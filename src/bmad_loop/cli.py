@@ -2121,11 +2121,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
+    from .adapters import registry as adapter_registry
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
-    if profile.hookless:
+    # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
+    # axes, so an `opencode-http` profile carrying a hook dialect still launches
+    # the HTTP adapter (and sends effort), while a hookless profile of another
+    # kind never does. The preview must follow the adapter `make_adapters` builds.
+    if profile.adapter == adapter_registry.OPENCODE_HTTP:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
