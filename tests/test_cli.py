@@ -9534,6 +9534,27 @@ def test_dry_run_renders_hookless_http_line(project, capsys):
     # the profile's codex-style template is rendered into the prompt_async body
     assert "Use the bmad-dev-auto skill now:" in dev_line
     assert "model=anthropic/claude-haiku-4-5" in dev_line
+    assert "effort=" not in dev_line  # unset → absent, like model
+
+
+def test_dry_run_hookless_line_shows_the_stage_effort(project, capsys):
+    """#643: the real session sends the stage's effort as `variant`, so the launch
+    plan names it (under the policy key) beside the model — a preview that read
+    the same with and without it could not confirm the per-stage configuration."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(
+        project.project,
+        OPENCODE_QUALIFIED_POLICY + 'effort = "low"\n[adapter.dev]\neffort = "max"\n',
+    )
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out = capsys.readouterr().out
+    dev_line = next(line for line in out.splitlines() if "dev:" in line)
+    review_line = next(line for line in out.splitlines() if "review:" in line)
+    assert dev_line.endswith("model=anthropic/claude-haiku-4-5 effort=max")
+    assert review_line.endswith("model=anthropic/claude-haiku-4-5 effort=low")
 
 
 def test_validate_warns_on_bare_opencode_model(project, capsys):
