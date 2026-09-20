@@ -9,15 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- Add a reasoning-effort field for OpenCode (#643). `effort` is a free-form string
-  on `[adapter]` and every `[adapter.<stage>]` table, inherited like `model` (a stage
-  that switches client falls back to the provider default), carried on
-  `SessionSpec.effort`, and sent by the `opencode-http` adapter as the per-call
-  `variant` on every `prompt_async` body — the initial prompt and every nudge —
-  and omitted entirely when empty. It never rides `OPENCODE_CONFIG_CONTENT` or
-  argv. The tmux CLIs ignore it; `bmad-loop validate` reports
-  `policy.effort-unsupported` (warning, exit code unchanged) when a stage on that
-  family sets it.
+- Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
+  inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
+  every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
+  sets it (#643).
 
 ### Fixed
 
