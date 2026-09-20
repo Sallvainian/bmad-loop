@@ -462,14 +462,17 @@ skill = "bmad-dev-auto"    # the only supported value — the generic upstream d
 [adapter]
 name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | custom
 model = ""                 # empty = CLI default (opencode-http wants "provider/model")
+effort = ""                # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
+                           # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs have no
+                           # channel for it and ignore it (`bmad-loop validate` warns)
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
 
 # Optional per-stage overrides — run the review pass on a different CLI/model
 # than the dev pass. Unset keys inherit from [adapter] when the stage runs the
-# same client; switching client falls back to that profile's defaults (model
-# and extra_args are client-specific).
+# same client; switching client falls back to that profile's defaults (model,
+# effort and extra_args are client-specific).
 # [adapter.dev]
 # model = "opus"
 # [adapter.review]
@@ -477,6 +480,10 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # model = "gpt-5-codex"
 # [adapter.triage]            # sweep triage stage
 # model = "opus"
+# With an opencode-http base, effort tunes reasoning per stage (opencode-http
+# only — a tmux CLI ignores it and `bmad-loop validate` warns):
+# [adapter.review]
+# effort = "max"              # e.g. a deeper review pass than dev
 
 [sweep]
 auto = "never"             # never | per-epic | run-end (auto sweeps never prompt)

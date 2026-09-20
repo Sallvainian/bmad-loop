@@ -6679,6 +6679,7 @@ class Engine:
             cwd=self.workspace.root,
             env=env,
             model=cfg.model,
+            effort=cfg.effort,
             timeout_s=self._session_timeout_s(self.policy.limits.session_timeout_min * 60),
             stall_nudges_cap=(
                 self.policy.limits.workflow_stall_nudges_cap

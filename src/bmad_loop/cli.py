@@ -890,6 +890,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{prof.name} expects e.g. 'anthropic/claude-haiku-4-5'",
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
+            # Reasoning effort (#643) has exactly one carrier: the opencode-http
+            # kind sends it as the per-prompt `variant`. The tmux generic family
+            # has no channel for it — no profile flag, no hook field — so a stage
+            # that sets it there runs at the provider default with nothing to show
+            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
+            # because "cannot carry effort" is a fact about that family; an
+            # out-of-tree kind's capability is not knowable here, so it stays
+            # silent rather than assert one. Advisory: severity `problem` is
+            # validate's exit code, and an ignored knob does not make a run unrunnable.
+            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+                report.warn(
+                    "policy.effort-unsupported",
+                    f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "
+                    f"only the opencode-http adapter carries a reasoning-effort value",
+                    {"role": role, "effort": cfg.effort, "profile": prof.name},
+                )
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -3470,7 +3486,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
                 return rc
         adapters = _make_adapters(project, run_dir, pol)
-        model = pol.adapter.resolved("dev").model
+        dev_cfg = pol.adapter.resolved("dev")
+        model = dev_cfg.model
+        effort = dev_cfg.effort
         _ctx_path, withheld, unreadable = resolve.build_context(
             state,
             run_dir,
@@ -3499,6 +3517,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 # this `task` object reads the same either way.
                 generation=task.generation,
                 model=model,
+                effort=effort,
             )
         except NotImplementedError:
             print(

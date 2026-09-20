@@ -175,6 +175,82 @@ name = "codex"
     assert review == policy.ResolvedAdapter("codex", "", None)
 
 
+def test_stage_client_switch_drops_base_effort(tmp_path):
+    """Effort is client-specific like `model`: its legal names belong to one
+    provider's models, so a stage that switches client must NOT inherit the base
+    value and falls back to "" (provider default).
+
+    ABLATION: replace the `same_client` fallback for effort in `resolved()` with a
+    plain `self.effort` and the review assert reddens."""
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "opencode-http"
+effort = "max"
+[adapter.review]
+name = "claude"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("review").effort == ""
+    # controls: the stages that keep the client inherit the base value
+    assert pol.adapter.resolved("dev").effort == "max"
+    assert pol.adapter.resolved("triage").effort == "max"
+
+
+def test_base_effort_inherits_into_every_stage(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "opencode-http"
+effort = "high"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.effort == "high"
+    for role in ("dev", "review", "triage"):
+        assert pol.adapter.resolved(role).effort == "high"
+    # the base-only (unknown role) branch constructs ResolvedAdapter positionally
+    # and must carry effort too
+    assert pol.adapter.resolved("retro").effort == "high"
+
+
+def test_stage_effort_overrides_base(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+effort = "low"
+[adapter.review]
+effort = "max"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("review").effort == "max"
+    assert pol.adapter.resolved("dev").effort == "low"
+    assert pol.adapter.resolved("triage").effort == "low"
+
+
+def test_effort_defaults_empty_everywhere(tmp_path):
+    pol = policy.load(None)
+    assert pol.adapter.effort == ""
+    for role in ("dev", "review", "triage", "retro"):
+        assert pol.adapter.resolved(role).effort == ""
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ("[adapter]\neffort = 3\n", r"adapter\.effort must be a string"),
+        ("[adapter.dev]\neffort = 3\n", r"adapter\.dev\.effort must be a string"),
+        ("[adapter.review]\neffort = true\n", r"adapter\.review\.effort must be a string"),
+    ],
+)
+def test_effort_wrong_type_rejected(tmp_path, body, match):
+    """Effort is free-form (no catalog validation) but it IS typed: a non-string is
+    loud at policy load, like every other `[adapter]` string key."""
+    p = tmp_path / "policy.toml"
+    p.write_text(body)
+    with pytest.raises(policy.PolicyError, match=match):
+        policy.load(p)
+
+
 def test_stage_same_client_inherits_and_overrides(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("""
@@ -233,6 +309,12 @@ def _roundtrip_snapshot(pol):
         # (c) a stage name override — the client switch resets model to ""
         '[adapter]\nname = "claude"\nmodel = "opus"\n'
         'extra_args = ["--permission-mode", "plan"]\n[adapter.review]\nname = "codex"\n',
+        # (d) base effort inherited by every stage
+        '[adapter]\nname = "opencode-http"\neffort = "high"\n',
+        # (e) a stage effort override beside a base one
+        '[adapter]\nname = "opencode-http"\neffort = "low"\n[adapter.review]\neffort = "max"\n',
+        # (f) a stage name override — the client switch resets effort to ""
+        '[adapter]\nname = "opencode-http"\neffort = "max"\n[adapter.review]\nname = "claude"\n',
     ],
 )
 def test_adapter_policy_from_snapshot_roundtrips_resolved(body):

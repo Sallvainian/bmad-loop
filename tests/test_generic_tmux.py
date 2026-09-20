@@ -184,6 +184,21 @@ def test_build_command_gemini_uses_interactive_flag(tmp_path):
     assert cmd.endswith("--model sonnet")
 
 
+@pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
+def test_effort_never_reaches_the_generic_argv_or_env(tmp_path, profile_name):
+    """#643: the tmux generic family has no channel for a reasoning-effort value,
+    so `SessionSpec.effort` is ignored — argv and env are byte-identical to an
+    effort-less spec's (and `config_digest` therefore stays untouched). The
+    carrier is the opencode-http adapter; validate warns about this family."""
+    adapter = make_adapter(tmp_path, profile_name=profile_name)
+    plain = make_spec(tmp_path)
+    with_effort = dataclasses.replace(plain, effort="max")
+    assert with_effort.effort == "max"  # the field landed (kept LAST on SessionSpec)
+    assert adapter.interactive_argv(with_effort) == adapter.interactive_argv(plain)
+    assert adapter.interactive_env(with_effort) == adapter.interactive_env(plain)
+    assert "max" not in adapter.build_command(with_effort)
+
+
 def test_extra_args_replace_profile_bypass(tmp_path):
     adapter = make_adapter(tmp_path, extra_args=("--custom-flag",))
     cmd = adapter.build_command(make_spec(tmp_path))

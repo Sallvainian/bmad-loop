@@ -5011,7 +5011,7 @@ def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkey
     save_state(run_dir, state)
     seen: list[int] = []
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         seen.append(generation)
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -5026,6 +5026,35 @@ def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkey
 
     assert seen == [2]  # the task's own generation, not a constant
     assert load_state(run_dir).tasks["s1"].generation == 3  # the re-arm bumped past it
+
+
+def test_resolve_hands_the_dev_stage_model_and_effort_to_the_session(tmp_path, monkeypatch):
+    """`cmd_resolve` launches the resolve agent as the DEV stage's client, so it
+    passes that stage's resolved `model` and (#643) `effort` — a stage override,
+    not the base value, proving the read goes through `resolved("dev")`."""
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")
+    _write_policy(
+        tmp_path,
+        '[adapter]\nname = "claude"\nmodel = "opus"\neffort = "low"\n'
+        '[adapter.dev]\nmodel = "sonnet"\neffort = "max"\n',
+    )
+    seen: dict[str, str] = {}
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
+        seen.update(model=model, effort=effort)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (None, 0, 0))
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert seen == {"model": "sonnet", "effort": "max"}
 
 
 def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
@@ -5207,7 +5236,7 @@ def _redrive_escalates(run_dir, detail):
 def _marker_writing_session(run_dir_marker=True):
     from bmad_loop import resolve
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         if run_dir_marker:
@@ -5708,7 +5737,7 @@ def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
     ran: list = []
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         # the resolve agent records a restore_patch in its output marker
         ran.append(story_key)
         marker = resolve.resolution_path(rd, story_key)
@@ -5893,7 +5922,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     patch.write_text("diff", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         # the resolve agent records a restore_patch in its output marker
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -5949,7 +5978,7 @@ def test_resolve_rereads_isolation_after_the_agent_session(
     _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
     _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         # the human and the agent conclude the story needs isolation, and the operator
         # edits policy.toml from another terminal while the session is still open
         if flipped_mid_session:
@@ -6000,7 +6029,7 @@ def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, ca
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
@@ -6031,7 +6060,7 @@ def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, 
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model="", effort=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")
@@ -9538,6 +9567,63 @@ def test_validate_model_warning_ignores_tmux_profiles(project, capsys):
 
     cli.cmd_validate(args)
     assert "is not 'provider/model'" not in _validate_output(capsys)
+
+
+def test_validate_warns_when_effort_is_set_on_a_tmux_profile(project, capsys):
+    """#643: only the opencode-http adapter carries a reasoning-effort value. A
+    stage that sets `effort` on the tmux generic family runs at the provider
+    default with nothing to show for it, so validate says so — advisory, naming
+    the role, profile and value."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "claude"\n[adapter.dev]\neffort = "high"\n')
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    findings = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
+    assert [f["severity"] for f in findings] == ["warning"]  # dev only: review/triage unset
+    assert findings[0]["detail"] == {"role": "dev", "effort": "high", "profile": "claude"}
+    assert "dev effort 'high' is ignored by claude" in findings[0]["message"]
+
+
+def test_validate_effort_warning_does_not_change_the_exit_code(project, capsys, monkeypatch):
+    """The warning is advisory: an otherwise-clean project with effort on a tmux
+    stage still exits 0 (the same rc as `test_validate_json_clean_project_is_a_
+    pure_document_at_rc_0`, whose fixture this shares minus the key)."""
+    _make_validate_pass(
+        project, monkeypatch, capsys, policy=CLAUDE_ONLY_POLICY + 'effort = "high"\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    warned = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
+    # base effort inherits into every stage that keeps the client, so all three warn
+    assert sorted(f["detail"]["role"] for f in warned) == ["dev", "review", "triage"]
+    assert {f["severity"] for f in warned} == {"warning"}
+
+
+def test_validate_effort_silent_on_the_opencode_kind(project, capsys):
+    """The carrier: effort on an opencode-http stage draws no warning.
+
+    ABLATION: drop the `prof.adapter == GENERIC` predicate and this reddens (the
+    check would fire for the one family that actually sends the value)."""
+    install_bmad_config(project)
+    _write_policy(project.project, OPENCODE_QUALIFIED_POLICY + 'effort = "max"\n')
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in doc["findings"])
+    # control: the policy loaded with the value in it (not silent for lack of a key)
+    assert policy_mod.load(project.project / ".bmad-loop" / "policy.toml").adapter.effort == "max"
+
+
+def test_validate_effort_silent_when_unset(project, capsys):
+    """No effort anywhere → no finding, on the very profile that would warn."""
+    install_bmad_config(project)
+    _write_policy(project.project)  # DUAL_CLIENT_POLICY: claude + codex, no effort
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in doc["findings"])
 
 
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):

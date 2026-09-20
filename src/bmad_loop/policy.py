@@ -366,6 +366,9 @@ class StageAdapterPolicy:
 
     name: str | None = None
     model: str | None = None
+    # Reasoning effort, free-form (provider- and model-specific names); None =
+    # inherit from [adapter] under the same client-specific rule as `model`.
+    effort: str | None = None
     extra_args: tuple[str, ...] | None = None
     # None = inherit from [adapter] (which itself falls back to the CLI profile)
     usage_grace_s: float | None = None
@@ -382,12 +385,20 @@ class ResolvedAdapter:
     # limits.stop_without_result_nudges respectively
     usage_grace_s: float | None = None
     stop_without_result_nudges: int | None = None
+    # Reasoning effort; "" = provider default. Only the opencode-http adapter
+    # carries it (as the per-prompt `variant`); the tmux generic family has no
+    # channel for it and ignores it (`bmad-loop validate` warns). Appended AFTER
+    # the older fields because `resolved()` constructs this positionally.
+    effort: str = ""
 
 
 @dataclass(frozen=True)
 class AdapterPolicy:
     name: str = "claude"  # CLI profile name; "claude-code-tmux" kept as legacy alias
     model: str = ""
+    # Reasoning effort for every stage that runs this client; free-form because
+    # the legal names are provider- and model-specific ("" = provider default).
+    effort: str = ""
     # None = use the profile's default bypass flags; a list replaces them
     extra_args: tuple[str, ...] | None = None
     # kill the run's bmad-loop-<id> tmux session when it finishes (False keeps
@@ -410,11 +421,13 @@ class AdapterPolicy:
                 self.extra_args,
                 self.usage_grace_s,
                 self.stop_without_result_nudges,
+                effort=self.effort,
             )
         name = stage.name if stage.name is not None else self.name
-        # model and extra_args are client-specific: inherit from the base only
-        # when the stage runs the same client; a client switch falls back to
-        # that profile's defaults (CLI default model, profile bypass flags).
+        # model, effort and extra_args are client-specific: inherit from the base
+        # only when the stage runs the same client; a client switch falls back to
+        # that profile's defaults (CLI default model, provider default effort,
+        # profile bypass flags).
         same_client = name == self.name
         # usage_grace_s / stop_without_result_nudges are benign timing knobs that
         # mean "fall back to the profile default" when None, so plain stage ??
@@ -434,6 +447,9 @@ class AdapterPolicy:
                 stage.stop_without_result_nudges
                 if stage.stop_without_result_nudges is not None
                 else self.stop_without_result_nudges
+            ),
+            effort=(
+                stage.effort if stage.effort is not None else (self.effort if same_client else "")
             ),
         )
 
@@ -461,9 +477,11 @@ def _stage_from_snapshot(raw: Any) -> StageAdapterPolicy:
         return StageAdapterPolicy()
     name = raw.get("name")
     model = raw.get("model")
+    effort = raw.get("effort")
     return StageAdapterPolicy(
         name=None if name is None else str(name),
         model=None if model is None else str(model),
+        effort=None if effort is None else str(effort),
         extra_args=_snapshot_extra_args(raw.get("extra_args")),
         usage_grace_s=raw.get("usage_grace_s"),
         stop_without_result_nudges=raw.get("stop_without_result_nudges"),
@@ -498,6 +516,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
         return AdapterPolicy(
             name=name,
             model=str(adapter_d.get("model", AdapterPolicy.model)),
+            effort=str(adapter_d.get("effort", AdapterPolicy.effort)),
             extra_args=_snapshot_extra_args(adapter_d.get("extra_args")),
             cleanup_session_on_finish=bool(
                 adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
@@ -682,6 +701,7 @@ def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
     return StageAdapterPolicy(
         name=_opt_typed_str(raw, f"adapter.{key}", "name"),
         model=_opt_typed_str(raw, f"adapter.{key}", "model"),
+        effort=_opt_typed_str(raw, f"adapter.{key}", "effort"),
         extra_args=_typed_str_tuple(raw, f"adapter.{key}", "extra_args"),
         usage_grace_s=_opt_grace(raw, f"adapter.{key}"),
         stop_without_result_nudges=_opt_nudges(raw, f"adapter.{key}"),
@@ -1041,6 +1061,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     adapter = AdapterPolicy(
         name=_typed_str(adapter_d, "adapter", "name", AdapterPolicy.name),
         model=_typed_str(adapter_d, "adapter", "model", AdapterPolicy.model),
+        effort=_typed_str(adapter_d, "adapter", "effort", AdapterPolicy.effort),
         extra_args=_typed_str_tuple(adapter_d, "adapter", "extra_args"),
         cleanup_session_on_finish=_typed_bool(
             adapter_d,
@@ -1376,6 +1397,8 @@ spec_folder = ""
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
+effort = ""                  # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
+                             # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs ignore it
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
@@ -1387,9 +1410,9 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 
 # Per-stage overrides for the dev, review and sweep-triage passes. Unset keys
 # inherit from [adapter] when the stage runs the same client; a stage that
-# switches client falls back to that profile's defaults instead (model and
-# extra_args are client-specific). Stage tables must come after the [adapter]
-# keys above.
+# switches client falls back to that profile's defaults instead (model, effort
+# and extra_args are client-specific). Stage tables must come after the
+# [adapter] keys above.
 # [adapter.dev]
 # model = "opus"
 # [adapter.review]
@@ -1398,6 +1421,10 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # stop_without_result_nudges = 5     # e.g. a multi-turn review needs more nudges than dev
 # [adapter.triage]
 # model = "opus"
+# With an opencode-http base, effort tunes reasoning per stage (opencode-http
+# only — a tmux CLI ignores it and `bmad-loop validate` warns):
+# [adapter.review]
+# effort = "max"                     # e.g. a deeper review pass than dev
 
 [sweep]
 # Deferred-work sweep: triage + execute open deferred-work.md entries.
