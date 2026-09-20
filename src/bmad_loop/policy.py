@@ -360,6 +360,20 @@ class CleanupPolicy:
     clean_tmp: bool = True  # let engine plugins clean their /tmp scratch (e.g. Unity MCP zips)
 
 
+# Legacy adapter names from older policy.toml files, plus friendly short names,
+# mapped to the canonical profile name. Owned here — not in `adapters.profile`,
+# which re-exports it as `ALIASES` for `get_profile` — because `[adapter] name`
+# semantics are a policy fact: `AdapterPolicy.resolved()` must see "opencode" and
+# "opencode-http" as the SAME client, or a stage naming the other spelling would
+# be treated as a client switch and lose the inherited model/effort/extra_args.
+PROFILE_ALIASES: dict[str, str] = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
+
+
+def canonical_profile_name(name: str) -> str:
+    """The profile name `get_profile` resolves `name` to — aliases collapsed."""
+    return PROFILE_ALIASES.get(name, name)
+
+
 @dataclass(frozen=True)
 class StageAdapterPolicy:
     """Per-stage overrides; None = inherit from [adapter]."""
@@ -427,8 +441,9 @@ class AdapterPolicy:
         # model, effort and extra_args are client-specific: inherit from the base
         # only when the stage runs the same client; a client switch falls back to
         # that profile's defaults (CLI default model, provider default effort,
-        # profile bypass flags).
-        same_client = name == self.name
+        # profile bypass flags). Compared by CANONICAL name: `opencode` and
+        # `opencode-http` are one profile, not a switch.
+        same_client = canonical_profile_name(name) == canonical_profile_name(self.name)
         # usage_grace_s / stop_without_result_nudges are benign timing knobs that
         # mean "fall back to the profile default" when None, so plain stage ??
         # base inheritance is safe regardless of a client switch.

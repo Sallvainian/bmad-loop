@@ -19,6 +19,14 @@ breaking changes may land in a minor release.
   `policy.effort-unsupported` (warning, exit code unchanged) when a stage on that
   family sets it.
 
+### Fixed
+
+- Compare per-stage adapter names by canonical profile in `AdapterPolicy.resolved()`:
+  a stage naming an alias of the base client (`opencode` vs `opencode-http`,
+  `claude-code-tmux` vs `claude`) runs the same client and now inherits `model`,
+  `effort` and `extra_args` instead of being treated as a client switch. The alias
+  table moves to `policy.PROFILE_ALIASES`; `adapters.profile.ALIASES` re-exports it.
+
 ## [0.12.0] — 2026-09-20
 
 ### Added

@@ -197,6 +197,47 @@ name = "claude"
     assert pol.adapter.resolved("triage").effort == "max"
 
 
+@pytest.mark.parametrize(
+    ("base", "stage"),
+    [("opencode", "opencode-http"), ("opencode-http", "opencode"), ("claude-code-tmux", "claude")],
+)
+def test_stage_naming_an_alias_of_the_base_client_is_not_a_switch(tmp_path, base, stage):
+    """`get_profile` resolves an alias and its canonical name to ONE profile, so a
+    stage spelling the base client the other way runs the same client and must
+    inherit the client-specific keys (model, effort, extra_args) rather than
+    falling back to that profile's defaults.
+
+    ABLATION: compare raw names in `resolved()`'s `same_client` and every row
+    reddens on all three keys."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"""
+[adapter]
+name = "{base}"
+model = "anthropic/claude-x"
+effort = "max"
+extra_args = ["--foo"]
+[adapter.review]
+name = "{stage}"
+""")
+    review = policy.load(p).adapter.resolved("review")
+    assert review.name == stage  # the stage's own spelling is kept for get_profile
+    assert review.model == "anthropic/claude-x"
+    assert review.effort == "max"
+    assert review.extra_args == ("--foo",)
+
+
+def test_profile_aliases_are_the_table_get_profile_uses():
+    """`resolved()`'s same-client test and `get_profile`'s lookup must collapse
+    the same aliases: one table, re-exported, never two copies that can drift."""
+    from bmad_loop.adapters import profile as profile_mod
+
+    assert profile_mod.ALIASES is policy.PROFILE_ALIASES
+    for alias, canonical in policy.PROFILE_ALIASES.items():
+        assert profile_mod.get_profile(alias).name == canonical
+        assert policy.canonical_profile_name(alias) == canonical
+    assert policy.canonical_profile_name("claude") == "claude"  # canonical is a fixed point
+
+
 def test_base_effort_inherits_into_every_stage(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("""
