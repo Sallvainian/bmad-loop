@@ -11936,6 +11936,59 @@ def test_session_env_fault_pauses_dev_without_burning_budget(project):
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
 
 
+def test_session_with_no_work_pauses_dev_without_burning_budget(project):
+    """A dev session that produced nothing (#727 — a CLI parked on a permission
+    dialog until the grace, the nudge and window death) pauses the run at the
+    first story rather than charging the attempt and launching a second session
+    into the same wall; `dev-decision` and `session-end` both carry the flag, and
+    re-arm restores the budget (attempt -> 0).
+
+    ABLATION: delete the `produced_work` arm in `decide_dev` and this RETRYs — a
+    second dev session is launched and the story ends deferred, not paused."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="stalled", produced_work=False)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # the one real session, not a spent budget
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason.startswith("no work produced: dev session stalled")
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["produced_work"] is False
+    assert dec["env_fault"] is False
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["produced_work"] is False
+
+    # the resolve workflow's re-arm step is what makes "not charged" true
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_engine_attaches_its_journal_to_every_adapter(project):
+    """The engine hands its `Journal` to the adapters it owns (#680), so an
+    adapter-side `session-idle` lands in the same file with the same
+    `log_task`/`log_pos` stamps; a session that worked leaves no `produced_work`
+    key on `session-end` (the field is present only when False, like
+    `session_vanished`) and `dev-decision` records it True."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [SessionResult(status="timeout")])
+    assert adapter.journal is engine.journal
+    assert engine.adapters["review"].journal is engine.journal
+    engine.run()
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert dec and all(d["produced_work"] is True for d in dec)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert ends and all("produced_work" not in e for e in ends)
+
+
 def test_two_plain_timeouts_still_defer(project):
     """Guard: NON-env-fault timeouts keep today's flow — two of them exhaust the
     dev budget and defer the story (the env-fault pause must not intercept them)."""

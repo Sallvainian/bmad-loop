@@ -208,7 +208,11 @@ cost-weighted total first (cache reads at `limits.cache_read_weight`), the
 unweighted one in parentheses. Below the counts, an **agent line** names who is
 driving: while a session is open it reads `agent <name> · <model> · <role>` (the
 resolved adapter for the live stage — `model` omitted when the session ran the
-CLI profile's default, `role` is the stage `dev` / `review` / `triage`); when no
+CLI profile's default, `role` is the stage `dev` / `review` / `triage`), with a
+yellow `· idle <age>` appended while the session's transcript has sat still past
+`limits.dev_stall_grace_s` (#680 — derived from the journal's open
+`session-idle`, cleared by its `session-active`; `<age>` is whole minutes, or
+`1h05m` above an hour); when no
 session is open it falls back to the run's configured adapters, rebuilt from the
 run's policy snapshot — `agents <name·model>` when dev and review resolve alike,
 else `agents dev <name·model> review <name·model>`, plus a `triage <name·model>`

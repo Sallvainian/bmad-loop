@@ -141,6 +141,20 @@ def make_sweep(
     return engine, adapter
 
 
+def test_sweep_attaches_journal_to_a_distinct_triage_adapter(project):
+    """#680: `Engine.__init__` attaches its journal to the adapters it knows; the
+    triage adapter is assigned AFTER that, so a distinct one would otherwise keep
+    `journal = None` and every sweep triage session would emit no idle events.
+
+    ABLATION: drop the `self.adapters["triage"].journal = self.journal` line and
+    the distinct-adapter assertion reddens."""
+    triage = MockAdapter([])
+    engine, dev = make_sweep(project, [], triage_adapter=triage)
+    assert engine.adapters["triage"] is triage
+    assert engine.adapters["triage"].journal is engine.journal
+    assert dev.journal is engine.journal
+
+
 def test_remaining_estimate_is_none_for_an_undecodable_ledger(project):
     """`None` and `0` mean opposite things to the graceful stop, and both are
     PUBLISHED — in the `run-stop` journal row and the stop notice. `None` is "no

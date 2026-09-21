@@ -7,6 +7,24 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- Journal a session's idle stretches (#680). The tmux adapter stats the live transcript
+  on the heartbeat cadence, stamps `transcript_idle_s` on `heartbeat.json`, and — with
+  the engine's journal attached (`CodingCLIAdapter.journal`) — writes one `session-idle`
+  when the age crosses `limits.dev_stall_grace_s` and one `session-active` when the
+  transcript moves again; `0` disables the pair. The TUI agent line shows the open
+  stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
+
+### Fixed
+
+- Pause a dev session that produced no work instead of retrying into the same wall
+  (#727). `SessionResult.produced_work` is `false` when no turn ended and the pane
+  never changed after its first frame before any wake nudge (a permission dialog, a
+  login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
+  environment fault does, `dev-decision` and `session-end` carry the flag, and re-arm
+  resets the attempt.
+
 ## [0.12.0] — 2026-09-20
 
 ### Added

@@ -770,6 +770,17 @@ class Engine:
         }
         self.run_dir = run_dir
         self.journal = journal
+        # Hand the run's journal to every adapter this engine owns, so an adapter
+        # can record what only it sees — the #680 `session-idle`/`session-active`
+        # pair rides it. Deduplicated by identity: dev and review commonly share
+        # one adapter object. Attached, never wrapped: the adapter appends on the
+        # engine thread while the engine's own journal is quiescent, so this is
+        # one writer with one set of `log_task`/`log_pos` stamps, not two.
+        seen_adapters: list[CodingCLIAdapter] = []
+        for owned in self.adapters.values():
+            if not any(owned is done for done in seen_adapters):
+                owned.journal = journal
+                seen_adapters.append(owned)
         self.state = state
         self.max_stories = max_stories
         self.epic_filter = epic_filter
@@ -2908,6 +2919,9 @@ class Engine:
                 # `_session_end_extras` (#489); here the flag pairs the
                 # diagnosis with the decision it fed.
                 session_vanished=result.session_vanished,
+                # Whether the session did anything before it ended (#727); False
+                # is what routed a non-completed result to the no-work PAUSE.
+                produced_work=result.produced_work,
             )
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
@@ -6485,6 +6499,11 @@ class Engine:
         # healthy moments before the probe asked.
         if result.session_vanished:
             extras["session_vanished"] = True
+        # no-work diagnosis (#727): same convention — present only when the
+        # session ended non-completed without ever changing its pane after the
+        # first frame, so a grep for the field finds exactly the parked sessions.
+        if not result.produced_work:
+            extras["produced_work"] = False
         return extras
 
     @staticmethod
