@@ -6521,6 +6521,50 @@ def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
+def test_unchanged_transcript_rewrite_is_not_new_work(tmp_path, monkeypatch):
+    """An old assistant record cannot become proof merely because mtime moves.
+
+    ABLATION: scan from byte zero on a same-size stat change and this reads True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    transcript.write_bytes(b'{"type":"assistant"}\n')
+
+    def script(call_n):
+        if call_n == 2:
+            old = transcript.stat().st_mtime_ns
+            os.utime(transcript, ns=(old + 1_000_000_000, old + 1_000_000_000))
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes unavailable")
+def test_transcript_scan_skips_fifo(tmp_path, monkeypatch):
+    """A hook-named FIFO must not block the adapter's wait loop on open.
+
+    ABLATION: remove the regular-file guard and the stubbed open fails.
+    """
+    fifo = tmp_path / "transcript.jsonl"
+    os.mkfifo(fifo)
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == fifo:
+            raise AssertionError("transcript FIFO would block on open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    assert generic.GenericAdapter._transcript_has_assistant_activity(str(fifo), 0) is False
+
+
 @pytest.mark.parametrize(
     "setup_record",
     [

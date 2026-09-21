@@ -192,8 +192,8 @@ def test_dev_env_fault_session_pauses_even_when_budget_exhausted():
 
 
 def test_dev_no_work_session_pauses_even_with_budget_left():
-    """A dev session that never did anything (#727) — no turn ended and the pane
-    never changed after its first frame: a CLI parked on a permission dialog —
+    """A dev session with no qualifying work evidence (#727), such as a CLI
+    parked on a permission dialog,
     PAUSEs for a human instead of RETRYing into the identical wall. The reason
     names the measurement, not the verdict alone.
 
@@ -203,6 +203,7 @@ def test_dev_no_work_session_pauses_even_with_budget_left():
     decision = decide_dev(task, parked, None, POLICY)
     assert decision.action == Action.PAUSE
     assert decision.reason.startswith("no work produced: dev session stalled")
+    assert "no completed turn or qualifying activity was observed" in decision.reason
     assert "permission prompt" in decision.reason
     assert "the attempt is not charged" in decision.reason
 

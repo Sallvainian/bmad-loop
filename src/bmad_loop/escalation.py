@@ -206,13 +206,13 @@ def no_work_pause_reason(role: str, result: SessionResult) -> str:
     Composed over `session_failure_reason`, like `env_fault_pause_reason`, so the
     #489 lost-session suffix survives: a session the multiplexer destroyed before
     it painted a second frame carries both facts, and the operator needs both. The
-    parenthetical names what the adapter measured — no turn ended and the pane did
-    not change after its first frame — and what that most often means, because the
+    parenthetical names what the adapter measured — no completed turn or qualifying
+    activity — and what that most often means, because the
     verdict alone (`crashed` / `stalled` / `timeout`) reads as an agent that ran and
     failed, when the CLI in fact sat at a prompt only a human can answer."""
     return (
-        f"no work produced: {session_failure_reason(role, result)} (no turn ended and "
-        "the pane never changed after its first frame — the CLI is likely waiting on a "
+        f"no work produced: {session_failure_reason(role, result)} (no completed turn "
+        "or qualifying activity was observed — the CLI may be waiting on a "
         "human: a permission prompt, a login, a confirmation; the attempt is not charged)"
     )
 

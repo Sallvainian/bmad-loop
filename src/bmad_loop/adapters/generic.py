@@ -386,6 +386,10 @@ class _ResultFileMixin:
         tokens alone can be a submitted prompt.
         """
         seen_messages: dict[str, dict] = {}
+        # Hook paths are external observations. A FIFO can be stat'ed but opening
+        # it for a JSONL scan would block the deterministic wait loop indefinitely.
+        if not Path(transcript_path).is_file():
+            return False
         try:
             with Path(transcript_path).open("rb") as stream:
                 while line := stream.readline():
@@ -902,20 +906,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             was_absent = idle.seen_absent if same_path else False
             self._sample_transcript_idle(handle.task_id, path, idle, now)
             current_key = idle.last_key
-            changed = current_key is not None and current_key != prior_key
-            if (
-                changed
-                and (prior_key is not None or was_absent)
-                and stall_nudges_sent == 0
-                and not transcript_work_seen
-            ):
-                start = (
-                    prior_key[1]
-                    if prior_key is not None
-                    and current_key is not None
-                    and current_key[1] > prior_key[1]
-                    else 0
-                )
+            # A same-size rewrite or truncation does not append a new record.
+            # Scanning from byte zero in that case would credit an old assistant
+            # record as fresh work merely because mtime changed.
+            grew = current_key is not None and (
+                (prior_key is not None and current_key[1] > prior_key[1])
+                or (prior_key is None and was_absent and current_key[1] > 0)
+            )
+            if grew and stall_nudges_sent == 0 and not transcript_work_seen:
+                start = prior_key[1] if prior_key is not None else 0
                 transcript_work_seen = self._transcript_has_assistant_activity(path, start)
 
         def produced_work() -> bool:
