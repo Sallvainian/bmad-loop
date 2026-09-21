@@ -150,6 +150,10 @@ class _IdleTracker:
     last_change_wall: float = 0.0
     idle_s: float | None = None
     open_since: float | None = None
+    # Latched True the first time the key CHANGES after the first sample: the CLI
+    # appended to its own transcript, which is the #727 no-work verdict's
+    # transcript half (see `_work_verdict`). Never reset.
+    moved: bool = False
 
 
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
@@ -336,8 +340,12 @@ class _ResultFileMixin:
         same reasons: a `Stop` arrived (a turn ended — the hook half, immune to a
         misbound pane sink); there is no pane log to read (`_log_evidence` is None —
         opencode-http, unit fixtures — and unknown never blocks); or the wait loop
-        saw the pane log change on a tick later than `FIRST_FRAME_S` after it started
-        and before any stall wake nudge was sent (`activity_seen`, the timeline half).
+        saw activity (`activity_seen`): the pane log changed on a tick later than
+        `FIRST_FRAME_S` after it started and before the first stall wake nudge (the
+        timeline half), OR the live transcript changed after its first sample, OR
+        the usage sampler read a nonzero spend from it — the last two are the CLI's
+        own writes, which a misbound pane sink cannot hide and a nudge echo cannot
+        produce, so neither carries the first-frame or nudge guard.
 
         The timeline half is what separates this from `_produced_work`, and why the
         #261 gate is reused for its tristate only, not its verdict: that gate's
@@ -794,18 +802,25 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     activity_seen = True
                 frame_key = tick_key
 
-        def produced_work() -> bool:
-            # Read at call time, after a final frame sample, so every exit below
-            # reports the loop's final view of the pane rather than the last tick's.
-            sample_frame()
-            return self._work_verdict(handle, stop_seen, activity_seen)
-
         # Idle detection (#680): the live transcript's (mtime_ns, size), sampled on
         # the heartbeat cadence from the first tick that knows `transcript_path`
         # — see `_sample_transcript_idle`. Observes only: nothing here nudges,
         # stalls or kills (#680 item 2 stays open), and `stall_deadline` is
         # neither consulted nor touched.
         idle = _IdleTracker()
+
+        # Definitive activity the pane cannot fake and a misbound pane sink
+        # (#254/#217) cannot hide: the CLI appended to its own transcript
+        # (`idle.moved`, sampled on the heartbeat cadence below) or the usage
+        # sampler read a nonzero spend from it (`usage_seen`). Either one is the
+        # model having produced tokens, so it counts as work whatever the pane did.
+        usage_seen = False
+
+        def produced_work() -> bool:
+            # Read at call time, after a final frame sample, so every exit below
+            # reports the loop's final view of the pane rather than the last tick's.
+            sample_frame()
+            return self._work_verdict(handle, stop_seen, activity_seen or idle.moved or usage_seen)
 
         while True:
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
@@ -897,6 +912,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and transcript_path
                 ):
                     weighted = self._sample_weighted_usage(transcript_path, spec)
+                    if weighted is not None and weighted > 0:
+                        usage_seen = True
                     if weighted is not None and weighted > spec.token_budget:
                         budget_tripped = True
                         budget_weighted = weighted
@@ -1291,6 +1308,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if key is None:
             return
         if key != idle.last_key:
+            if idle.last_key is not None:
+                idle.moved = True
             if idle.open_since is not None and self.journal is not None:
                 try:
                     self.journal.append(

@@ -6492,6 +6492,74 @@ def test_growth_during_the_final_wait_then_death_in_the_same_tick_is_work(tmp_pa
     assert (result.status, result.produced_work) == ("crashed", True)
 
 
+def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
+    """A misbound pane sink (#254/#217): the pane log exists at 0 bytes forever,
+    but the transcript a `SessionStart` named keeps growing — the CLI is writing
+    its own record. No `Stop` before the deadline: `timeout`, but the session
+    worked, so `produced_work=True` and the decision keeps today's routing.
+
+    ABLATION: drop `idle.moved` from `produced_work()` and this reads False."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0  # only the deadline can end this
+    # the pane never grows: `_idle_adapter`'s script is replaced below, and the log
+    # stays the 0-byte file `_pane_log` created
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 4:
+            _grow(transcript, b'{"type":"assistant"}\n')  # the CLI's own write
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (adapter.logs_dir / "3-1-dev-1.log").stat().st_size == 0  # pane said nothing
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
+    """The complement: a named transcript that never changes after its first
+    sample is not activity — the first sample alone must not latch `moved`."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_nonzero_usage_under_a_static_pane_is_work(tmp_path, monkeypatch):
+    """The budget sampler read a nonzero spend from the transcript: the model
+    produced tokens, which is work whatever the (misbound, 0-byte) pane says.
+    Enforce mode trips and the grace expires: `over_budget`, `produced_work=True`.
+
+    ABLATION: drop the `usage_seen` latch and this reads False."""
+    adapter, clock, _sent = _budget_adapter(tmp_path, monkeypatch)
+    _pane_log(adapter, "b-1", 0)  # present and empty: `_log_evidence` is False, not None
+    transcript = tmp_path / "t.jsonl"
+    _write_claude_transcript(transcript, input_tokens=5000)
+    adapter.watcher = _ScriptedWatcher([_start_event(transcript)], on_call=_advance_31(clock))
+    result = adapter.wait_for_completion(
+        _budget_handle(), _budget_spec(tmp_path, mode="enforce", grace_s=50.0)
+    )
+    assert result.status == "over_budget"
+    assert result.stop_seen is False
+    assert result.produced_work is True
+
+
 def test_growth_inside_first_frame_window_alone_is_not_work(tmp_path, monkeypatch):
     """The complement of the row above, isolating ABLATION B from the nudge arm:
     the same growth landing INSIDE FIRST_FRAME_S (no nudge ever sent — the

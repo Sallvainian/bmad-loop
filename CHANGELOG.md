@@ -19,9 +19,9 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - Pause a dev session that produced no work instead of retrying into the same wall
-  (#727). `SessionResult.produced_work` is `false` when no turn ended and the pane
-  never changed after its first frame before any wake nudge (a permission dialog, a
-  login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
+  (#727). `SessionResult.produced_work` is `false` when no turn ended, the pane
+  never changed after its first frame before any wake nudge, and the transcript
+  never grew (a permission dialog, a login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
   environment fault does, `dev-decision` and `session-end` carry the flag, and re-arm
   resets the attempt.
 

@@ -259,10 +259,12 @@ class SessionResult:
     # Whether the session showed ANY sign of working before it ended on a
     # non-completed verdict (#727). `True` when a `Stop` arrived, when the adapter
     # has no pane log to read (opencode-http, unit fixtures — "unknown never
-    # blocks"), or when the pane log changed on a tick later than
+    # blocks"), when the pane log changed on a tick later than
     # `generic.FIRST_FRAME_S` after the wait loop started and before the first
-    # stall wake nudge was sent. `False` means the CLI painted at most its first
-    # frame and then sat still until the grace, the nudge and the exit: a
+    # stall wake nudge was sent, or when the CLI's own transcript changed after
+    # its first sample / the usage sampler read a nonzero spend from it (writes a
+    # misbound pane sink cannot hide). `False` means the CLI painted at most its
+    # first frame and then sat still until the grace, the nudge and the exit: a
     # permission dialog, a login prompt, a dead-on-arrival window. `decide_dev`
     # PAUSEs such a session ahead of the attempt budget, the way an environment
     # fault does, so re-arm restores the attempt instead of a fresh session being
