@@ -174,6 +174,30 @@ class SessionRecord:
         )
 
 
+def result_mapping(result_json: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the original result dictionary, or an empty dictionary otherwise.
+
+    SessionRecord.from_dict rehydrates result_json unchecked, and third-party
+    adapters may return non-dictionaries despite the declared contract. The
+    first-party generic adapter already rejects such documents at its reader.
+    Keep the narrow annotation to catch incorrect arguments statically; the
+    runtime guard covers those untrusted producers (DW-206/DW-207).
+
+    Consumers use the existing empty-document channel for these reads, without
+    adding an error or event. This replaces falsiness-only `result_json or {}`
+    reads, which raised on truthy non-dictionaries. The raw session document
+    remains available to validators with their own shape-refusal channels.
+
+    Preserve dictionary identity so downstream reconciliation can mutate the
+    same document, including the review loop's normalized local value. Empty
+    dictionaries also retain identity; their field reads answer just as the old
+    empty substitute did. No caller's document is copied or rewritten here.
+    """
+    if isinstance(result_json, dict):
+        return result_json
+    return {}
+
+
 def _rebased_on(path: str | None, root: Path) -> str | None:
     """One persisted spec path, re-anchored on `root`; absolute values pass through.
 
@@ -186,6 +210,32 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     if not path or Path(path).is_absolute():
         return path
     return str(root / path)
+
+
+def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
+    """Rehydrate `StoryTask.baseline_artifacts` from state.json: a mapping of
+    path -> `[mtime_ns, size]` or `None`. Anything else — a pre-upgrade absent
+    key, or a shape a hand edit mangled — reads as "no snapshot", on which the
+    artifact-only receipt refuses rather than guesses."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[int] | None] = {}
+    for key, value in raw.items():
+        if value is None:
+            out[str(key)] = None
+        elif (
+            isinstance(value, list)
+            and len(value) == 2
+            # `bool` is an `int`; a `[true, 42]` is a mangled record, not a fingerprint
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        ):
+            out[str(key)] = [value[0], value[1]]
+        else:
+            # Never `int(...)` a value here: a `["bad", 42]` or `[null, 42]` must
+            # read as "no snapshot", not raise out of `from_dict` and keep the
+            # whole run state — and `bmad-loop resume` — from loading.
+            return None
+    return out
 
 
 @dataclass
@@ -202,32 +252,69 @@ class StoryTask:
     # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
     # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
     followup_reviews_spent: int = 0
-    # How many times a human re-arm (`runs.rearm_escalation`) has re-opened this
-    # task. Re-arm resets `attempt` to 0 and the next dispatch bumps it back to 1,
-    # so without a discriminator the re-minted session task_id is byte-equal to a
-    # record the ABANDONED attempt already appended to the append-only `sessions`
-    # list — and `Engine._resumable_session`, which matches on that id, replays the
-    # abandoned attempt's verdict for the fresh one (#705). Feeds
+    # Session-id namespace rollovers performed when an escalated task is reopened
+    # while its attempt budget resets to 0. This happens in `runs.rearm_escalation`
+    # and in the sweep engine's ESCALATED restart arms. The next dispatch bumps the
+    # attempt back to 1, so without a discriminator the re-minted session task_id is
+    # byte-equal to a record the ABANDONED attempt already appended to the
+    # append-only `sessions` list. Feeds
     # `engine._session_task_id`, which emits the suffix only above zero, so every
     # id already on disk stays byte-identical across the upgrade. `task.sessions`
-    # is deliberately NOT cleared at re-arm: the run-dir audit trail it indexes is
-    # read by a second resolve cycle.
+    # is deliberately NOT cleared when a task is reopened: the run-dir audit trail
+    # it indexes is read by a later resolve cycle.
     generation: int = 0
+    # How much of the append-only `sessions` list an accepted escalation resolution
+    # already covered: a LENGTH, i.e. an index INTO `task.sessions`, not a count of
+    # escalations and not a generation number. `resolve._gather_escalations` shows only
+    # the escalations recorded by sessions at or after this position, so a second
+    # resolve cycle does not re-present entries the human already disambiguated
+    # (DW-11). Stamped in `runs.rearm_escalation`, and only when its caller passes
+    # `resolution_recorded=True` — a re-arm that accepted nothing must not advance it,
+    # or escalations nobody answered become invisible forever. `record_session` is the
+    # sole mutation of `sessions` in `src/`, and a re-arm deliberately does NOT clear
+    # the list, which is what makes a length stable across cycles. 0 = nothing answered
+    # yet, which is also what a pre-upgrade `state.json` deserializes to (unfiltered,
+    # the pre-DW-11 behavior).
+    escalations_resolved_upto: int = 0
     # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
     # done spec); otherwise it skips it.
     followup_review_recommended: bool = False
+    # A timeout salvage verified this product but could not refile its follow-up
+    # over an unreadable ledger. Resume retries that current review's salvage,
+    # including authoritative verification, instead of rebuilding the attempt.
+    salvage_refile_pending: bool = False
+    # Sweep migration recovery format. 0 is a pre-upgrade task whose restart
+    # keeps the legacy reset-and-reread behavior; 1 requires the run-owned
+    # baseline/manifest (and, by phase, rewrite/result) records.
+    migration_recovery_format: int = 0
+    # True only when the migration publisher itself armed the run-scoped ledger
+    # doubt. A later successful idempotent replay may release that doubt, but
+    # must never release one inherited from another sweep phase.
+    migration_ledger_doubt_owned: bool = False
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Attempt-start fingerprints (`[st_mtime_ns, st_size]`, or None when the entry
+    # was listed but could not be measured) of every IGNORED entry under
+    # `implementation_artifacts`, keyed by repo-relative posix path — the baseline
+    # the bundle path's artifact-only receipt (DW-273) measures ownership against,
+    # since ignored paths have no git baseline of their own. Stamped beside the
+    # pair above at every genuinely new attempt, cleared with them. None = no
+    # snapshot (a story task, a pre-upgrade run, or a capture that degraded), on
+    # which the receipt refuses.
+    baseline_artifacts: dict[str, list[int] | None] | None = None
     # Deferred-work bookkeeping is persisted before its readers land so an older
     # state.json remains resumable throughout the forward-port.  The nullable
     # snapshot text and its captured flag are deliberately separate: None means
     # "no ledger existed", while False means "no snapshot was taken".
+    # A `_digest_of` sha256, or `engine._UNREADABLE_LEDGER_DIGEST` when the
+    # baseline read was refused by the OS (DW-258): still a `str`, but not a
+    # digest — `engine._ledger_changed_since_baseline` reads it as "unknown".
     baseline_ledger_digest: str | None = None
     pre_harvest_ledger: str | None = None
     pre_harvest_ledger_captured: bool = False
@@ -243,9 +330,6 @@ class StoryTask:
     # JSON-native containers only; callers persist these through state.json.
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     bundle_closes_intended: list[str] = field(default_factory=list)
-    # `append_entry` kwargs for review-budget follow-ups this task filed into the
-    # ACTIVE workspace's ledger, which under isolation is the unit worktree's.
-    refiled_followups: list[dict[str, Any]] = field(default_factory=list)
     # Deferred-work ids a story DECLARED it closes (`closes_deferred:`), recorded at
     # the commit boundary. Same ledger, same isolation problem: a gitignored path
     # never merges out of the unit worktree, so the flip has to be re-applied.
@@ -266,6 +350,36 @@ class StoryTask:
     accepted_dev_session_index: int | None = None
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
+    # Publication evidence is independent of the artifact-only receipt. None
+    # means legacy/unarmed; an empty baseline proves all paths were absent.
+    artifact_baseline: dict[str, str] | None = None
+    artifact_destination: str | None = None
+    # Exact ignored source bytes accepted by deterministic verification, as
+    # relpath -> sha256. Separate from ``artifact_baseline`` (destination
+    # overwrite authority) and ``artifact_payload`` (frozen replay bytes).
+    # None means legacy/unarmed or an acceptance whose binding was refused; an
+    # empty mapping proves the accepted selection contained no ignored files.
+    artifact_source_digests: dict[str, str] | None = None
+    # Git-clean-filter-normalized blob ids accepted for every tracked or
+    # pending-tracked declared deliverable. These authorize only the exact
+    # staged bytes at the final commit boundary; modes remain Git's concern.
+    # None means legacy/unarmed or an incomplete/refused binding, while an
+    # empty mapping proves the accepted selection contained no Git deliverables.
+    artifact_tracked_source_oids: dict[str, str] | None = None
+    # Stable owner of both accepted-source maps. Session-list indexes are
+    # append-only, unlike attempt/cycle counters after a human re-arm. The
+    # identity is persisted before source bytes are read so a crash in that
+    # window cannot replay the same accepted result and mint new authority.
+    artifact_acceptance_identity: str | None = None
+    artifact_payload: dict[str, str] | None = None
+    artifact_publication_complete: bool = False
+    # Durable authority for one target-side integration attempt.  The append
+    # journal is allowed to lose a torn final record, so it cannot be the source
+    # of truth for crash replay.  This JSON-native receipt is saved atomically
+    # before Git may move the target ref.  Its operation identity is coupled to
+    # Git's reflog action; ``old_revision``/``new_revision`` are filled from that
+    # ref update after it is observed.  None is legacy/no active integration.
+    integration_attempt: dict[str, Any] | None = None
     spec_file: str | None = None
     # The spec owned by the current/last dispatched dev attempt. Unlike
     # ``spec_file`` (the accepted/result artifact), this is bound before launch
@@ -416,9 +530,14 @@ class StoryTask:
             "review_cycle": self.review_cycle,
             "followup_reviews_spent": self.followup_reviews_spent,
             "generation": self.generation,
+            "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
+            "salvage_refile_pending": self.salvage_refile_pending,
+            "migration_recovery_format": self.migration_recovery_format,
+            "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_artifacts": self.baseline_artifacts,
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
@@ -427,12 +546,19 @@ class StoryTask:
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
-            "refiled_followups": self.refiled_followups,
             "story_closes_intended": self.story_closes_intended,
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
+            "artifact_baseline": deepcopy(self.artifact_baseline),
+            "artifact_destination": self.artifact_destination,
+            "artifact_source_digests": deepcopy(self.artifact_source_digests),
+            "artifact_tracked_source_oids": deepcopy(self.artifact_tracked_source_oids),
+            "artifact_acceptance_identity": self.artifact_acceptance_identity,
+            "artifact_payload": deepcopy(self.artifact_payload),
+            "artifact_publication_complete": self.artifact_publication_complete,
+            "integration_attempt": deepcopy(self.integration_attempt),
             "spec_file": self._serialized_worktree_path(self.spec_file),
             "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
             "dispatched_spec_snapshot": (
@@ -534,8 +660,17 @@ class StoryTask:
         relativization is measured against it.
         """
         self.release_spec_paths_from_mount()
+        self.artifact_baseline = None
+        self.artifact_destination = None
+        self.artifact_source_digests = None
+        self.artifact_tracked_source_oids = None
+        self.artifact_acceptance_identity = None
+        self.artifact_payload = None
+        self.artifact_publication_complete = False
+        self.integration_attempt = None
         self.baseline_commit = None
         self.baseline_untracked = None
+        self.baseline_artifacts = None
 
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
@@ -562,6 +697,37 @@ class StoryTask:
         self.spec_file = _rebased_on(self.spec_file, root)
         self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
 
+    def relativize_project_local_accepted_spec(self, project: Path) -> None:
+        """Make a canonical project-local accepted spec portable to a worktree.
+
+        Only the accepted ``spec_file`` is normalized. Prior-attempt dispatch path
+        and snapshot fields remain byte-for-byte untouched until fresh attempt
+        binding replaces them after the mount opens. Relative values already carry
+        the intended authority, while external, missing, unresolvable, and
+        symlink-external absolute values keep their original spelling. Resolving
+        both sides before containment prevents a lexical in-project path through an
+        outward symlink from being redirected into a replacement checkout.
+
+        Every probe sits INSIDE the ``try``, the regular-file one included (DW-116).
+        ``run_isolated`` calls this before its first ``except``, so an ``OSError`` out
+        of ``target.is_file()`` — a TOCTOU against the ``strict=True`` resolve just
+        above it, or a non-EACCES fault — killed the run rather than leaving the
+        spelling alone. Non-raising behavior is byte-identical: a false probe still
+        returns without relativizing, and so now does a raising one.
+        """
+        raw = self.spec_file
+        if not raw or not Path(raw).is_absolute():
+            return
+        try:
+            project_root = project.resolve(strict=True)
+            target = Path(raw).resolve(strict=True)
+            relative = target.relative_to(project_root)
+            if not target.is_file():
+                return
+        except (OSError, RuntimeError, ValueError):
+            return
+        self.spec_file = relative.as_posix()
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
         dispatched_spec_snapshot = d.get("dispatched_spec_snapshot")
@@ -583,13 +749,18 @@ class StoryTask:
             review_cycle=int(d.get("review_cycle", 0)),
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
             generation=int(d.get("generation", 0)),
+            escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
+            salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
+            migration_recovery_format=int(d.get("migration_recovery_format", 0)),
+            migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_artifacts=_baseline_artifacts_from(d.get("baseline_artifacts")),
             baseline_ledger_digest=(
                 str(d.get("baseline_ledger_digest"))
                 if d.get("baseline_ledger_digest") is not None
@@ -610,7 +781,6 @@ class StoryTask:
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
-            refiled_followups=[deepcopy(dict(item)) for item in d.get("refiled_followups", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
             board_advance_intended=(
                 str(d["board_advance_intended"])
@@ -624,6 +794,18 @@ class StoryTask:
             ),
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
+            artifact_baseline=deepcopy(d.get("artifact_baseline")),
+            artifact_destination=d.get("artifact_destination"),
+            artifact_source_digests=deepcopy(d.get("artifact_source_digests")),
+            artifact_tracked_source_oids=deepcopy(d.get("artifact_tracked_source_oids")),
+            artifact_acceptance_identity=(
+                str(d["artifact_acceptance_identity"])
+                if d.get("artifact_acceptance_identity") is not None
+                else None
+            ),
+            artifact_payload=deepcopy(d.get("artifact_payload")),
+            artifact_publication_complete=bool(d.get("artifact_publication_complete", False)),
+            integration_attempt=deepcopy(d.get("integration_attempt")),
             spec_file=d.get("spec_file"),
             dispatched_spec_file=d.get("dispatched_spec_file"),
             dispatched_spec_snapshot=dispatched_spec_snapshot,
@@ -662,6 +844,21 @@ class RunState:
     # `project`, which is exactly the pre-upgrade behavior and the correct answer
     # for every run without the override.
     repo_root: str = ""
+    # Intent marker for `runs.restamp_code_root`: True from the atomic state write
+    # that moved `repo_root` until the `rearm-code-root-restamped` journal record
+    # for that move has landed. state.json and the journal are two files with no
+    # transaction across them, so the move and its record cannot be made durable
+    # in one step; this flag rides the state write itself, which is what lets a
+    # retry tell "moved and recorded" from "moved, record still owed" — the one
+    # distinction that keeps the record retryable without ever asserting a move
+    # that was not persisted. Consumed by whichever surface retries first, and by
+    # both the same way: a second `restamp_code_root` and a plain `resume` each
+    # discharge the debt with their own `rearm-code-root-restamped` append naming
+    # the root THIS field's `repo_root` still describes, before overwriting it —
+    # never by folding it into another line, which would answer an A→B debt with a
+    # row that names no root. Deliberately absent from `documents.py`'s `--json`
+    # projection (schema 1), like `rearmed` / `resolved_redrive`.
+    code_root_restamp_pending: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -713,6 +910,15 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # Version of the separately persisted sweep.json options format. Zero means
+    # a pre-marker run, where a missing options file is the legacy unrestricted
+    # shape. Selector-capable sweeps stamp the current nonzero version at launch,
+    # so losing sweep.json cannot silently widen them on resume.
+    sweep_options_version: int = 0
+    # SHA-256 of the exact sweep.json bytes published for the current format.
+    # State and options are separate atomic files; this binding makes replacing
+    # a targeted run's valid options with an unrestricted document fail closed.
+    sweep_options_digest: str = ""
     # story-queue source (policy.StoriesPolicy.source), pinned at run start so
     # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
     # without re-reading policy — a policy edit mid-run must not switch a live run's
@@ -724,6 +930,64 @@ class RunState:
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
+    # sweep runs only: the run's own dispositions of deferred-work decisions —
+    # ids already journaled as skipped-unattended, and ids whose recorded answer
+    # this run already journaled as DROPPED (and notified). Persisted so a
+    # pause/resume of the SAME run does not re-announce a disposition it already
+    # made; deliberately run-scoped, so a NEW run re-evaluates every decision
+    # from scratch. Deliberately NOT the human's answer either: that stays in
+    # `<run>/decisions.json`, auditable and untouched — only the disposition the
+    # run reached about it lives here.
+    sweep_skipped_decisions: list[str] = field(default_factory=list)
+    sweep_dropped_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and a VERDICT rather than a disposition (DW-200): ids whose
+    # `build` answer this run recorded while `record_decision` reported writing no
+    # `decision:` line. It answers a different question from the two lists above —
+    # "this answer's ledger line never landed", not "this disposition was already
+    # announced" — and neither replaces the other. Persisted because the verdict is
+    # observed in `_decisions_phase` and consumed in `_materialize_bundles`: an
+    # interruption anywhere between them must not resume into a materialized bundle
+    # for an id the ledger holds no entry for. Cleared by the drop that announces
+    # it, in the same `_save()` that quarantines the id in
+    # `sweep_dropped_decisions`. An id no later drop announces remains until the
+    # run ends; this list never doubles as a second announcement gate.
+    sweep_unlanded_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and the RUN's ledger-publication doubt rather than a
+    # cycle's (DW-218/219). `_ledger_in_doubt` / `_close_ledger_in_doubt` live on
+    # the SweepEngine instance and are cycle-scoped by design; this mirrors them
+    # the moment either is armed, because the window that loses them is between
+    # the arming site and `_cycle`'s dispatch gate reporting: a stop request
+    # observed in the withheld branch, or any crash in the same span, ends the
+    # process with the verdict held only in memory, and the resume then dispatches
+    # the bundles whose `git add -A` sweeps the half-written ledger into HEAD.
+    # It follows the latch it mirrors rather than outliving it: a later effect
+    # landing in the same decision walk proves the ledger reads and writes again,
+    # and `_release_ledger_doubt` clears the mirror there — but ONLY for an arm
+    # THIS process made. The mirror is left standing while the close phase's latch
+    # is armed this cycle, and whenever it was inherited from a previous process,
+    # because "the ledger reads and writes again" is a statement about this
+    # process's LAST ATTEMPT and nothing wider — not about a write a different
+    # phase made, nor about bytes a previous process left on disk. Those two wait
+    # for the documented repair: a human edits the ledger
+    # and re-runs `bmad-loop sweep`, which is a NEW run with fresh state, so the
+    # residual stickiness cannot contaminate a later cycle: `_loop` stops or
+    # returns when doubt remains armed at the boundary. A cycle that releases its
+    # doubt can continue repeating with a clear mirror. Absent from an
+    # older `state.json`, it reads False: a compatibility default, so that run
+    # resumes exactly as it does today. Not evidence the run which wrote it was
+    # healthy — it could have armed an instance latch and lost it at the same
+    # interruption this field closes.
+    sweep_ledger_in_doubt: bool = False
+    # sweep runs only: a ledger write this run published whose commit has not yet
+    # landed. Latched BEFORE the already-resolved close and each decision effect
+    # write, cleared by the ledger-family `_commit_ledger` once git says the file
+    # is at HEAD, and settled at the top of a resume. The two sites gate their own
+    # commit on THIS invocation's write result (DW-183/DW-185), and a process that
+    # dies between the publish and the commit replays as an invocation that wrote
+    # nothing — so without the debt on disk the closure the journal already claims
+    # stays dirty ahead of the cycle's bundles. A pre-latch `state.json` loads
+    # False and resumes exactly as before.
+    sweep_ledger_commit_owed: bool = False
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -794,6 +1058,7 @@ class RunState:
             "run_id": self.run_id,
             "project": self.project,
             "repo_root": self.repo_root,
+            "code_root_restamp_pending": self.code_root_restamp_pending,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -809,9 +1074,16 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            "sweep_options_version": self.sweep_options_version,
+            "sweep_options_digest": self.sweep_options_digest,
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
+            "sweep_skipped_decisions": self.sweep_skipped_decisions,
+            "sweep_dropped_decisions": self.sweep_dropped_decisions,
+            "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
+            "sweep_ledger_in_doubt": self.sweep_ledger_in_doubt,
+            "sweep_ledger_commit_owed": self.sweep_ledger_commit_owed,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -825,6 +1097,7 @@ class RunState:
             run_id=d["run_id"],
             project=d["project"],
             repo_root=str(d.get("repo_root", "")),
+            code_root_restamp_pending=bool(d.get("code_root_restamp_pending", False)),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
@@ -840,9 +1113,16 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            sweep_options_version=int(d.get("sweep_options_version", 0)),
+            sweep_options_digest=str(d.get("sweep_options_digest", "")),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
+            sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
+            sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
+            sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
+            sweep_ledger_in_doubt=bool(d.get("sweep_ledger_in_doubt", False)),
+            sweep_ledger_commit_owed=bool(d.get("sweep_ledger_commit_owed", False)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),
@@ -868,10 +1148,101 @@ class VerifyOutcome:
     # time): no further session can reconcile it, so it routes to a pause with
     # both sides named rather than to another cycle (#334)
     contradiction: bool = False
+    # Whether this PASSING outcome waived the dev gate's proof-of-work check on
+    # the park leg (`verify_dev`'s two-part park selector fired). The fact of the
+    # waiver, not its result: `Engine._verify_dev_artifacts` journals exactly the
+    # attempts this is True for, so a park that got past the dev ARTIFACT gate
+    # without proving work always leaves a trace there (#676).
+    #
+    # Scoped to that gate at both ends, and the bound is worth stating exactly.
+    # This rides only the `passed()` return, so a leg that waived proof-of-work
+    # and then failed a later check INSIDE `verify_dev` — the sprint pair is the
+    # reachable one — records nothing; anything wider would need the flag on the
+    # failing constructors too. It says nothing at all about the stages AFTER that
+    # gate: the configured `[verify]` commands, decision routing, the review loop,
+    # the pre-commit workflows and the commit all run later and may still reject
+    # the attempt, which is then retried or deferred with its record already
+    # written. So a True here means "the artifact gate was cleared with
+    # proof-of-work waived", never "this park committed".
+    park_proof_skipped: bool = False
+    # An OBSERVATION, never a gate: on that same waived leg, what the skipped
+    # proof-of-work gate WOULD have found, measured from the same baseline and
+    # under the same exclusions it would have used. `True` = nothing it counts —
+    # the residue was confined to what proof-of-work already excludes, the #676
+    # shape the waiver exists for. `False` = it would have found changes. `None` =
+    # the probe could not answer.
+    #
+    # `False` is a statement about the TREE, not about a session, and the wording
+    # matters because the tempting shorthand ("the park wrote real code") is a
+    # claim this seam cannot make: the gate it stands in for cannot attribute
+    # residue to a session either — under `isolation = "none"` a commit that
+    # arrived in the shared checkout from outside the session satisfies it — so
+    # the observation inherits exactly that limit rather than improving on it.
+    #
+    # Three things produce `None`, all of them "the probe could not answer": a
+    # `GitError` (it degrades rather than escalating), a git REFUSAL such as an
+    # unresolvable baseline (any rc that is not one of git's two real answers, rc
+    # 128 being the everyday one — `_changes_since` reports it as unknown instead
+    # of letting the gate's fail-open record a confident `False`), and an
+    # attempt with no `baseline_commit` to measure from. Nothing branches on any
+    # of the three.
+    #
+    # The two fields are deliberately separate, and collapsing them is the bug
+    # this pair exists to prevent: one says a gate was waived, the other says what
+    # that gate would have found. Keyed on the observation alone, an unanswerable
+    # probe is indistinguishable from no waiver at all — so a park whose probe
+    # faulted would go unrecorded, re-creating exactly the silence this pair ends.
+    # A waived gate is recorded whatever the probe managed to say; `None` is a
+    # truthful field value, not a reason to withhold the record.
+    park_zero_diff: bool | None = None
+    # Stories plan halts waive the same proof-of-work gate for a different
+    # reason: the accepted output is the plan spec itself. Keep their observation
+    # independent of the park-only pair above — the result.json `plan_halt`
+    # marker remains the authority for which leg ran, while this field reports
+    # only what the waived gate would have found. `True` / `False` / `None` have
+    # the same no-diff / diff / unknown meanings as `park_zero_diff`.
+    plan_halt_zero_diff: bool | None = None
+    # A deferred-work BUNDLE's artifact-only receipt (DW-273). `True` when the
+    # bundle path's proof-of-work gate found nothing it counts, the session's
+    # synthesized result asserted `artifact_only: true` (the strict boolean
+    # `devcontract` mints from the current session's genuine marker, exactly as
+    # `park_asserted`), and a directory-scoped `git status --ignored` listing of
+    # the configured `implementation_artifacts` dir held IGNORED entries (`!!`
+    # records — the tracked and untracked ones are what the probe already
+    # measured). Only
+    # `verify.verify_dev_bundle` sets it; the sprint and stories legs never
+    # consult the receipt, so on their outcomes it is always `False`.
+    #
+    # It is a receipt, not a waiver: the gate still ran and positively answered
+    # "nothing changed" before the receipt was consulted, and what the receipt
+    # proves is bounded — ignored paths carry no baseline, so the listing shows
+    # only that the artifacts dir holds session-reachable content under the code
+    # tree, never WHICH entry this session wrote. The assertion is the
+    # load-bearing half, as it is for a park.
+    artifact_only_accepted: bool = False
+    # The number of ignored entries the receipt's listing held, carried to the journal
+    # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
+    # accepted, including on every non-bundle leg.
+    artifact_only_residue: int | None = None
 
     @classmethod
-    def passed(cls) -> "VerifyOutcome":
-        return cls(ok=True)
+    def passed(
+        cls,
+        *,
+        park_proof_skipped: bool = False,
+        park_zero_diff: bool | None = None,
+        plan_halt_zero_diff: bool | None = None,
+        artifact_only_accepted: bool = False,
+        artifact_only_residue: int | None = None,
+    ) -> "VerifyOutcome":
+        return cls(
+            ok=True,
+            park_proof_skipped=park_proof_skipped,
+            park_zero_diff=park_zero_diff,
+            plan_halt_zero_diff=plan_halt_zero_diff,
+            artifact_only_accepted=artifact_only_accepted,
+            artifact_only_residue=artifact_only_residue,
+        )
 
     @classmethod
     def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":

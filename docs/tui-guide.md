@@ -208,7 +208,11 @@ cost-weighted total first (cache reads at `limits.cache_read_weight`), the
 unweighted one in parentheses. Below the counts, an **agent line** names who is
 driving: while a session is open it reads `agent <name> · <model> · <role>` (the
 resolved adapter for the live stage — `model` omitted when the session ran the
-CLI profile's default, `role` is the stage `dev` / `review` / `triage`); when no
+CLI profile's default, `role` is the stage `dev` / `review` / `triage`), with a
+yellow `· idle <age>` appended while the session's transcript has sat still past
+`limits.dev_stall_grace_s` (#680 — derived from the journal's open
+`session-idle`, cleared by its `session-active`; `<age>` is whole minutes, or
+`1h05m` above an hour); when no
 session is open it falls back to the run's configured adapters, rebuilt from the
 run's policy snapshot — `agents <name·model>` when dev and review resolve alike,
 else `agents dev <name·model> review <name·model>`, plus a `triage <name·model>`
@@ -321,15 +325,18 @@ A run driven on another host (shared checkout) always shows `unknown`, never
 falsely `interrupted`. Legacy runs without a pid file fall back to probing the
 per-run tmux session, which can prove `alive` but never `dead`.
 
-Journal kinds are styled by substring, first match wins:
+Journal kinds are styled by substring, first match wins — except the reader-minted
+marker below, which is matched by EQUALITY before the substring table runs, so a
+producer kind that merely contains its spelling is not restyled:
 
-| Substring                                       | Color  | Examples                                        |
-| ----------------------------------------------- | ------ | ----------------------------------------------- |
-| `escalat`, `failed`                             | red    | `preference-escalation`, `review-verify-failed` |
-| `done`, `complete`, `finished`                  | green  | `story-done`, `run-complete`                    |
-| `decision`, `deferred`, `boundary`, `truncated` | yellow | `decision-pending`, `epic-boundary`             |
-| `start`, `resume`                               | cyan   | `session-start`, `run-resume`                   |
-| anything else                                   | dim    |                                                 |
+| Match                                                 | Color  | Examples                                                                                                                                                                                                                    |
+| ----------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `journal-line-unreadable` (exact kind, matched first) | red    | a journal line that could not be parsed; reader-minted, never written by the engine. Renders `bytes=<n>` and nothing else — deliberately no timestamp (unknowable) and no content from the line (it can carry session text) |
+| `escalat`, `failed`                                   | red    | `preference-escalation`, `review-verify-failed`                                                                                                                                                                             |
+| `done`, `complete`, `finished`                        | green  | `story-done`, `run-complete`                                                                                                                                                                                                |
+| `decision`, `deferred`, `boundary`, `truncated`       | yellow | `decision-pending`, `epic-boundary`                                                                                                                                                                                         |
+| `start`, `resume`                                     | cyan   | `session-start`, `run-resume`                                                                                                                                                                                               |
+| anything else                                         | dim    |                                                                                                                                                                                                                             |
 
 ## Key bindings
 
@@ -419,7 +426,18 @@ this run` when the original engine still appears to be running. Heed this
   one: two engines driving one run dir corrupt each other's state. It can also
   mean the pid was recycled by another process — verify before resuming.
 
-Confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
+After the multiplexer and engine-liveness checks, confirming an unfinished sweep
+checks whether the main checkout's deferred-work ledger can be read. An undecodable ledger or a
+permissions/storage read failure shows an error toast with the same repair guidance
+as the CLI, and no detached window launches. Repair the ledger by hand (or fix its
+permissions or storage), then resume again to keep the in-flight bundle recovery.
+The toast also offers `bmad-loop sweep` after committing or stashing changes so the
+worktree is clean. Story runs and cases where the probe cannot locate the ledger
+retain the existing handoff, as does an absent ledger. The probe does not check an
+isolated unit worktree's ledger; an unreadable copy there may still re-pause the run
+after handoff until that copy is repaired.
+
+When these checks pass, confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
 like any other launch. Resume drops any stale `bmad-loop-<run-id>` session a
 stopped or interrupted run left behind and spins up a fresh one, so the run
 never re-attaches to a dead session.
@@ -506,10 +524,13 @@ artifacts the engine already wrote.
   (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
   gate inherits the same richer surface — including the anchored read and the refusal
   of **Approve & resume** on a spec that cannot be read. Story-gate and epic-boundary pauses have no
-  spec to show — a story gate fires before the story is recorded, an epic boundary has
-  no story at all — so they open a compact pause-reason viewer instead: the reason names
-  the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the
-  ledger, so a gate that is still open legitimately re-pauses.
+  spec to show — a story gate fires before the story is recorded, or on a sweep bundle
+  whose intent regeneration the ledger refused (its task may carry a spec file, but the
+  gate is about the ledger, not the spec), an epic boundary has no story at all — so
+  they open a compact pause-reason viewer instead: the reason names
+  the blocking entries and the remedy. **Resume** re-picks a gated sprint story;
+  for a bundle-regeneration pause, it recovers the same persisted bundle and regenerates
+  its intent document. Both re-ask the ledger, so an unresolved refusal re-pauses.
 
 `p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
 Re-arm & resume inline once a resolution exists. Pause badges in the run list and
@@ -567,7 +588,19 @@ from — press `d`. The Deferred Work pane title shows the outstanding count
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
 a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
-acts on it (build → bundle, keep-open → recorded) without asking again. Skip a
+acts on it (build → bundle, keep-open → recorded) without asking again. The
+ledger can take no `decision:` line, though — the entry retired by another
+writer while the modal was open, or the ledger file gone (DW-198). The modal
+says so in a `warning` toast (naming the id, and the store answer where one was
+still saved), the walk carries on to the next decision, and that answer is not
+counted in the `recorded N decision(s)` summary. A publication refusal is appended
+to that warning, or shown in its own `warning` toast when a ledger line landed.
+It says an answer that DID land on disk could not be published to git
+(DW-209/213): the modal's writer commits only the files that call actually
+wrote, and a file that vanished or went unreadable between the write and the
+staging is dropped from the commit and named here with its cause. That one does
+not change the count, which still depends only on whether a ledger line landed,
+and the walk carries on the same way. Skip a
 modal to leave that one for later. The same set is available on the CLI via
 `bmad-loop decisions` (`--list` to just view).
 
@@ -617,12 +650,14 @@ behavior.
 | `gates.retrospective`                 | select                 | `notify`           | `never` / `notify` / `auto`                                                                                                                                                                                                                                                                                                        |
 | `limits.max_review_cycles`            | int ≥ 1                | 3                  | review loop bound before plateau-defer                                                                                                                                                                                                                                                                                             |
 | `limits.max_dev_attempts`             | int ≥ 1                | 2                  | dev retry budget                                                                                                                                                                                                                                                                                                                   |
+| `limits.artifact_file_max_mb`         | int ≥ 1                | 5                  | raw-byte cap for each ignored file selected for isolated artifact publication; tracked declarations ride Git and do not count                                                                                                                                                                                                      |
+| `limits.artifact_payload_max_mb`      | int ≥ 1                | 10                 | aggregate raw-byte cap across selected ignored publication files, enforced before base64 encoding                                                                                                                                                                                                                                  |
 | `limits.max_followup_reviews`         | int ≥ 0                | 1                  | extra review rounds granted for a finalized pass's own follow-up before it converges + refiles instead of burning a cycle · 0 = never honor one                                                                                                                                                                                    |
 | `limits.session_timeout_min`          | int ≥ 1                | 90                 | per-session wall clock                                                                                                                                                                                                                                                                                                             |
 | `limits.git_timeout_s`                | int ≥ 1                | 120                | bound on any single git subprocess; exceeding it pauses/degrades, never crashes the run — raise on a loaded host or a very large worktree                                                                                                                                                                                          |
 | `limits.teardown_grace_s`             | int ≥ 0                | 20                 | verified teardown: poll a killed session up to this long, then force-kill its pane pids and re-kill · 0 = single unverified best-effort kill                                                                                                                                                                                       |
 | `limits.stop_without_result_nudges`   | int ≥ 0                | 1                  | nudges when a session stops without result.json                                                                                                                                                                                                                                                                                    |
-| `limits.dev_stall_grace_s`            | int ≥ 0                | 600                | silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence · 0 = no launch timer, but a result-less turn end still fails fast                                                                                                                                                         |
+| `limits.dev_stall_grace_s`            | int ≥ 0                | 600                | silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence · also the transcript-idle notice threshold (journal `session-idle`/`session-active`, TUI idle age) · 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast                                |
 | `limits.dev_stall_nudges`             | int ≥ 0                | 2                  | best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget · 0 = stall on grace expiry                                                                                                                                                                                                |
 | `limits.dev_stall_nudges_cap`         | int ≥ 0                | 6                  | total (never-restored) nudge bound per dev/review session — an accepted nudge does not guarantee a wake · 0 = stall on first grace expiry                                                                                                                                                                                          |
 | `limits.workflow_stall_nudges_cap`    | int ≥ 0                | 3                  | same monotonic cap for an injected plugin-workflow session that finished its work but never wrote its completion marker · 0 = stall on first grace expiry                                                                                                                                                                          |
@@ -639,9 +674,10 @@ behavior.
 | `review.trigger`                      | select                 | `recommended`      | `recommended` (run only when the dev pass flags `followup_review_recommended`) / `always`; bounded by `limits.max_review_cycles`                                                                                                                                                                                                   |
 | `adapter.name`                        | text                   | `claude`           | CLI profile: `claude` / `codex` / `gemini` / custom                                                                                                                                                                                                                                                                                |
 | `adapter.model`                       | text                   | (CLI default)      | model override                                                                                                                                                                                                                                                                                                                     |
+| `adapter.effort`                      | text                   | (provider default) | reasoning effort, free-form (`high`, `max`, …); sent by `opencode-http` as the per-prompt `variant`, ignored by the tmux CLIs (validate warns)                                                                                                                                                                                     |
 | `adapter.extra_args`                  | override switch + args | profile defaults   | see below                                                                                                                                                                                                                                                                                                                          |
 | `adapter.cleanup_session_on_finish`   | switch                 | on                 | kill the run's tmux session on finish; off keeps it                                                                                                                                                                                                                                                                                |
-| `adapter.dev` / `.review` / `.triage` | text ×2 + args         | inherit            | per-stage `name` / `model` / `extra_args` overrides                                                                                                                                                                                                                                                                                |
+| `adapter.dev` / `.review` / `.triage` | text ×3 + args         | inherit            | per-stage `name` / `model` / `effort` / `extra_args` overrides                                                                                                                                                                                                                                                                     |
 | `sweep.auto`                          | select                 | `never`            | `never` / `per-epic` / `run-end`                                                                                                                                                                                                                                                                                                   |
 | `sweep.max_bundles`                   | int ≥ 1                | 5                  | bundles per sweep; triage excess truncated                                                                                                                                                                                                                                                                                         |
 | `sweep.max_triage_attempts`           | int ≥ 1                | 2                  | triage validation retries                                                                                                                                                                                                                                                                                                          |

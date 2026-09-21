@@ -25,6 +25,8 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .. import policy
+from ..escalation import display_pause_reason
+from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -110,6 +112,19 @@ def agent_label(name: str, model: str) -> str:
     return f"{name}·{model}" if model else name
 
 
+def _format_age(seconds: float) -> str:
+    """Coarse age for the header's `· idle <age>` text (#680): whole minutes
+    below an hour (`12m`), hours and minutes above (`1h05m`), never seconds — the
+    threshold is the stall grace (minutes), so finer resolution would only make
+    the line flicker on every poll. A negative age (a clock stepped backward
+    between the adapter's stamp and this render) reads as `0m` rather than a
+    minus sign."""
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
 class RunHeader(Static):
     """One-glance summary of the selected run, or the empty-state hint."""
 
@@ -191,6 +206,15 @@ class RunHeader(Static):
                 text.append(f" · {agent.model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
+            if agent.idle_since is not None:
+                # The transcript has sat still past the stall grace (#680): the
+                # pane may still be repainting a spinner, so this is the one
+                # surface that separates a session working from one parked in a
+                # tool call. Yellow, not red — it is a notice, not a verdict, and
+                # nothing bounds the stretch.
+                text.append(
+                    f" · idle {_format_age(time.time() - agent.idle_since)}", style="yellow"
+                )
         else:
             # No session open: show the configured adapters from the run's policy
             # snapshot. Skip the line entirely when the snapshot can't be rebuilt
@@ -226,7 +250,7 @@ class RunHeader(Static):
                 text.append("  ")
                 text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:
-                text.append(f" — {state.paused_reason}", style="yellow")
+                text.append(f" — {display_pause_reason(state)}", style="yellow")
             # p opens the stage-appropriate review viewer; e resumes; R resolves
             # an escalation (the header only hints the common paths).
             text.append("\n  press p to review · e to resume", style="dim")
@@ -256,6 +280,12 @@ class RunHeader(Static):
 
 
 # ------------------------------------------------------------ journal lines
+
+# Applied by EQUALITY, before the substring table below runs — see
+# `journal.UNREADABLE_LINE_KIND` for why. The detail local to this file: four PRODUCER
+# kinds end in "-unreadable" (`story-gate-unreadable`, `stories-manifest-unreadable`, …),
+# so any substring rule here would restyle them too.
+_UNREADABLE_LINE_STYLE = "red"
 
 # kind substrings -> style, first match wins; anything else renders dim
 _JOURNAL_STYLES = (
@@ -289,7 +319,10 @@ _JOURNAL_COL_PAD = 1  # per-column right pad in the row grid
 
 def journal_line(entry: dict[str, Any]) -> Table:
     kind = str(entry.get("kind", "?"))
-    style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
+    if kind == UNREADABLE_LINE_KIND:
+        style = _UNREADABLE_LINE_STYLE
+    else:
+        style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
     ts = entry.get("ts")
     clock = ""
     if isinstance(ts, (int, float)):

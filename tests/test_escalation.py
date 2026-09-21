@@ -1,11 +1,19 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import pytest
+
+from bmad_loop import escalation
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.escalation import (
+    CRITICAL_DISPLAY_MAX,
     Action,
+    critical_escalations,
+    critical_session_reason,
     decide_dev,
     decide_review_session,
+    display_critical_reason,
+    preference_escalations,
     review_retry_or_exhaust,
 )
 from bmad_loop.model import StoryTask
@@ -18,6 +26,104 @@ POLICY = Policy(
 )
 COMPLETED = SessionResult(status="completed", result_json={"escalations": []})
 FAILING = VerifyOutcome.retry("spec status is 'in-progress', expected 'done'")
+
+
+def test_escalation_selectors_preserve_valid_list_semantics():
+    critical = {"severity": "critical", "detail": "stop"}
+    preferences = [
+        {},
+        {"severity": "PREFERENCE", "detail": "explicit"},
+        {"detail": "implicit"},
+        {"severity": 1, "detail": "non-critical"},
+    ]
+    result = {"escalations": [None, "junk", critical, *preferences]}
+
+    assert critical_escalations(result) == [critical]
+    assert preference_escalations(result) == preferences
+
+
+def test_escalation_selectors_reject_every_non_list_shape():
+    for value in (None, 1, "escalation", {"severity": "CRITICAL"}, ("tuple",)):
+        result = {"escalations": value}
+        assert critical_escalations(result) == []
+        assert preference_escalations(result) == []
+
+
+def test_escalation_selectors_absorb_a_non_mapping_document():
+    """The row above varies the `escalations` VALUE; this one varies the whole
+    document through direct helper calls (DW-181). The sweep lanes call the
+    critical selector before their validators, but the earlier engine
+    dereference prevents malformed session documents from reaching them.
+
+    ABLATION: restore `if not result_json` in `_escalation_list` and every
+    truthy row here raises `AttributeError` instead of returning `[]` -- the
+    empty list alone would pass for any reason a value could be absent, so the
+    mapping control below pins that the widened guard still lets a real
+    document through to its partition."""
+    for document in (None, {}, [], "", 0, False, ["nope"], "escalations", 7):
+        assert critical_escalations(document) == []
+        assert preference_escalations(document) == []
+
+    critical = {"severity": "CRITICAL", "detail": "stop"}
+    preference = {"severity": "PREFERENCE", "detail": "note"}
+    control = {"escalations": [critical, preference]}
+
+    assert critical_escalations(control) == [critical]
+    assert preference_escalations(control) == [preference]
+
+
+@pytest.mark.parametrize("role", ["dev", "review", "fix", "migration", "triage"])
+def test_every_critical_session_role_uses_the_shared_lossless_formatter(role):
+    detail = "begin\n" + "x" * 2500 + "TAIL"
+    reason = critical_session_reason(
+        role,
+        {"escalations": [{"severity": "CRITICAL", "detail": detail}]},
+    )
+    assert reason == f"CRITICAL escalation from {role} session: {detail}"
+    assert reason.endswith("TAIL")
+
+
+def test_critical_display_bound_marks_spec_or_journal_without_touching_short_text():
+    exact = "x" * CRITICAL_DISPLAY_MAX
+    assert display_critical_reason(exact) == exact
+    assert "truncated" not in display_critical_reason(exact)
+
+    with_spec = display_critical_reason(exact + "TAIL", "/tmp/spec.md")
+    without_spec = display_critical_reason(exact + "TAIL")
+    assert len(with_spec) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in with_spec
+    assert "[recovery trail: /tmp/spec.md]" in with_spec
+    assert len(without_spec) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in without_spec
+    assert "TAIL" not in with_spec
+
+
+def test_critical_display_preserves_source_spelling_and_compacts_an_overlong_source():
+    spaced = "/tmp/spec.md "
+    assert display_critical_reason("short", spaced) == f"short [recovery trail: {spaced}]"
+
+    source = "/root/" + "middle/" * 300 + "spec.md"
+    displayed = display_critical_reason("R" * 3000, source)
+    assert len(displayed) <= CRITICAL_DISPLAY_MAX
+    assert "R" * 1000 in displayed
+    assert "full detail in journal.jsonl" in displayed
+    assert "recovery trail: /root/" in displayed
+    assert displayed.endswith("spec.md]")
+    assert source not in displayed
+
+
+def test_decide_review_session_calls_the_shared_critical_formatter(monkeypatch):
+    calls = []
+
+    def shared(role, result_json):
+        calls.append((role, result_json))
+        return "shared review reason"
+
+    monkeypatch.setattr(escalation, "critical_session_reason", shared)
+    result = SessionResult(status="completed", result_json={"escalations": []})
+    decision = escalation.decide_review_session(_task(), result, POLICY)
+    assert calls == [("review", result.result_json)]
+    assert decision == escalation.Decision(Action.PAUSE, "shared review reason")
 
 
 def _task(**kw) -> StoryTask:
@@ -83,6 +189,77 @@ def test_dev_env_fault_session_pauses_even_when_budget_exhausted():
     decision = decide_dev(task, env_fault, None, POLICY)
     assert decision.action == Action.PAUSE
     assert "environment fault" in decision.reason
+
+
+def test_dev_no_work_session_pauses_even_with_budget_left():
+    """A dev session with no qualifying work evidence (#727), such as a CLI
+    parked on a permission dialog,
+    PAUSEs for a human instead of RETRYing into the identical wall. The reason
+    names the measurement, not the verdict alone.
+
+    ABLATION: delete the `produced_work` arm in `decide_dev` and this RETRYs."""
+    task = _task(attempt=1)  # 1 < 2 -> budget remains
+    parked = SessionResult(status="stalled", produced_work=False)
+    decision = decide_dev(task, parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session stalled")
+    assert "no completed turn or qualifying activity was observed" in decision.reason
+    assert "permission prompt" in decision.reason
+    assert "the attempt is not charged" in decision.reason
+
+
+def test_dev_no_work_session_pauses_even_when_budget_exhausted():
+    """The no-work pause outranks budget exhaustion like the env-fault pause does:
+    a spent budget must not file a CLI waiting on a human as deferred work."""
+    task = _task(attempt=2)  # 2 == max_dev_attempts -> budget spent
+    parked = SessionResult(status="crashed", produced_work=False)
+    decision = decide_dev(task, parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session crashed")
+
+
+def test_dev_produced_work_default_keeps_todays_routing():
+    """`produced_work` defaults True — "unknown never blocks" — so every positional
+    construction (the engine's hand-built results, opencode-http, every fixture)
+    keeps RETRY-with-budget / DEFER-without. Pinned on both arms so the default
+    cannot silently flip."""
+    plain = SessionResult(status="timeout")
+    assert plain.produced_work is True
+    assert decide_dev(_task(attempt=1), plain, None, POLICY).action == Action.RETRY
+    assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
+    assert "no work produced" not in decide_dev(_task(attempt=1), plain, None, POLICY).reason
+
+
+def test_dev_env_fault_outranks_no_work():
+    """Both flags set: the env-fault arm is checked first, so the reason blames
+    the transport, not the silence — a lost API connection explains a still
+    pane better than the still pane explains itself."""
+    task = _task(attempt=1)
+    both = SessionResult(
+        status="timeout",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        produced_work=False,
+    )
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session timeout")
+    assert "no work produced" not in decision.reason
+
+
+def test_no_work_reason_keeps_the_lost_session_suffix():
+    """#727 x #489: the no-work reason is composed over `session_failure_reason`,
+    so a session the multiplexer destroyed before it painted a second frame
+    carries both facts instead of one cancelling the other."""
+    task = _task(attempt=1)
+    both = SessionResult(status="crashed", session_vanished=True, produced_work=False)
+    decision = decide_dev(task, both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: dev session crashed:")
+    assert "multiplexer no longer reports the session" in decision.reason
+    # the review decider does not carry the arm (a named follow-up, not this wave)
+    review = decide_review_session(task, both, POLICY)
+    assert "no work produced" not in review.reason
 
 
 def test_dev_plain_noncompleted_still_retries_with_budget():

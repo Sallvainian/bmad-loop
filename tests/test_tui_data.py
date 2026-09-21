@@ -7,12 +7,13 @@ import importlib
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from conftest import install_bmad_config, refuse_to_resolve, write_sprint
 
-from bmad_loop import bmadconfig, deferredwork, policy
-from bmad_loop.journal import Journal, save_state
+from bmad_loop import bmadconfig, deferredwork, platform_util, policy
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data
@@ -30,10 +31,19 @@ def make_run(root: Path, run_id: str, **state_kwargs) -> Path:
     return run_dir
 
 
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def dead_pid() -> int:
-    """Pid guaranteed (modulo astronomically unlikely reuse) to be dead."""
+    """Return an exited child's PID, retaining its handle to prevent Windows reuse."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
@@ -106,6 +116,65 @@ def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch)
     assert data.pending_missed_decisions(original_spelling) is pending
     assert paths.project in data._missed_cache
     assert original_spelling not in data._missed_cache
+
+
+def test_pending_missed_decisions_survives_an_undecodable_triage(project):
+    """DW-145 at the one surface where the fault escaped UNCAUGHT. This reader
+    catches `(BmadConfigError, OSError)`, and `UnicodeDecodeError` is a
+    `ValueError`: one run's cached triage holding non-UTF-8 bytes raised straight
+    out of `decisions.pending_missed_decisions`, past this handler, into the
+    dashboard's render. The good run's DW-1 still lists, so the widened except
+    tuple degrades per FILE rather than blanking the panel.
+    Ablation: revert that tuple to `(json.JSONDecodeError, OSError)` and this
+    reddens with `UnicodeDecodeError` rather than returning ["DW-1"]."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+    (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
+
+    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
+def test_pending_missed_decisions_survives_a_nested_null_triage(project):
+    """DW-155/DW-158 at the same uncaught surface, one fault class over. A cached
+    triage can decode and parse cleanly and still hold a `null` where a list
+    member belongs; `validate_triage` called `.get` on it unscreened, so an
+    `AttributeError` -- not an `OSError`, so this reader's
+    `(BmadConfigError, OSError)` catch does not see it either -- escaped
+    `decisions.pending_missed_decisions` and reached the dashboard's render, the
+    same path DW-145's `UnicodeDecodeError` took. The validator is total over
+    shapes now, so the bad cache is refused and skipped and the good run's DW-1
+    still lists: degradation is per FILE, not a blanked panel.
+    Ablation: drop the `_plan_mapping` call in `validate_triage`'s `bundles` loop
+    and this reddens with `AttributeError` rather than returning ["DW-1"]."""
+    import json
+
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+    (bad / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": [],
+                "already_resolved": [],
+                "bundles": [None],
+                "blocked": [],
+                "skip": [],
+                "decisions": [],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
@@ -259,11 +328,86 @@ def test_journal_tail_resets_on_truncation(tmp_path):
     assert [e["kind"] for e in tail.read_new()] == ["run-start"]
 
 
-def test_journal_tail_skips_unparseable_lines(tmp_path):
+def test_journal_tail_reports_unparseable_lines_as_a_marker(tmp_path):
+    """An unreadable line is REPORTED in the live pane, not skipped: the shared
+    `journal.unreadable_line_entry` takes its stream position, so the operator sees
+    that a record was lost rather than a gap they cannot detect. (Inverted from
+    `test_journal_tail_skips_unparseable_lines` by DW-97.)
+
+    Ablation: restore `except json.JSONDecodeError: continue` in `read_new` and this
+    reddens with the marker absent."""
     path = tmp_path / "journal.jsonl"
     path.write_text('not json\n{"ts": 1, "kind": "run-start"}\n')
     tail = data.JournalTail(tmp_path)
+    assert tail.read_new() == [
+        {"kind": UNREADABLE_LINE_KIND, "bytes": len("not json")},
+        {"ts": 1, "kind": "run-start"},
+    ]
+
+
+def test_journal_tail_marker_matches_the_journal_entries_marker(tmp_path):
+    """Both readers mint the SAME shape from the same helper — the whole reason the
+    minter lives in `journal.py` rather than twice.
+
+    The torn line carries a MULTI-BYTE character, so `bytes` can distinguish the raw
+    line (15 bytes) from the decoded string this reader parses (14 characters). With
+    an ASCII-only fixture the two are equal and `len(raw)` vs `len(line)` is
+    untestable — and they must not diverge, or the two readers would report different
+    counts for one line.
+
+    Ablation: count `len(line)` (the decoded string) in `read_new` instead of
+    `len(raw)` and this reddens, 14 != 15."""
+    path = tmp_path / "journal.jsonl"
+    torn = '{"kind": "café'  # 14 characters, 15 UTF-8 bytes
+    path.write_text(f'{torn}\n{{"ts": 1, "kind": "run-start"}}\n', encoding="utf-8")
+    assert len(torn) == 14 and len(torn.encode("utf-8")) == 15  # the two spellings differ
+
+    tail_entries = data.JournalTail(tmp_path).read_new()
+    assert tail_entries == Journal(tmp_path).entries()
+    assert tail_entries[0] == {"kind": UNREADABLE_LINE_KIND, "bytes": 15}
+
+
+def test_journal_tail_withholds_a_fragment_until_its_newline_lands(tmp_path):
+    """The byte offset only advances past complete lines, so a partially flushed
+    record is not read as a truncated entry — and `Journal.append`'s heal is what
+    guarantees that newline eventually arrives on the fragment's OWN line."""
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"ts": 1, "kind": "run-start"}\n{"ts": 2, "kind": "unit-merge-star')
+    tail = data.JournalTail(tmp_path)
     assert [e["kind"] for e in tail.read_new()] == ["run-start"]
+    assert tail.read_new() == []  # nothing new; the fragment is still withheld
+
+
+def test_journal_tail_sees_both_records_after_a_healed_append(tmp_path):
+    """The two-record regression at the TUI's reader: one partial flush costs one
+    record, and the SUCCESSOR of the healing append is intact.
+
+    Ablation: drop the `_tail_is_terminated` prepend in `Journal.append` and this
+    reddens — `unit-merged` is swallowed with the fragment."""
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"ts": 2, "kind": "unit-merge-star')
+    tail = data.JournalTail(tmp_path)
+    assert tail.read_new() == []
+
+    journal = Journal(tmp_path)
+    journal.append("unit-merged", unit="u1")
+    journal.append("run-complete")
+    assert [e["kind"] for e in tail.read_new()] == [
+        UNREADABLE_LINE_KIND,
+        "unit-merged",
+        "run-complete",
+    ]
+
+
+def test_journal_tail_marker_at_the_tail_clears_a_pending_decision(tmp_path):
+    """`data.pending_decision` (and `launch.decision_pending`) read the LAST entry
+    only, on the documented ground that any later entry means the prompt moved on. A
+    marker is a later entry, so the alert clears — read-only evidence, asserted here
+    so the coupling is not rediscovered by an operator staring at a stuck alert."""
+    entries = [{"kind": "decision-pending", "dw_id": "DW-1", "question": "?"}]
+    assert data.pending_decision(entries) is not None
+    entries.append({"kind": UNREADABLE_LINE_KIND, "bytes": 12})
+    assert data.pending_decision(entries) is None
 
 
 # ------------------------------------------------------------------ LogView
@@ -801,6 +945,90 @@ def test_active_agent_labeled_session_peels_story_key():
     assert (agent.name, agent.model) == ("codex", "gpt-5")
 
 
+def _stamped_start(task_id="1-1-alpha-dev-3"):
+    return {
+        "kind": "session-start",
+        "task_id": task_id,
+        "role": "dev",
+        "adapter": "claude",
+        "model": "opus",
+        "story_key": "1-1-alpha",
+    }
+
+
+def test_active_agent_idle_since_from_open_idle_stretch():
+    """#680: the last `session-idle` for the open session's task, not closed by a
+    later `session-active`, sets `idle_since` to its `since_ts`; the default is
+    None, so every existing construction and comparison stands.
+
+    ABLATION E: drop the `_idle_since` derivation and the first assertion reddens."""
+    entries = [
+        _stamped_start(),
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0, "idle_s": 60.0},
+    ]
+    agent = data.active_agent(entries, None)
+    assert agent is not None and agent.idle_since == 5030.0
+    assert data.active_agent([_stamped_start()], None).idle_since is None
+
+
+def test_active_agent_idle_since_cleared_by_session_active_and_session_end():
+    idle = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0}
+    active = {"kind": "session-active", "task_id": "1-1-alpha-dev-3", "idle_s": 120.0}
+    agent = data.active_agent([_stamped_start(), idle, active], None)
+    assert agent is not None and agent.idle_since is None
+    # a later stretch reopens it with its own since_ts
+    later = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5150.0}
+    agent = data.active_agent([_stamped_start(), idle, active, later], None)
+    assert agent is not None and agent.idle_since == 5150.0
+    # session-end closes the session: no agent at all
+    ended = {"kind": "session-end", "task_id": "1-1-alpha-dev-3"}
+    assert data.active_agent([_stamped_start(), idle, ended], None) is None
+
+
+def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
+    """A `session-idle` for another task, or one left behind by an EARLIER session
+    (before this session-start), is not this session's."""
+    stale = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 4000.0}
+    other = {"kind": "session-idle", "task_id": "2-2-beta-dev-1", "since_ts": 5030.0}
+    agent = data.active_agent([stale, _stamped_start(), other], None)
+    assert agent is not None and agent.idle_since is None
+
+
+def test_active_agent_idle_since_never_raises_on_malformed_entry():
+    """A `session-idle` without a numeric `since_ts` is skipped (the TUI ages the
+    text from it); the agent itself is still derived."""
+    for bad in (
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3"},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": "soon"},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": None},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": True},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("nan")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("-inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 10**1000},
+    ):
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert agent is not None and agent.idle_since is None
+        agent = data.active_agent(
+            [
+                _stamped_start(),
+                {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0},
+                bad,
+            ],
+            None,
+        )
+        assert agent is not None and agent.idle_since == 5030.0
+    # an int since_ts is a number too
+    agent = data.active_agent(
+        [
+            _stamped_start(),
+            {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030},
+        ],
+        None,
+    )
+    assert agent is not None and agent.idle_since == 5030.0
+
+
 def test_active_agent_none_without_resolvable_snapshot():
     # Unstamped entry + no trustworthy snapshot: an all-"claude" reconstruction
     # would mislabel a run that predates stamping, so the agent is unknown.
@@ -1000,6 +1228,20 @@ def test_deferred_entries_unavailable(tmp_path, project):
     assert data.deferred_entries(project.project) is None
 
 
+def test_deferred_entries_undecodable_ledger_is_unavailable(project):
+    """The pane already had an "unavailable" degrade (`items = None`), but reached it
+    only for `OSError` — and `UnicodeDecodeError` is a `ValueError` (DW-146), so
+    undecodable bytes escaped the whole refresh instead of rendering the pane
+    unavailable. Same answer as a missing ledger: the dashboard cannot show entries
+    it could not read.
+    Ablation: revert the except tuple to `OSError` alone and this reddens with
+    `UnicodeDecodeError` escaping rather than `None`."""
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    assert data.deferred_entries(project.project) is None
+
+
 def test_severity_extraction():
     cases = {
         "severity: high\n": "high",
@@ -1013,6 +1255,21 @@ def test_severity_extraction():
     }
     for body, expected in cases.items():
         assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
+
+
+def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project):
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: quoted severity\n\n"
+        "```markdown\nseverity: critical\n```\nstatus: open\n",
+        encoding="utf-8",
+    )
+
+    items = data.deferred_entries(project.project)
+
+    assert items is not None
+    assert items[0].severity is None
 
 
 def test_deferred_entries_legacy_ledger(project):
@@ -1133,20 +1390,9 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
 
     `_session_task_id` composes `safe_segment(f"{story_key}-{part}-{seq}{gen}")`, and
     #705 added `gen` — a `-g<N>` suffix emitted only above generation zero. That
-    changed the grammar this parser documents, and nothing recorded either half of it.
-
-    The `-g1` row pins a DOCUMENTED LIMITATION, not a desired outcome: the suffix
-    fails `seq.isdigit()` and the whole id comes back as the story key. It is
-    unreachable today because every `session-start` has carried `story_key` since #153
-    phase 1, so the entries this fallback actually sees predate generations entirely.
-    It is pinned precisely because that reasoning is an assumption about the CALLER:
-    widen the fallback to entries that can carry `-gN` and this row is where the
-    breakage surfaces, instead of a bogus `1-1-a-dev-1-g1` row appearing in the
-    active-agent view.
-
-    Ablation: drop the `seq.isdigit()` term and the `-g1` row changes answer (it then
-    peels `g1` as if it were a sequence); change the emitted suffix shape in
-    `engine._session_task_id` and the last row reddens.
+    changed the grammar this parser documents. Only a final numeric generation
+    component is peeled; generation-like malformed or nonterminal components retain
+    the existing best-effort fallback behavior.
     """
     # the ordinary unsuffixed shape: the recorded role is peeled with its seq
     assert data._story_key_from_task_id("1-1-a-dev-1", "dev") == "1-1-a"
@@ -1156,6 +1402,13 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
     # not the expected shape at all — returned verbatim
     assert data._story_key_from_task_id("nonsense", "dev") == "nonsense"
 
-    # generation-suffixed (#705): NOT parsed, returned whole. Unreachable today.
-    assert data._story_key_from_task_id("1-1-a-dev-1-g1", "dev") == "1-1-a-dev-1-g1"
-    assert data._story_key_from_task_id("1-1-a-dev-1-g12", "dev") == "1-1-a-dev-1-g12"
+    # generation-suffixed (#705): one terminal numeric generation is peeled
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1", "dev") == "1-1-a"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g12", "dev") == "1-1-a"
+    # malformed and nonterminal generation-like components are not suffixes
+    assert data._story_key_from_task_id("1-1-a-dev-1-g", "dev") == "1-1-a-dev-1-g"
+    assert data._story_key_from_task_id("1-1-a-dev-1-gx", "dev") == "1-1-a-dev-1-gx"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g0", "dev") == "1-1-a-dev-1-g0"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g01", "dev") == "1-1-a-dev-1-g01"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g١", "dev") == "1-1-a-dev-1-g١"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1-extra", "dev") == "1-1-a-dev-1-g1-extra"
