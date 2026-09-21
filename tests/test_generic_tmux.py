@@ -6521,6 +6521,61 @@ def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
+def test_transcript_write_inside_the_first_heartbeat_interval_is_work(tmp_path, monkeypatch):
+    """The transcript is written between the `SessionStart` that names it and the
+    next heartbeat. The idle baseline is taken the moment the transcript is named,
+    so that write is a CHANGE at the first heartbeat sample — not absorbed into
+    the baseline. Static pane, no Stop, then timeout: `produced_work=True`.
+
+    ABLATION: drop the `_sample_transcript_idle` call at first observation and the
+    heartbeat sample becomes the baseline — False."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0  # inside the first heartbeat interval
+            _grow(transcript, b'{"type":"assistant"}\n')
+        elif call_n == 3:
+            clock["t"] += 20.0  # heartbeat 2 fires at +30 and samples the change
+        elif call_n == 4:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch):
+    """The transcript's only write lands after the last heartbeat sample and the
+    deadline elapses before another: the exit verdict compares the transcript
+    against the tracker's baseline itself. `timeout`, `produced_work=True`.
+
+    ABLATION: drop the transcript comparison inside `produced_work()` — False."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            _grow(transcript, b'{"type":"assistant"}\n')
+        elif call_n == 3:
+            clock["t"] += 10_000.0  # no heartbeat fires before the deadline check
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]  # never re-sampled
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
 def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
     """The complement: a named transcript that never changes after its first
     sample is not activity — the first sample alone must not latch `moved`."""
@@ -6767,14 +6822,16 @@ def test_idle_stretch_journals_one_pair_and_stamps_heartbeat(tmp_path, monkeypat
 
     assert result.status == "timeout"  # the idle stretch itself ended nothing
     assert mux.sent == []  # never nudged
-    # heartbeat 1 predates the transcript; the first sample is age 0; the age
-    # climbs; the move resets it; the second stretch climbs to its own crossing
+    # heartbeat 1 predates the transcript; the baseline is taken the moment the
+    # SessionStart names it (mono 1000, inside tick 1), so heartbeat 2 already
+    # reads 30 s; the age climbs; the move resets it; the second stretch climbs
+    # to its own crossing
     assert [hb["transcript_idle_s"] for hb in heartbeats] == [
         None,
-        0.0,
         30.0,
         60.0,
         90.0,
+        120.0,
         0.0,
         30.0,
         60.0,
@@ -6789,10 +6846,10 @@ def test_idle_stretch_journals_one_pair_and_stamps_heartbeat(tmp_path, monkeypat
         "kind": "session-idle",
         "task_id": "3-1-dev-1",
         "idle_s": 60.0,
-        "since_ts": 5030.0,  # wall time of the first sample (mono 1030)
+        "since_ts": 5000.0,  # wall time the transcript was first named (mono 1000)
         "threshold_s": 60.0,
     }
-    assert active == {"kind": "session-active", "task_id": "3-1-dev-1", "idle_s": 120.0}
+    assert active == {"kind": "session-active", "task_id": "3-1-dev-1", "idle_s": 150.0}
     assert second["since_ts"] == 5150.0  # the move at mono 1150 started the new stretch
     assert second["idle_s"] == 60.0
 
@@ -6819,7 +6876,7 @@ def test_idle_events_need_a_positive_grace(tmp_path, monkeypatch):
     adapter.wait_for_completion(_dev_handle(), spec)
 
     assert adapter.journal.entries == []
-    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, 0.0, 30.0, 60.0, 90.0, 120.0]
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, 30.0, 60.0, 90.0, 120.0, 150.0]
 
 
 def test_idle_events_need_an_attached_journal(tmp_path, monkeypatch):
@@ -6844,7 +6901,7 @@ def test_idle_events_need_an_attached_journal(tmp_path, monkeypatch):
     )
     spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
     adapter.wait_for_completion(_dev_handle(), spec)
-    assert heartbeats[-1]["transcript_idle_s"] == 120.0
+    assert heartbeats[-1]["transcript_idle_s"] == 150.0
 
 
 def test_idle_age_is_null_without_a_transcript(tmp_path, monkeypatch):

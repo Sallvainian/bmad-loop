@@ -820,6 +820,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # Read at call time, after a final frame sample, so every exit below
             # reports the loop's final view of the pane rather than the last tick's.
             sample_frame()
+            if transcript_path and not idle.moved and idle.last_key is not None:
+                # Same for the transcript: a write inside the final heartbeat
+                # interval has not been sampled yet. Compare against the tracker's
+                # baseline without advancing it — the idle record is the heartbeat's.
+                key = self._transcript_activity_key(transcript_path)
+                if key is not None and key != idle.last_key:
+                    idle.moved = True
             return self._work_verdict(handle, stop_seen, activity_seen or idle.moved or usage_seen)
 
         while True:
@@ -1170,6 +1177,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             session_id = event.session_id or session_id
+            if event.transcript_path and not transcript_path:
+                # First observation of the transcript (#680): take the idle
+                # baseline NOW, not at the next heartbeat, so the age is measured
+                # from when the transcript became known and every later write —
+                # including one inside the first heartbeat interval — is seen as a
+                # change by the #727 transcript latch (`_IdleTracker.moved`) rather
+                # than absorbed into the baseline.
+                self._sample_transcript_idle(
+                    handle.task_id, event.transcript_path, idle, time.monotonic()
+                )
             transcript_path = event.transcript_path or transcript_path
 
             if event.event == "SessionStart":
