@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
+  inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
+  every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
+  sets it (#643).
 - Journal a session's idle stretches (#680). The tmux adapter stats the live transcript
   on the heartbeat cadence, stamps `transcript_idle_s` on `heartbeat.json`, and — with
   the engine's journal attached (`CodingCLIAdapter.journal`) — writes one `session-idle`
@@ -27,6 +31,12 @@ breaking changes may land in a minor release.
   dialog, a login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
   environment fault does, `dev-decision` and `session-end` carry the flag, and re-arm
   resets the attempt.
+- Preserve inherited `model`, `effort` and `extra_args` when a stage names an alias
+  of the base client (`opencode` / `opencode-http`, `claude-code-tmux` / `claude`)
+  instead of treating it as a client switch.
+- Key the `run --dry-run` launch preview on the adapter kind, not `profile.hookless`:
+  an `opencode-http` profile with a hook dialect shows the server/prompt_async line,
+  a hookless profile of another kind shows the argv line.
 
 ## [0.12.0] — 2026-09-20
 

@@ -890,6 +890,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{prof.name} expects e.g. 'anthropic/claude-haiku-4-5'",
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
+            # Reasoning effort (#643) has exactly one carrier: the opencode-http
+            # kind sends it as the per-prompt `variant`. The tmux generic family
+            # has no channel for it — no profile flag, no hook field — so a stage
+            # that sets it there runs at the provider default with nothing to show
+            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
+            # because "cannot carry effort" is a fact about that family; an
+            # out-of-tree kind's capability is not knowable here, so it stays
+            # silent rather than assert one. Advisory: severity `problem` is
+            # validate's exit code, and an ignored knob does not make a run unrunnable.
+            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+                report.warn(
+                    "policy.effort-unsupported",
+                    f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "
+                    f"only the opencode-http adapter carries a reasoning-effort value",
+                    {"role": role, "effort": cfg.effort, "profile": prof.name},
+                )
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -2105,19 +2121,27 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
+    from .adapters import registry as adapter_registry
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
-    if profile.hookless:
+    # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
+    # axes, so an `opencode-http` profile carrying a hook dialect still launches
+    # the HTTP adapter (and sends effort), while a hookless profile of another
+    # kind never does. The preview must follow the adapter `make_adapters` builds.
+    if profile.adapter == adapter_registry.OPENCODE_HTTP:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
         model = f" model={cfg.model}" if cfg.model else ""
+        # effort rides the prompt_async body as `variant` (#643); shown under the
+        # policy's own key so the preview distinguishes the configurations.
+        effort = f" effort={cfg.effort}" if cfg.effort else ""
         return (
             f"{profile.binary} serve --hostname 127.0.0.1 --port <auto> "
             f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
-            f"{model}"
+            f"{model}{effort}"
         )
     extra = cfg.extra_args if cfg.extra_args is not None else profile.bypass_args
     argv = [
@@ -3470,7 +3494,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
                 return rc
         adapters = _make_adapters(project, run_dir, pol)
-        model = pol.adapter.resolved("dev").model
+        dev_cfg = pol.adapter.resolved("dev")
+        model = dev_cfg.model
+        effort = dev_cfg.effort
         _ctx_path, withheld, unreadable = resolve.build_context(
             state,
             run_dir,
@@ -3499,6 +3525,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 # this `task` object reads the same either way.
                 generation=task.generation,
                 model=model,
+                effort=effort,
             )
         except NotImplementedError:
             print(

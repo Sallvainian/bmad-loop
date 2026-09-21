@@ -234,6 +234,11 @@ key = "model"
 kind = "str"
 placeholder = "CLI default model"
 [[section.field]]
+key = "effort"
+kind = "str"
+placeholder = "provider default"
+description = "reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the per-prompt variant, ignored by the tmux CLIs"
+[[section.field]]
 key = "extra_args"
 kind = "args"
 [[section.field]]
@@ -269,6 +274,10 @@ placeholder = "inherit from [adapter]"
 key = "model"
 kind = "str"
 placeholder = "inherit / client default"
+[[section.field]]
+key = "effort"
+kind = "str"
+placeholder = "inherit / provider default"
 [[section.field]]
 key = "extra_args"
 kind = "args"

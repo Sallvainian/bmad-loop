@@ -204,6 +204,14 @@ class SessionSpec:
     # resumed run is protected too — always an absolute path by the time it lands
     # here. Kept LAST alongside spec_snapshot so positional constructions stay valid.
     expected_spec: str | None = None
+    # Reasoning effort (#643), free-form because the legal names are provider- and
+    # model-specific; "" = provider default. Resolved per stage by
+    # `AdapterPolicy.resolved()` with the same client-specific inheritance as
+    # `model`. Only the opencode-http adapter has a channel for it — it rides every
+    # `prompt_async` body as `variant` — and the tmux generic family ignores it
+    # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
+    # untouched. Kept LAST so positional SessionSpec constructions stay valid.
+    effort: str = ""
 
 
 @dataclass(frozen=True)

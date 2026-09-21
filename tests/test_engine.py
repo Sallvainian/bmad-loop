@@ -7536,7 +7536,8 @@ def test_per_stage_adapter_and_model_dispatch(project):
         adapter=AdapterPolicy(
             name="claude",
             model="opus",
-            review=StageAdapterPolicy(name="codex", model="gpt-5-codex"),
+            effort="high",
+            review=StageAdapterPolicy(name="codex", model="gpt-5-codex", effort="max"),
         ),
     )
     engine = Engine(
@@ -7555,6 +7556,9 @@ def test_per_stage_adapter_and_model_dispatch(project):
     assert [s.role for s in review_mock.sessions] == ["review"]
     assert dev_mock.sessions[0].model == "opus"
     assert review_mock.sessions[0].model == "gpt-5-codex"
+    # #643: the resolved per-stage effort rides the SessionSpec the same way
+    assert dev_mock.sessions[0].effort == "high"
+    assert review_mock.sessions[0].effort == "max"
 
 
 def test_review_loop_converges_within_budget(project):
