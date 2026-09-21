@@ -383,9 +383,11 @@ class _ResultFileMixin:
         `$set.messages` snapshots can replay older messages, so a model message
         with an ID only proves work when it is new or changed. Copilot's metrics
         only prove work when output or reasoning tokens are positive; input
-        tokens alone can be a submitted prompt.
+        tokens alone can be a submitted prompt. Codex token counts are cumulative,
+        so only an increase in output tokens proves new work.
         """
         seen_messages: dict[str, dict] = {}
+        codex_output_seen = 0
         # Hook paths are external observations. A FIFO can be stat'ed but opening
         # it for a JSONL scan would block the deterministic wait loop indefinitely.
         if not Path(transcript_path).is_file():
@@ -428,6 +430,16 @@ class _ResultFileMixin:
                         and payload.get("type") == "agent_message"
                     ):
                         return True
+                    if isinstance(payload, dict) and payload.get("type") == "token_count":
+                        info = payload.get("info")
+                        if isinstance(info, dict):
+                            totals = info.get("total_token_usage")
+                            usage = totals if isinstance(totals, dict) else info
+                            output = usage.get("output_tokens")
+                            if type(output) is int:
+                                if after_baseline and output > codex_output_seen:
+                                    return True
+                                codex_output_seen = max(codex_output_seen, output)
                     if after_baseline:
                         data = entry.get("data")
                         metrics = data.get("modelMetrics") if isinstance(data, dict) else None

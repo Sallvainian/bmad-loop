@@ -6841,6 +6841,63 @@ def test_copilot_metrics_in_final_interval_prove_model_work(
     assert (result.status, result.produced_work) == ("timeout", produced_work)
 
 
+@pytest.mark.parametrize(
+    ("baseline_output", "final_output", "produced_work"),
+    [
+        (None, 3, True),
+        (None, 0, False),
+        (10, 11, True),
+        (10, 10, False),
+    ],
+)
+def test_codex_token_count_in_final_interval_proves_new_model_work(
+    tmp_path, monkeypatch, baseline_output, final_output, produced_work
+):
+    """Codex can write cumulative token totals before its agent_message. A final
+    output increase proves work even when the pane stays static and no heartbeat
+    follows; input-only growth or an unchanged prior output total does not.
+
+    ABLATION: ignore token_count and the positive rows fail; accept any positive
+    appended total and the unchanged-output row fails.
+    """
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False, profile_name="codex"
+    )
+    adapter._stall_grace_s = 0.0
+
+    def token_count(output_tokens, input_tokens):
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    }
+                },
+            },
+        }
+
+    if baseline_output is not None:
+        _grow(transcript, (json.dumps(token_count(baseline_output, 20)) + "\n").encode())
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            _grow(transcript, (json.dumps(token_count(final_output, 30)) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]
+    assert (result.status, result.produced_work) == ("timeout", produced_work)
+
+
 def test_transcript_created_after_being_named_is_work(tmp_path, monkeypatch):
     """`SessionStart` names a transcript that does not exist yet; the CLI creates
     and writes it later and then times out with no further write and a static

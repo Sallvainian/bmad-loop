@@ -18,8 +18,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Count Copilot shutdown metrics with model output as work when a dev session
-  exits before the next transcript heartbeat (#822).
+- Count Copilot shutdown metrics and increased Codex output-token totals as work
+  when a dev session exits before the next transcript heartbeat (#822).
 
 - Pause a dev session with no confirmed work instead of retrying into the same wall
   (#727). `SessionResult.produced_work` is `false` when no turn ended and no
