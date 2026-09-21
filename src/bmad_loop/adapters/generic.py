@@ -150,10 +150,15 @@ class _IdleTracker:
     last_change_wall: float = 0.0
     idle_s: float | None = None
     open_since: float | None = None
-    # Latched True the first time the key CHANGES after the first sample: the CLI
-    # appended to its own transcript, which is the #727 no-work verdict's
-    # transcript half (see `_work_verdict`). Never reset.
+    # Latched True the first time the key CHANGES after the first sample — or the
+    # file APPEARS after a sample found it absent: the CLI appended to (or created)
+    # its own transcript, which is the #727 no-work verdict's transcript half (see
+    # `_work_verdict`). Never reset.
     moved: bool = False
+    # A sample ran while the named transcript could not be stat'ed (not yet
+    # created). The next successful sample is then the file's creation, which
+    # counts as movement rather than as the baseline.
+    seen_absent: bool = False
 
 
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
@@ -1319,7 +1324,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
         A None key (not yet created, torn by a rename, unreadable) skips the tick
         and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
-        for a stat. A key that moved closes any open stretch with one
+        for a stat — but remembers that the named path was absent, so the file's
+        later appearance is the CLI's first write (`moved`), not the baseline. A key that moved closes any open stretch with one
         `session-active` carrying the stretch's full length; a key that has not
         moved for `_idle_threshold_s` opens one with one `session-idle` (`idle_s`,
         `since_ts`, `threshold_s`), latched until the key moves again. The
@@ -1334,9 +1340,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         evidence, alive."""
         key = self._transcript_activity_key(transcript_path)
         if key is None:
+            if idle.last_key is None:
+                idle.seen_absent = True
             return
         if key != idle.last_key:
-            if idle.last_key is not None:
+            if idle.last_key is not None or idle.seen_absent:
+                # a change since the baseline, or the file appearing after a
+                # sample found the named path absent — the CLI wrote it either way
                 idle.moved = True
             if idle.open_since is not None and self.journal is not None:
                 try:

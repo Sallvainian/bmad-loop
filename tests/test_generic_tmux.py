@@ -6576,6 +6576,33 @@ def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
+def test_transcript_created_after_being_named_is_work(tmp_path, monkeypatch):
+    """`SessionStart` names a transcript that does not exist yet; the CLI creates
+    and writes it later and then times out with no further write and a static
+    pane. Creation after an absent sample is the CLI's first write, so the
+    populated file is movement, not the baseline: `produced_work=True`.
+
+    ABLATION: drop the `seen_absent` arm and the exit-time sample baselines the
+    populated file — False."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    transcript.unlink()
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            transcript.write_bytes(b'{"type":"user"}\n{"type":"assistant"}\n')  # created
+        elif call_n == 3:
+            clock["t"] += 10_000.0  # deadline; only the exit-time sample sees the file
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
 def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
     """The complement: a named transcript that never changes after its first
     sample is not activity — the first sample alone must not latch `moved`."""
