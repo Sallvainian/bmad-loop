@@ -18,6 +18,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Count Copilot shutdown metrics with model output as work when a dev session
+  exits before the next transcript heartbeat (#822).
+
 - Pause a dev session that produced no work instead of retrying into the same wall
   (#727). `SessionResult.produced_work` is `false` when no turn ended, the pane
   never changed after its first frame before any wake nudge, and the transcript

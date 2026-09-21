@@ -381,7 +381,9 @@ class _ResultFileMixin:
         the no-work verdict. A line crossing the old EOF is included so a torn
         line completed by the latest append can still prove work. Gemini's
         `$set.messages` snapshots can replay older messages, so a model message
-        with an ID only proves work when it is new or changed.
+        with an ID only proves work when it is new or changed. Copilot's metrics
+        only prove work when output or reasoning tokens are positive; input
+        tokens alone can be a submitted prompt.
         """
         seen_messages: dict[str, dict] = {}
         try:
@@ -422,6 +424,17 @@ class _ResultFileMixin:
                         and payload.get("type") == "agent_message"
                     ):
                         return True
+                    if after_baseline:
+                        data = entry.get("data")
+                        metrics = data.get("modelMetrics") if isinstance(data, dict) else None
+                        if isinstance(metrics, dict):
+                            for model in metrics.values():
+                                usage = model.get("usage") if isinstance(model, dict) else None
+                                if isinstance(usage, dict) and any(
+                                    type(usage.get(key)) is int and usage[key] > 0
+                                    for key in ("outputTokens", "reasoningTokens")
+                                ):
+                                    return True
         except OSError:
             pass
         return False

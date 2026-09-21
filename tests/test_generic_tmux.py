@@ -6754,6 +6754,49 @@ def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch, m
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
+@pytest.mark.parametrize(
+    ("usage", "produced_work"),
+    [
+        ({"inputTokens": 20, "outputTokens": 3}, True),
+        ({"inputTokens": 20, "reasoningTokens": 3}, True),
+        ({"inputTokens": 20, "outputTokens": 0, "reasoningTokens": 0}, False),
+    ],
+)
+def test_copilot_metrics_in_final_interval_prove_model_work(
+    tmp_path, monkeypatch, usage, produced_work
+):
+    """Copilot's shutdown metrics can be the first model evidence after the last
+    heartbeat. Input tokens alone can come from setup and must not prove work.
+
+    ABLATION: ignore Copilot metrics and the positive rows fail; accept any
+    modelMetrics record and the input-only row fails.
+    """
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False, profile_name="copilot"
+    )
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0
+            record = {
+                "id": "metrics-1",
+                "type": "metrics",
+                "data": {"modelMetrics": {"gpt-5-mini": {"usage": usage}}},
+            }
+            _grow(transcript, (json.dumps(record) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]
+    assert (result.status, result.produced_work) == ("timeout", produced_work)
+
+
 def test_transcript_created_after_being_named_is_work(tmp_path, monkeypatch):
     """`SessionStart` names a transcript that does not exist yet; the CLI creates
     and writes it later and then times out with no further write and a static
@@ -7041,12 +7084,12 @@ def _session_start(task_id, transcript_path):
     )
 
 
-def _idle_adapter(tmp_path, monkeypatch, *, grace=60.0, journal=True):
+def _idle_adapter(tmp_path, monkeypatch, *, grace=60.0, journal=True, profile_name="claude"):
     """Dev adapter with a live pane log that the script keeps repainting (the #680
     spinner: the stall re-arm never fires) and a transcript file the script
     advances on cue. Heartbeats are captured in order."""
     mux = _UnitMux()
-    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter, _ = make_dev_adapter(tmp_path, profile_name=profile_name, mux=mux)
     adapter._stall_grace_s = grace
     adapter._idle_threshold_s = grace  # the same knob, read from policy in production
     adapter._stall_nudges = 0
