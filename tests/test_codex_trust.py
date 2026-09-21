@@ -107,6 +107,7 @@ def test_trust_resolves_codex_cmd_shim_before_spawning(tmp_path, monkeypatch):
 )
 def test_trust_refuses_stale_or_unmatched_relay(tmp_path, monkeypatch, mutation, expected):
     data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
     result = _rpc(tmp_path, data)
     hooks = result["data"][0]["hooks"]
     if mutation == "start-modified":
@@ -135,6 +136,7 @@ def test_trust_refuses_stale_or_unmatched_relay(tmp_path, monkeypatch, mutation,
 
 def test_trust_refuses_relay_for_old_checkout_and_startup_excluding_matcher(tmp_path, monkeypatch):
     data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
     monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "trusted"
 
@@ -152,6 +154,7 @@ def test_trust_refuses_relay_for_old_checkout_and_startup_excluding_matcher(tmp_
 
 def test_missing_profile_stop_and_unsupported_launch_args_fail_closed(tmp_path, monkeypatch):
     data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
     monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
     profile = get_profile("codex")
     assert (
