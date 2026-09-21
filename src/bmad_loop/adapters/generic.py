@@ -1268,13 +1268,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             session_id = event.session_id or session_id
-            if event.transcript_path and not transcript_path:
-                # First observation of the transcript (#680): take the idle
-                # baseline NOW, not at the next heartbeat, so the age is measured
-                # from when the transcript became known and every later write —
-                # including one inside the first heartbeat interval — is seen as a
-                # change by the #727 transcript evidence check rather than
-                # absorbed into the baseline.
+            if event.transcript_path and event.transcript_path != transcript_path:
+                # Take the idle baseline as soon as a hook names a new transcript,
+                # including a later re-point (#680). A write before the next
+                # heartbeat is then a change for the #727 work check rather than
+                # being absorbed into the baseline at exit.
                 sample_transcript(event.transcript_path, time.monotonic())
             transcript_path = event.transcript_path or transcript_path
 

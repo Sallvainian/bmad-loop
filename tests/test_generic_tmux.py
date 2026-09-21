@@ -6817,6 +6817,36 @@ def test_repointed_transcript_rebaselines_instead_of_reading_as_movement(tmp_pat
     assert (result.status, result.produced_work) == ("timeout", False)
 
 
+def test_repointed_transcript_write_in_final_interval_is_work(tmp_path, monkeypatch):
+    """A new SessionStart names another transcript, which receives model output
+    before the next heartbeat. Exit-time sampling must see that write as movement.
+
+    ABLATION: sample only the first named path and the exit sample baselines the
+    already populated replacement transcript, leaving produced_work False."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user"}\n')
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 10.0  # the new path is named between heartbeats
+        elif call_n == 3:
+            _grow(other, b'{"type":"assistant","content":"reply"}\n')
+            clock["t"] += 10_000.0  # exit before another heartbeat
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript)), _session_start("3-1-dev-1", str(other))],
+        on_call=script,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None]
+    assert (result.status, result.produced_work) == ("timeout", True)
+
+
 def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
     """The complement: a named transcript that never changes after its first
     sample is not activity — the first sample alone must not prove work."""
