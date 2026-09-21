@@ -991,9 +991,23 @@ def test_active_agent_idle_since_never_raises_on_malformed_entry():
         {"kind": "session-idle", "task_id": "1-1-alpha-dev-3"},
         {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": "soon"},
         {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": None},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": True},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("nan")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("-inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 10**1000},
     ):
         agent = data.active_agent([_stamped_start(), bad], None)
         assert agent is not None and agent.idle_since is None
+        agent = data.active_agent(
+            [
+                _stamped_start(),
+                {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0},
+                bad,
+            ],
+            None,
+        )
+        assert agent is not None and agent.idle_since == 5030.0
     # an int since_ts is a number too
     agent = data.active_agent(
         [

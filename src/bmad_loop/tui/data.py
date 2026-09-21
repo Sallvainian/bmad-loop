@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -606,8 +607,8 @@ def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str)
     """Wall timestamp the open session's current idle stretch began (#680), or
     None when it is not idle: the `since_ts` of the last `session-idle` for
     `task_id` after index `start`, unless a later `session-active` for the same
-    task closed it. A `session-idle` without a numeric `since_ts` is skipped, not
-    trusted — the TUI ages the text from it. Never raises on a malformed entry."""
+    task closed it. Malformed or non-finite timestamps are ignored without
+    erasing an earlier valid stretch. Never raises on a malformed entry."""
     since: float | None = None
     for entry in journal_entries[start + 1 :]:
         if str(entry.get("task_id")) != task_id:
@@ -615,7 +616,13 @@ def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str)
         kind = entry.get("kind")
         if kind == "session-idle":
             raw = entry.get("since_ts")
-            since = float(raw) if isinstance(raw, (int, float)) else None
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                try:
+                    stamp = float(raw)
+                except OverflowError:
+                    continue
+                if math.isfinite(stamp):
+                    since = stamp
         elif kind == "session-active":
             since = None
     return since

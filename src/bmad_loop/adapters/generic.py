@@ -154,14 +154,12 @@ class _IdleTracker:
     last_change_wall: float = 0.0
     idle_s: float | None = None
     open_since: float | None = None
-    # Latched True the first time the key CHANGES after the first sample — or the
-    # file APPEARS after a sample found it absent: the CLI appended to (or created)
-    # its own transcript, which is the #727 no-work verdict's transcript half (see
-    # `_work_verdict`). Never reset.
-    moved: bool = False
+    # A close event whose best-effort journal write failed. Retry it on later
+    # samples so the TUI does not keep showing an idle session as stuck.
+    pending_active_s: float | None = None
     # A sample ran while the named transcript could not be stat'ed (not yet
-    # created). The next successful sample is then the file's creation, which
-    # counts as movement rather than as the baseline.
+    # created). The next successful sample is a change from absence, not a
+    # pre-existing file's baseline.
     seen_absent: bool = False
 
 
@@ -351,10 +349,10 @@ class _ResultFileMixin:
         opencode-http, unit fixtures — and unknown never blocks); or the wait loop
         saw activity (`activity_seen`): the pane log changed on a tick later than
         `FIRST_FRAME_S` after it started and before the first stall wake nudge (the
-        timeline half), OR the live transcript changed after its first sample, OR
-        the usage sampler read a nonzero spend from it — the last two are the CLI's
-        own writes, which a misbound pane sink cannot hide and a nudge echo cannot
-        produce, so neither carries the first-frame or nudge guard.
+        timeline half), OR a pre-nudge transcript change carried a model-side
+        record, OR pre-nudge usage reported model spend. These last two signals
+        survive a misbound pane sink; setup-only and post-nudge writes do not
+        supply proof.
 
         The timeline half is what separates this from `_produced_work`, and why the
         #261 gate is reused for its tristate only, not its verdict: that gate's
@@ -374,6 +372,37 @@ class _ResultFileMixin:
         if stop_seen or activity_seen:
             return True
         return self._log_evidence(handle) is None
+
+    @staticmethod
+    def _transcript_has_assistant_activity(transcript_path: str, since_size: int) -> bool:
+        """A model-side JSONL record written after a sampled baseline.
+
+        The idle detector remains stat-only. Reading content here is solely for
+        the no-work verdict. A line crossing the old EOF is included so a torn
+        line completed by the latest append can still prove work.
+        """
+        try:
+            with Path(transcript_path).open("rb") as stream:
+                while line := stream.readline():
+                    if stream.tell() <= since_size:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("type") == "assistant" or entry.get("role") in (
+                        "assistant",
+                        "model",
+                    ):
+                        return True
+                    payload = entry.get("payload")
+                    if isinstance(payload, dict) and payload.get("type") == "agent_message":
+                        return True
+        except OSError:
+            pass
+        return False
 
     def _session_vanished(self) -> bool:
         """Whether the whole multiplexer session is gone, asked only once a
@@ -825,12 +854,34 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # neither consulted nor touched.
         idle = _IdleTracker()
 
-        # Definitive activity the pane cannot fake and a misbound pane sink
-        # (#254/#217) cannot hide: the CLI appended to its own transcript
-        # (`idle.moved`, sampled on the heartbeat cadence below) or the usage
-        # sampler read a nonzero spend from it (`usage_seen`). Either one is the
-        # model having produced tokens, so it counts as work whatever the pane did.
+        # A transcript can grow for an initial user prompt or the loop's own
+        # wake nudge, neither of which proves model work. Latch model-side
+        # evidence only while the pre-nudge window remains open.
+        transcript_work_seen = False
         usage_seen = False
+
+        def sample_transcript(path: str, now: float) -> None:
+            nonlocal transcript_work_seen
+            same_path = idle.path == path
+            prior_key = idle.last_key if same_path else None
+            was_absent = idle.seen_absent if same_path else False
+            self._sample_transcript_idle(handle.task_id, path, idle, now)
+            current_key = idle.last_key
+            changed = current_key is not None and current_key != prior_key
+            if (
+                changed
+                and (prior_key is not None or was_absent)
+                and stall_nudges_sent == 0
+                and not transcript_work_seen
+            ):
+                start = (
+                    prior_key[1]
+                    if prior_key is not None
+                    and current_key is not None
+                    and current_key[1] > prior_key[1]
+                    else 0
+                )
+                transcript_work_seen = self._transcript_has_assistant_activity(path, start)
 
         def produced_work() -> bool:
             # Read at call time, after a final frame sample, so every exit below
@@ -841,11 +892,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # interval has not been sampled yet. A full sample, not a bare
                 # compare, so an idle stretch that ended in that interval is closed
                 # with its `session-active` before `session-end` lands, and the
-                # #727 latch (`idle.moved`) sees the write.
-                self._sample_transcript_idle(
-                    handle.task_id, transcript_path, idle, time.monotonic()
-                )
-            return self._work_verdict(handle, stop_seen, activity_seen or idle.moved or usage_seen)
+                # #727 transcript evidence check sees the write.
+                sample_transcript(transcript_path, time.monotonic())
+            return self._work_verdict(
+                handle, stop_seen, activity_seen or transcript_work_seen or usage_seen
+            )
 
         while True:
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
@@ -910,7 +961,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # the payload carries this tick's age. Inert until a hook event
                 # has named the transcript.
                 if transcript_path:
-                    self._sample_transcript_idle(handle.task_id, transcript_path, idle, now)
+                    sample_transcript(transcript_path, now)
                 self._write_heartbeat(
                     handle.task_id,
                     {
@@ -937,7 +988,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and transcript_path
                 ):
                     weighted = self._sample_weighted_usage(transcript_path, spec)
-                    if weighted is not None and weighted > 0:
+                    if weighted is not None and weighted > 0 and stall_nudges_sent == 0:
                         usage_seen = True
                     if weighted is not None and weighted > spec.token_budget:
                         budget_tripped = True
@@ -1200,11 +1251,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # baseline NOW, not at the next heartbeat, so the age is measured
                 # from when the transcript became known and every later write —
                 # including one inside the first heartbeat interval — is seen as a
-                # change by the #727 transcript latch (`_IdleTracker.moved`) rather
-                # than absorbed into the baseline.
-                self._sample_transcript_idle(
-                    handle.task_id, event.transcript_path, idle, time.monotonic()
-                )
+                # change by the #727 transcript evidence check rather than
+                # absorbed into the baseline.
+                sample_transcript(event.transcript_path, time.monotonic())
             transcript_path = event.transcript_path or transcript_path
 
             if event.event == "SessionStart":
@@ -1221,9 +1270,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         # The one exit that does not go through `produced_work()`:
                         # sample once more so an idle stretch that ended inside the
                         # final interval is closed before `session-end` (#680).
-                        self._sample_transcript_idle(
-                            handle.task_id, transcript_path, idle, time.monotonic()
-                        )
+                        sample_transcript(transcript_path, time.monotonic())
                     return SessionResult(
                         status="completed",
                         result_json=result_json,
@@ -1336,7 +1383,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         A None key (not yet created, torn by a rename, unreadable) skips the tick
         and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
         for a stat — but remembers that the named path was absent, so the file's
-        later appearance is the CLI's first write (`moved`), not the baseline. A key that moved closes any open stretch with one
+        later appearance is a change, not the baseline. A key that moved closes any open stretch with one
         `session-active` carrying the stretch's full length; a key that has not
         moved for `_idle_threshold_s` opens one with one `session-idle` (`idle_s`,
         `since_ts`, `threshold_s`), latched until the key moves again. The
@@ -1349,46 +1396,40 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         age is still measured for `heartbeat.json`. Every write is best-effort —
         an unwritable journal must not end a session that is, by this very
         evidence, alive."""
+
+        def flush_active() -> None:
+            if idle.pending_active_s is None or self.journal is None:
+                return
+            try:
+                self.journal.append("session-active", task_id=task_id, idle_s=idle.pending_active_s)
+            except OSError:
+                return
+            idle.pending_active_s = None
+
         if idle.path != transcript_path:
             # A different transcript than the one sampled so far (a hook event
             # re-pointed it): start over on this file — its first key is a
             # baseline, not a change. An open stretch belonged to the old file
             # and is closed here, since nothing else can close it: the TUI would
             # otherwise read the old `session-idle` for as long as the new file
-            # keeps moving. `moved` stays latched if it already was.
-            if idle.open_since is not None and self.journal is not None:
-                try:
-                    self.journal.append(
-                        "session-active",
-                        task_id=task_id,
-                        idle_s=round(now - idle.last_change_mono, 3),
-                    )
-                except OSError:
-                    pass
+            # keeps moving. Any earlier work verdict remains latched by the caller.
+            if idle.open_since is not None:
+                idle.pending_active_s = round(now - idle.last_change_mono, 3)
             idle.path = transcript_path
             idle.last_key = None
             idle.idle_s = None
             idle.open_since = None
             idle.seen_absent = False
         key = self._transcript_activity_key(transcript_path)
+        flush_active()
         if key is None:
             if idle.last_key is None:
                 idle.seen_absent = True
             return
         if key != idle.last_key:
-            if idle.last_key is not None or idle.seen_absent:
-                # a change since the baseline, or the file appearing after a
-                # sample found the named path absent — the CLI wrote it either way
-                idle.moved = True
-            if idle.open_since is not None and self.journal is not None:
-                try:
-                    self.journal.append(
-                        "session-active",
-                        task_id=task_id,
-                        idle_s=round(now - idle.last_change_mono, 3),
-                    )
-                except OSError:
-                    pass
+            if idle.open_since is not None:
+                idle.pending_active_s = round(now - idle.last_change_mono, 3)
+                flush_active()
             idle.open_since = None
             idle.last_key = key
             idle.last_change_mono = now
@@ -1396,21 +1437,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         idle.idle_s = round(now - idle.last_change_mono, 3)
         if (
             idle.open_since is None
+            and idle.pending_active_s is None
             and self.journal is not None
             and self._idle_threshold_s > 0
             and idle.idle_s >= self._idle_threshold_s
         ):
-            idle.open_since = idle.last_change_wall
             try:
                 self.journal.append(
                     "session-idle",
                     task_id=task_id,
                     idle_s=idle.idle_s,
-                    since_ts=idle.open_since,
+                    since_ts=idle.last_change_wall,
                     threshold_s=self._idle_threshold_s,
                 )
             except OSError:
                 pass
+            else:
+                idle.open_since = idle.last_change_wall
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)

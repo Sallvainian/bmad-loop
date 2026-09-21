@@ -11979,9 +11979,14 @@ def test_engine_attaches_its_journal_to_every_adapter(project):
     key on `session-end` (the field is present only when False, like
     `session_vanished`) and `dev-decision` records it True."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, adapter = make_engine(project, [SessionResult(status="timeout")])
+    review_adapter = MockAdapter([])
+    engine, adapter = make_engine(
+        project, [SessionResult(status="timeout")], review_adapter=review_adapter
+    )
     assert adapter.journal is engine.journal
-    assert engine.adapters["review"].journal is engine.journal
+    assert review_adapter is not adapter
+    assert engine.adapters["review"] is review_adapter
+    assert review_adapter.journal is engine.journal
     engine.run()
     dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert dec and all(d["produced_work"] is True for d in dec)

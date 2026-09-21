@@ -6498,7 +6498,7 @@ def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
     its own record. No `Stop` before the deadline: `timeout`, but the session
     worked, so `produced_work=True` and the decision keeps today's routing.
 
-    ABLATION: drop `idle.moved` from `produced_work()` and this reads False."""
+    ABLATION: drop the transcript evidence latch from `produced_work()` and this reads False."""
     adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
     adapter._stall_grace_s = 0.0  # only the deadline can end this
     # the pane never grows: `_idle_adapter`'s script is replaced below, and the log
@@ -6519,6 +6519,127 @@ def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
     result = adapter.wait_for_completion(_dev_handle(), spec)
     assert (adapter.logs_dir / "3-1-dev-1.log").stat().st_size == 0  # pane said nothing
     assert (result.status, result.produced_work) == ("timeout", True)
+
+
+def test_setup_only_transcript_growth_is_not_work(tmp_path, monkeypatch):
+    """A prompt echo or metadata append before any nudge is not model output.
+
+    ABLATION: treat any transcript stat change as work and this reads True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+
+    def script(call_n):
+        if call_n == 2:
+            _grow(transcript, b'{"type":"user","message":"setup"}\n')
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_old_assistant_record_is_not_credited_to_a_new_user_append(tmp_path, monkeypatch):
+    """Only records crossing the sampled EOF can prove post-baseline work."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    _grow(transcript, b'{"type":"assistant","message":"old"}\n')
+
+    def script(call_n):
+        if call_n == 2:
+            _grow(transcript, b'{"type":"user","message":"new prompt"}\n')
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_empty_transcript_creation_is_not_work(tmp_path, monkeypatch):
+    """Creating a named path with zero bytes is setup, not a model turn."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    transcript.unlink()
+
+    def script(call_n):
+        if call_n == 2:
+            transcript.touch()
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
+def test_post_nudge_transcript_growth_is_not_work(tmp_path, monkeypatch):
+    """Even an assistant-shaped append after the loop's wake nudge needs Stop.
+
+    ABLATION: drop the `stall_nudges_sent == 0` guard on transcript evidence
+    and this becomes produced_work=True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_nudges = 1
+    sent: list[str] = []
+    adapter.send_text = lambda handle, value: sent.append(value)
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 61.0  # cross grace; the adapter sends its wake nudge
+        elif call_n == 3:
+            _grow(transcript, b'{"type":"assistant","message":"late"}\n')
+            alive["v"] = False
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert sent == [generic.STALL_NUDGE_TEXT]
+    assert (result.status, result.produced_work) == ("crashed", False)
+
+
+def test_post_nudge_usage_sample_is_not_work(tmp_path, monkeypatch):
+    """A spend first observed after the wake nudge cannot override no-work.
+
+    ABLATION: drop the nudge guard on `usage_seen` and this reads True.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_nudges = 1
+    sent: list[str] = []
+    adapter.send_text = lambda handle, value: sent.append(value)
+    adapter._sample_weighted_usage = lambda path, spec: 100 if sent else 0
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+
+    def script(call_n):
+        if call_n == 2:
+            clock["t"] += 61.0
+        elif call_n == 3:
+            alive["v"] = False
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), token_budget=1000, token_budget_mode="warn")
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert sent == [generic.STALL_NUDGE_TEXT]
+    assert (result.status, result.produced_work) == ("crashed", False)
 
 
 def test_transcript_write_inside_the_first_heartbeat_interval_is_work(tmp_path, monkeypatch):
@@ -6641,7 +6762,7 @@ def test_repointed_transcript_rebaselines_instead_of_reading_as_movement(tmp_pat
 
 def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
     """The complement: a named transcript that never changes after its first
-    sample is not activity — the first sample alone must not latch `moved`."""
+    sample is not activity — the first sample alone must not prove work."""
     adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
     adapter._stall_grace_s = 0.0
 
@@ -7184,3 +7305,45 @@ def test_idle_journal_write_failure_is_swallowed(tmp_path, monkeypatch):
     spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
     result = adapter.wait_for_completion(_dev_handle(), spec)
     assert result.status == "timeout"
+
+
+def test_idle_journal_retries_transient_event_failures(tmp_path, monkeypatch):
+    """A failed append cannot consume either boundary of an idle stretch.
+
+    ABLATION: latch open_since before the idle append, or clear the active
+    pending state after its failed append, and one of the two events is lost.
+    """
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    adapter._idle_threshold_s = 60.0
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    idle = generic._IdleTracker()
+
+    class _FailOncePerKind:
+        def __init__(self):
+            self.entries: list[dict] = []
+            self.failed: set[str] = set()
+
+        def append(self, kind, **fields):
+            if kind not in self.failed:
+                self.failed.add(kind)
+                raise OSError("temporary journal failure")
+            self.entries.append({"kind": kind, **fields})
+
+    journal = _FailOncePerKind()
+    adapter.journal = journal
+    clock = _steerable_clock(monkeypatch)
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    clock["t"] += 60.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert journal.entries == []
+    clock["t"] += 30.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert [entry["kind"] for entry in journal.entries] == ["session-idle"]
+    _grow(transcript, b'{"type":"assistant"}\n')
+    clock["t"] += 10.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert [entry["kind"] for entry in journal.entries] == ["session-idle"]
+    clock["t"] += 30.0
+    adapter._sample_transcript_idle("3-1-dev-1", str(transcript), idle, clock["t"])
+    assert [entry["kind"] for entry in journal.entries] == ["session-idle", "session-active"]
