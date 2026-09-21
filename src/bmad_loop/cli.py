@@ -741,6 +741,37 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
 
+        if profile.hooks.dialect == "codex-hooks-json":
+            from .codex_trust import project_hook_trust
+
+            if not profile.packaged:
+                trust_message = (
+                    "hook trust unverifiable: project-owned Codex profile may name an "
+                    "untrusted executable; validation will not launch it"
+                )
+            elif pol is not None and pol.scm.isolation == "worktree":
+                trust_message = (
+                    "hook trust unverifiable for future worktree sessions: each isolated "
+                    "directory needs its own Codex trust grant"
+                )
+            elif not hooks_ok:
+                trust_message = "hook trust cannot pass: Codex relay hooks are not registered"
+            else:
+                trust = project_hook_trust(project, profile)
+                trust_message = None if trust.status == "trusted" else trust.reason
+            if trust_message is None:
+                report.ok(
+                    "hooks.trust",
+                    f"Codex hook trust current for {profile.name} in {project}",
+                    {"profile": profile.name, "project": str(project), "binary": profile.binary},
+                )
+            else:
+                report.fail(
+                    "hooks.trust",
+                    f"{profile.name}: {trust_message}",
+                    {"profile": profile.name, "project": str(project), "binary": profile.binary},
+                )
+
     # #461: `hooks.registered` above is a substring match on the config JSON — it
     # never touches the artifact the registered command points AT. A branch switch
     # (or a deleted .bmad-loop/) leaves the registration green while every hook
@@ -3106,8 +3137,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         # instead of reloading the predecessor's old paused state and double-driving.
         if runs.engine_liveness(run_dir) == "alive":
             print(
-                f"run {run_dir.name} is still live — resuming would double-drive it; "
-                "stop it first",
+                f"run {run_dir.name} is still live — resuming would double-drive it; stop it first",
                 file=sys.stderr,
             )
             return 1
@@ -5104,6 +5134,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
     # Every `ok:` trailer is human-facing chatter, so in JSON mode it goes to
     # stderr — stdout is the document alone, or empty when --out took it.
     trailers = sys.stderr if args.json else sys.stdout
+    trust_ok = finding.hook_trust is None or finding.hook_trust == "trusted"
+    trailer_prefix = "ok" if trust_ok else "FAIL"
     if args.out:
         out_path = Path(args.out)
         if args.json:
@@ -5111,7 +5143,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else:
             out_path.write_text(report, encoding="utf-8")
         print(
-            f"  ok: {noun} written to {out_path} ({len(finding.warnings)} warning(s))",
+            f"  {trailer_prefix}: {noun} written to {out_path} ({len(finding.warnings)} warning(s))",
             file=trailers,
         )
     else:
@@ -5120,10 +5152,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else:
             print(report)
         print(
-            f"  ok: {finding.mode} {noun} for {args.cli} ({len(finding.warnings)} warning(s))",
+            f"  {trailer_prefix}: {finding.mode} {noun} for {args.cli} "
+            f"({len(finding.warnings)} warning(s))",
             file=trailers,
         )
-    return 0
+    return 0 if trust_ok else 1
 
 
 def cmd_diagnose(args: argparse.Namespace) -> int:

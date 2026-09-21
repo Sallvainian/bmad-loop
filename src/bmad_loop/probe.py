@@ -162,6 +162,7 @@ class ProfileFinding:
     flags: FlagFinding | None = None
     declared_events: dict = field(default_factory=dict)  # native -> canonical
     registered: bool | None = None  # scan: hooks present in the CLI's config?
+    hook_trust: str | None = None  # trusted | untrusted | unverifiable (Codex only)
     captured_events: list[EventCapture] = field(default_factory=list)  # probe
     transcript: TranscriptFinding | None = None
     tokens: TokenSchema | None = None
@@ -473,6 +474,32 @@ def _hooks_registered(project: Path, profile: CLIProfile) -> bool:
     return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
 
 
+def _check_hook_trust(
+    finding: ProfileFinding, project: Path, profile: CLIProfile, binary: str, *, live: bool = False
+) -> None:
+    if profile.hooks.dialect != "codex-hooks-json":
+        return
+    from .codex_trust import project_hook_trust
+
+    marker = PROBE_HOOK_NAME if live else "bmad_loop_hook.py"
+    trust = project_hook_trust(project, profile, binary=binary, marker=marker)
+    finding.hook_trust = trust.status
+    if trust.status != "trusted":
+        scope = "temporary probe workspace" if live else "project checkout"
+        finding.warnings.append(
+            f"Codex hook trust for {scope} using {finding.binary}: {trust.reason}"
+        )
+        if live:
+            finding.next_steps.append(
+                "Codex has no trust grant for this fresh temporary workspace; "
+                "live capture cannot proceed until that workspace is trusted"
+            )
+        else:
+            finding.next_steps.append(
+                "Open Codex in the project checkout and accept its hook trust prompt"
+            )
+
+
 # ----------------------------------------------------------------- SCAN mode
 
 
@@ -513,6 +540,7 @@ def scan(
 
     if profile is not None:
         finding.registered = _hooks_registered(project, profile)
+        _check_hook_trust(finding, project, profile, binary)
         if not finding.registered:
             finding.next_steps.append(
                 f"hooks not registered in {profile.hooks.config_path}; "
@@ -708,6 +736,12 @@ def probe(
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
+        # The source checkout's trust says nothing about this new directory.
+        # Query after writing its config and before launching a model turn.
+        _check_hook_trust(finding, tmpdir, profile, binary, live=True)
+        if finding.hook_trust is not None and finding.hook_trust != "trusted":
+            return finding
+
         # 2. launch one trivial content-free turn in a fresh tmux window
         argv = _probe_argv(profile, binary, hints)
         env = {
@@ -843,6 +877,8 @@ def render_markdown(
     out.append(_fmt_kv("usage_parser", f.parser))
     if f.registered is not None:
         out.append(_fmt_kv("hooks registered", "yes" if f.registered else "no"))
+    if f.hook_trust is not None:
+        out.append(_fmt_kv("Codex hook trust", f.hook_trust))
     out.append(_fmt_kv("warnings", str(len(f.warnings))))
     out.append("")
 
@@ -993,6 +1029,7 @@ def render_json(
         "dialect": f.dialect,
         "usage_parser": f.parser,
         "hooks_registered": f.registered,
+        "hook_trust": f.hook_trust,
         "declared_events": f.declared_events,
         "version": f.flags.version if f.flags else None,
         "help": f.flags.help if f.flags else None,
