@@ -145,6 +145,10 @@ class _IdleTracker:
     `session-idle` carried — or None between stretches: the latch that makes the
     pair one-per-stretch."""
 
+    # The transcript path the samples below belong to. A later hook event that
+    # names a DIFFERENT path rebaselines the tracker (`_sample_transcript_idle`):
+    # a key measured on one file says nothing about another.
+    path: str | None = None
     last_key: tuple[int, int] | None = None
     last_change_mono: float = 0.0
     last_change_wall: float = 0.0
@@ -1338,6 +1342,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         age is still measured for `heartbeat.json`. Every write is best-effort —
         an unwritable journal must not end a session that is, by this very
         evidence, alive."""
+        if idle.path != transcript_path:
+            # A different transcript than the one sampled so far (a hook event
+            # re-pointed it): start over on this file — its first key is a
+            # baseline, not a change, and any open stretch belonged to the old
+            # file. `moved` stays latched if it already was.
+            idle.path = transcript_path
+            idle.last_key = None
+            idle.idle_s = None
+            idle.open_since = None
+            idle.seen_absent = False
         key = self._transcript_activity_key(transcript_path)
         if key is None:
             if idle.last_key is None:

@@ -6603,6 +6603,42 @@ def test_transcript_created_after_being_named_is_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
+def test_repointed_transcript_rebaselines_instead_of_reading_as_movement(tmp_path, monkeypatch):
+    """A later hook event names a DIFFERENT transcript. Its key is compared to
+    nothing the tracker measured before: the new file is a fresh baseline, so a
+    static second transcript under a static pane is still no work, and the age
+    restarts from the re-pointing.
+
+    ABLATION: drop the `idle.path` rebaseline and the second file's key differs
+    from the first file's, reading as movement — True."""
+    adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, journal=False
+    )
+    adapter._stall_grace_s = 0.0
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')  # exists, differs, never changes
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 5:
+            clock["t"] += 10_000.0
+
+    events = [
+        _session_start("3-1-dev-1", str(transcript)),
+        None,
+        _session_start("3-1-dev-1", str(other)),  # re-pointed on tick 3
+    ]
+    adapter.watcher = _ScriptedWatcher(events, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    # ages: none before naming; tick 2's heartbeat is throttled (the clock moves
+    # inside wait_for); 30 on the first file; then the re-pointed file's own
+    # clock — 0 at the heartbeat that first sampled it, 30 on the next
+    assert [hb["transcript_idle_s"] for hb in heartbeats] == [None, 30.0, 0.0, 30.0]
+    assert (result.status, result.produced_work) == ("timeout", False)
+
+
 def test_static_transcript_under_a_static_pane_is_no_work(tmp_path, monkeypatch):
     """The complement: a named transcript that never changes after its first
     sample is not activity — the first sample alone must not latch `moved`."""
