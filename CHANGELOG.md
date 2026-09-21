@@ -20,6 +20,10 @@ breaking changes may land in a minor release.
   transcript moves again; `0` disables the pair. The TUI agent line shows the open
   stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
 
+### Changed
+
+- Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
+
 ### Fixed
 
 - Distinguish confirmed missing tmux-family sessions from failed window listings;
