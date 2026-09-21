@@ -1141,6 +1141,27 @@ def test_validate_model_format_check_keys_on_the_adapter_kind_not_hooklessness(
     assert any(f["check"] == "adapter.hookless" for f in findings)
 
 
+def test_validate_effort_silent_on_an_out_of_tree_kind(fresh_adapter_registry, project, capsys):
+    """`policy.effort-unsupported` is a fact about the bundled tmux GENERIC family
+    ("no channel for effort"); whether an out-of-tree kind can carry it is not
+    knowable here, so the check must stay silent for one rather than assert a
+    capability it cannot see.
+
+    The `adapter.kind == "ok"` assert is the control: the profile loaded and its
+    kind resolved, so the absent warning is the predicate, not a failed load.
+
+    ABLATION: flip the predicate to `prof.adapter != adapter_registry.OPENCODE_HTTP`
+    and this reddens."""
+    fresh_adapter_registry.register_adapter("hermes", needs_mux=False, load=lambda: _stub_builder())
+    install_bmad_config(project)
+    _write_profile(project.project, "hermes", adapter="hermes")
+    _write_policy(project.project, '[adapter]\nname = "hermes"\neffort = "max"\n')
+
+    findings = _validate_findings(project.project, capsys)
+    assert not any(f["check"] == "policy.effort-unsupported" for f in findings)
+    assert [f["severity"] for f in findings if f["check"] == "adapter.kind"] == ["ok"]
+
+
 def test_validate_model_format_warns_on_an_opencode_kind_carrying_a_hook_dialect(
     fresh_adapter_registry, project, capsys
 ):

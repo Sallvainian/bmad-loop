@@ -481,7 +481,9 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # [adapter.triage]            # sweep triage stage
 # model = "opus"
 # With an opencode-http base, effort tunes reasoning per stage (opencode-http
-# only — a tmux CLI ignores it and `bmad-loop validate` warns):
+# only — a tmux CLI ignores it and `bmad-loop validate` warns). An unrecognized
+# name is not rejected: the session silently runs at the provider default, so
+# spell it exactly as the model's variant list names it.
 # [adapter.review]
 # effort = "max"              # e.g. a deeper review pass than dev
 

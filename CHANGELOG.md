@@ -19,6 +19,9 @@ breaking changes may land in a minor release.
 - Preserve inherited `model`, `effort` and `extra_args` when a stage names an alias
   of the base client (`opencode` / `opencode-http`, `claude-code-tmux` / `claude`)
   instead of treating it as a client switch.
+- Key the `run --dry-run` launch preview on the adapter kind, not `profile.hookless`:
+  an `opencode-http` profile with a hook dialect shows the server/prompt_async line,
+  a hookless profile of another kind shows the argv line.
 
 ## [0.12.0] — 2026-09-20
 
