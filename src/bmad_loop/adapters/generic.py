@@ -774,8 +774,30 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         frame_key = self._log_activity_key(handle.task_id)
         activity_seen = False
 
+        def sample_frame() -> None:
+            # One pane-frame sample: flip `activity_seen` on growth that lands later
+            # than FIRST_FRAME_S after the loop started and before the first stall
+            # wake nudge. Called at the top of every tick and again by
+            # `produced_work()` right before each exit verdict, because output that
+            # arrives during `watcher.wait_for` and is followed by window death or a
+            # `SessionEnd` in the same iteration would otherwise be judged on the
+            # previous tick's key. The post-nudge exclusion holds on the re-sample
+            # too: `stall_nudges_sent` is already > 0 on every tick after the nudge.
+            nonlocal frame_key, activity_seen
+            tick_key = self._log_activity_key(handle.task_id)
+            if tick_key is not None and tick_key != frame_key:
+                if (
+                    not activity_seen
+                    and stall_nudges_sent == 0
+                    and time.monotonic() - loop_started > FIRST_FRAME_S
+                ):
+                    activity_seen = True
+                frame_key = tick_key
+
         def produced_work() -> bool:
-            # Read at call time, so every exit below reports the loop's final view.
+            # Read at call time, after a final frame sample, so every exit below
+            # reports the loop's final view of the pane rather than the last tick's.
+            sample_frame()
             return self._work_verdict(handle, stop_seen, activity_seen)
 
         # Idle detection (#680): the live transcript's (mtime_ns, size), sampled on
@@ -790,15 +812,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # the timeout check so growth on the final tick still counts; before the
             # nudge arm so a tick that both sees growth and sends a nudge scores the
             # growth (the nudge cannot have caused what preceded it).
-            tick_key = self._log_activity_key(handle.task_id)
-            if tick_key is not None and tick_key != frame_key:
-                if (
-                    not activity_seen
-                    and stall_nudges_sent == 0
-                    and time.monotonic() - loop_started > FIRST_FRAME_S
-                ):
-                    activity_seen = True
-                frame_key = tick_key
+            sample_frame()
             remaining = deadline - time.monotonic()
             wall_expired = time.time() >= wall_deadline
             if remaining <= 0 or wall_expired:

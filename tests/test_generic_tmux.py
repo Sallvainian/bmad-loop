@@ -6465,6 +6465,33 @@ def test_working_session_that_later_stalls_produced_work(tmp_path, monkeypatch):
     assert result.produced_work is True
 
 
+def test_growth_during_the_final_wait_then_death_in_the_same_tick_is_work(tmp_path, monkeypatch):
+    """Output that lands during `watcher.wait_for` and is followed by window death
+    in the SAME iteration: the top-of-tick sample predates the growth, so the exit
+    verdict must re-sample the pane before judging. Past FIRST_FRAME_S, no nudge
+    sent — `crashed`, but the session worked (`produced_work=True`).
+
+    ABLATION: drop the `sample_frame()` call inside `produced_work()` and the exit
+    judges the previous tick's key — False."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path, mux=_UnitMux())
+    alive = {"v": True}
+    adapter._window_alive = lambda handle: alive["v"]
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    clock = _steerable_clock(monkeypatch)
+
+    def script(call_n):
+        # inside wait_for: the CLI prints its last output and exits before the
+        # liveness probe that follows this very call
+        clock["t"] += generic.FIRST_FRAME_S + 1.0
+        _grow(log, b"Wrote src/bmad_loop/engine.py\nTraceback (most recent call last):\n")
+        alive["v"] = False
+
+    adapter.watcher = _ScriptedWatcher([], on_call=script)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.produced_work) == ("crashed", True)
+
+
 def test_growth_inside_first_frame_window_alone_is_not_work(tmp_path, monkeypatch):
     """The complement of the row above, isolating ABLATION B from the nudge arm:
     the same growth landing INSIDE FIRST_FRAME_S (no nudge ever sent — the
