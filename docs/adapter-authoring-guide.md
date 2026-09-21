@@ -566,7 +566,11 @@ Three frozen dataclasses cross the seam:
 
 - **`SessionSpec`** (engine → adapter) — `task_id`, `role` (`"dev"` / `"review"` /
   `"retro"`), `prompt`, `cwd`, `env`, `model` (empty = CLI default),
-  `timeout_s`.
+  `timeout_s`, and `effort` (empty = provider default; a free-form reasoning-effort
+  name resolved per stage from `[adapter] effort`). Only `opencode-http` carries
+  `effort` — as the per-prompt `variant` — and the generic tmux adapter ignores it,
+  because no profile key maps it onto a CLI flag; `bmad-loop validate` warns when a
+  stage on that family sets it. An out-of-tree adapter class may read it or not.
 - **`SessionHandle`** (returned by `start_session`) — `task_id`, `native_id` (tmux
   window id, HTTP session id, …), `launched_ns` (wall-clock ns just before launch;
   the floor for hook events).
@@ -581,7 +585,17 @@ Three frozen dataclasses cross the seam:
 
 Required (abstract):
 
-- `start_session(spec) -> SessionHandle` — launch the session.
+- `start_session(spec) -> SessionHandle` — launch the session. An adapter that
+  persists the standard `tasks/<id>/` directory must reset its shared cycle
+  artifacts when an id is reused: after creating the task directory and before
+  launching the session, remove every file named by
+  `journal.TASK_CYCLE_ARTIFACTS` (shared artifacts: [`result.json`,
+  `escalation.json`]).
+  Use missing-safe deletion; a missing artifact is a normal no-op and must not
+  make startup fail. This tuple covers only artifacts shared across adapters and
+  readers. Adapter-private breadcrumbs such as `heartbeat.json`,
+  `resultless-stops.jsonl`, `session-lifecycle.jsonl`, and `messages.json` remain
+  outside the shared cleanup contract and are managed by their owning adapter.
 - `wait_for_completion(handle, spec) -> SessionResult` — block until the session
   ends (or stalls/times out), then report status. Poll
   `runs.read_stop_request_mode(run_dir) == "hard"` on both sides of the loop's
@@ -647,7 +661,10 @@ decisions worth stealing:
   Permissions, the model, and a hermetic skills path are injected via the
   `OPENCODE_CONFIG_CONTENT` env var (zero worktree pollution), and each server
   gets its own `OPENCODE_SERVER_PASSWORD` so a foreign process on a recycled
-  port can never impersonate it.
+  port can never impersonate it. Reasoning effort (`SessionSpec.effort`) is the
+  one knob that does NOT go through the config: it is a per-call `variant` on
+  every `prompt_async` body instead, because the config has no top-level
+  `variant` and its `agent.<name>.variant` is inert unless that agent pins a model.
 - **Map the transport onto the hook-signal semantics** instead of inventing new
   ones: the SSE `session.idle` event ≙ the Stop hook, server-process death ≙
   window death (`crashed`, landed artifact honored), and a poll fallback

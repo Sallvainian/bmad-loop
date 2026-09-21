@@ -8,9 +8,19 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import attach_profile, git, install_build_auto_skill, write_gated_ledger, write_spec
+from conftest import (
+    _OK,
+    attach_profile,
+    git,
+    install_build_auto_skill,
+    nested_repo_root_paths,
+    seed_outer_decoy_ledger,
+    write_gated_ledger,
+    write_ledger,
+    write_spec,
+)
 
-from bmad_loop import stories
+from bmad_loop import stories, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -40,6 +50,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested
 from bmad_loop.stories_engine import StoriesEngine
@@ -204,13 +215,65 @@ def resume_engine(project, engine, script):
         policy=engine.policy,
         adapter=adapter,
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        # A real resume REOPENS the journal: `cli.cmd_resume` builds a fresh
+        # `Journal(run_dir)` and hands it to `runsetup.compose_resume`, so this
+        # harness builds the same shape (DW-241). `Journal` is file-backed either
+        # way; what a SHARED object leaks across the boundary is its
+        # `_log_task`/`_log_path` binding, which stamps `log_task`/`log_pos` onto
+        # rows a real resumed engine writes bare. See the row right below.
+        journal=Journal(engine.run_dir),
         state=state,
         story_filter=state.story_filter,
         max_stories=state.max_stories,
         spec_folder=state.spec_folder,
     )
     return new_engine, adapter
+
+
+def test_the_resumed_engine_reopens_the_journal_off_disk(project):
+    """The harness's own fidelity: `resume_engine` builds the journal a REAL resume
+    builds rather than handing the pre-pause engine's object back (DW-241) — the
+    `tests/test_sweep.py` row of the same name, carried over because a StoriesEngine
+    resumes through the very same `cli.cmd_resume` path.
+
+    `cli.cmd_resume` constructs `Journal(run_dir)` and passes it to
+    `runsetup.compose_resume`; a fresh `Journal` starts with `_log_task = None`.
+    Sharing one object carried the PRE-PAUSE session's `set_active_log` binding across
+    the resume boundary, and `Journal.append` stamps `log_task`/`log_pos` onto every
+    entry while that binding is set — so every row a resumed engine writes BEFORE
+    starting its own session was stamped with a log from the run before the pause. A
+    real resume writes those rows bare. `Journal` holds NO in-memory record list —
+    `append` writes one line to `run_dir/journal.jsonl` and `entries()` re-reads it —
+    so the binding is the only state a shared object could leak; every "exactly once"
+    claim in this file's resume rows was already round-tripping through disk.
+
+    Graded on the CONSEQUENCE, never on object identity: `resumed.journal is not
+    engine.journal` would be tautological and would red for a refactor that changed
+    nothing observable.
+
+    Ablation, performed: hand `resume_engine` the pre-pause `engine.journal` back as
+    its `journal=` argument and the FINAL assertion reds — the appended row carries
+    the pre-pause `log_task` and `log_pos`. That one only: the two `first[...]` lines
+    above it are the PREMISE and stay green under both spellings (they describe the
+    pre-pause row, stamped either way), and the reopen half stays green too, because
+    the file is what both objects read."""
+    engine, _ = make_engine(project, [])
+    engine.journal.set_active_log("S-1-dev-1")  # stands in for the pre-pause session
+    engine.journal.append("run-start", cycle=1)
+    save_state(engine.run_dir, engine.state)
+
+    resumed, _ = resume_engine(project, engine, [])
+
+    # reopened, not re-created: the rows already on disk are still what it reads
+    assert [e["kind"] for e in resumed.journal.entries()] == ["run-start"]
+    resumed.journal.append("run-start", cycle=2)
+    first, second = [e for e in resumed.journal.entries() if e["kind"] == "run-start"]
+    assert (first["cycle"], second["cycle"]) == (1, 2)  # appended AFTER, same file
+    assert first["log_task"] == "S-1-dev-1"  # premise: the pre-pause row WAS stamped...
+    # ...with BOTH fields, so the conclusion below pins both. `0` is deliberate: it is
+    # `append`'s `except OSError: size = 0` arm, since no pane log exists on disk here.
+    assert first["log_pos"] == 0
+    assert "log_task" not in second and "log_pos" not in second
 
 
 def story_spec(paths, story_id: str, *, spec_folder: str = SPEC_FOLDER) -> Path:
@@ -244,6 +307,34 @@ def test_two_story_happy_path(project):
         assert status_of(read_frontmatter(story_spec(project, sid))) == "done"
     assert engine.state.tasks["1"].phase == Phase.DONE
     assert engine.state.tasks["2"].phase == Phase.DONE
+
+
+def test_story_review_gate_journals_its_verify_commands(project):
+    """`StoriesEngine._verify_review` threads the base engine's review sink, so a
+    stories-mode review-leg verifier pass lands the same `verify-command-result`
+    records the base engine's does.
+
+    Its own row rather than a claim carried by `test_engine.py`: the sink is
+    passed at each override, so dropping it here would leave every stories run
+    silently unrecorded while the base engine's tests stayed green — the shape the
+    #695 root bug already took across these same three gates.
+
+    Ablation: remove `on_results=` from `StoriesEngine._verify_review` and the
+    record assertion fails at zero entries."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [], policy=_stories_policy(verify=VerifyPolicy(commands=(_OK,)))
+    )
+    sp = story_spec(project, "1")
+    write_spec(sp, "done", rev_parse_head(project.project))
+    task = StoryTask(story_key="1", epic=1)
+    task.spec_file = str(sp)
+
+    assert engine._verify_review(task).ok
+
+    (record,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert record["verification_stage"] == "review"
+    assert record["command"] == _OK and record["story_key"] == "1"
 
 
 def test_run_state_pins_stories_mode(project):
@@ -951,6 +1042,10 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     assert leg1.prompt.endswith("Halt after planning.")
     assert leg1.env["BMAD_LOOP_PLAN_HALT"] == "1"
     assert _kinds(engine.journal, "plan-halt")
+    (waiver,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert waiver["story_key"] == "1"
+    assert waiver["zero_diff"] is True
+    assert "plan_halt" not in waiver  # the result marker remains a separate fact
     assert _kinds(engine.journal, "checkpoint-pause")[-1]["checkpoint"] == "plan"
 
     resumed, radapter = resume_engine(project, engine, [stories_checkpoint_effect()])
@@ -962,6 +1057,233 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     leg2 = next(s for s in radapter.sessions if s.role == "dev")
     assert "Halt after planning" not in leg2.prompt
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
+
+
+@pytest.mark.parametrize(
+    "result_json",
+    [
+        {"workflow": "auto-dev"},
+        {"workflow": "wrong-workflow", "plan_halt": True},
+    ],
+    ids=["marker-absent", "earlier-gate-fails"],
+)
+def test_refused_plan_halt_does_not_journal_a_proof_waiver(project, result_json):
+    """Only a passing artifact outcome earns the plan-halt waiver record.
+
+    Ablation: move the journal append before `verify_dev_stories`, or key it only
+    on a truthy marker, and the relevant row observes a record for a refused leg.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert not outcome.ok
+    assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+
+
+@pytest.mark.parametrize("document", [["nope"], "escalations", 7])
+def test_non_mapping_document_selects_not_a_plan_halt_on_both_reads(project, document):
+    """DW-206: stories mode's two `plan_halt` reads, which a non-mapping document
+    now reaches for the first time.
+
+    `_run_session` guards its own reads but returns the document untouched, so
+    these two frames sit downstream of it and were previously unreachable with
+    this shape — a truthy non-mapping raised `AttributeError` upstream. Both
+    reads must be TOTAL and must agree: a document that carries no readable
+    `plan_halt` marker is not a plan-halt leg.
+
+    That answer is the safe one on both sides. `_verify_dev_artifacts` leaves
+    `plan_checkpoint_pending` False, so the run does not pause for a plan review
+    it has no plan for; and `_run_verify_commands_after_dev` returns True, so the
+    project's build/test gate still RUNS rather than being skipped as it is for a
+    real plan leg. A non-mapping must never buy a session past the gate.
+
+    ABLATION: revert either read to `(result_json or {}).get("plan_halt")` and
+    that row raises `AttributeError` instead of answering."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    outcome = engine._verify_dev_artifacts(task, document)
+
+    # not a plan halt: the checkpoint never arms, and the leg is verified as an
+    # ordinary implementation (which a ready-for-dev spec does not satisfy)
+    assert task.plan_checkpoint_pending is False
+    assert not outcome.ok
+    assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    # the twin read agrees: the build/test gate is not waived
+    assert engine._run_verify_commands_after_dev(task, document) is True
+
+
+@pytest.mark.parametrize("zero_diff", [False, None], ids=["residue", "unknown"])
+def test_accepted_plan_halt_journals_the_non_clean_proof_observation(
+    project, monkeypatch, zero_diff
+):
+    """The engine carries the verifier's full tri-state into the accepted-halt
+    record; neither residue nor an unanswerable probe may be rewritten as clean.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    if zero_diff is False:
+        (project.repo_root / "src.txt").write_text("planning residue\n", encoding="utf-8")
+    else:
+
+        def boom(_repo):
+            raise verify.GitError("untracked enumeration failed")
+
+        monkeypatch.setattr(verify, "untracked_files", boom)
+
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "plan_halt": True},
+    )
+
+    assert outcome.ok
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is zero_diff
+
+
+def test_accepted_plan_halt_journal_excludes_engine_written(project, monkeypatch):
+    """The journal projects the gate after excluding orchestrator-owned residue.
+
+    Ablation: stop composing ``engine_written`` into the stories observation and
+    this reports ``zero_diff: false`` even though the session itself wrote no code.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+    (project.repo_root / "engine-owned.txt").write_text(
+        "orchestrator bookkeeping\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(engine, "_harvest_gate_exclude", lambda _task: ("engine-owned.txt",))
+
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "plan_halt": True},
+    )
+
+    assert outcome.ok
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is True
+
+
+def test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape(
+    project,
+):
+    """Grade the real producer's stories plan-halt join (DW-153).
+
+    ``StoriesEngine._verify_dev_artifacts`` passes ``_harvest_gate_exclude`` into
+    ``verify_dev_stories`` as ``engine_written`` for ``observe_skipped_proof``.
+    The nested shape makes a project-rooted spelling name a REAL outer ledger,
+    so it cannot agree with the correct root through a pathspec matching nothing.
+
+    Seed the absolute outer stories folder, whose path the engine keeps verbatim:
+    stories exclusions stay unprefixed while the ledger exclusion needs ``app/``.
+    Commit every seeded file, including the draft story, before the attempt. This
+    prevents decoy residue and forces git's exclude-pathspec branch for the append.
+    Leave the decoy alone: touching it would make even the correct root see residue.
+
+    Assert the observation before the spelling pin so the ablation fails on
+    behavior. The stand-down control proves the append is countable; an additional
+    verifier exclusion hiding it would fail that control. Check the journal first
+    because the second verification deduplicates the same attempt/generation.
+
+    Ablation, measured: set ``root = paths.project`` in ``_harvest_gate_exclude``
+    and this fails with ``plan_halt_zero_diff is False``. The unprefixed spelling
+    excludes the untouched outer decoy and counts the engine's nested append.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+
+    outer_spec_folder = paths.repo_root / SPEC_FOLDER
+    sp = outer_spec_folder / "stories" / "1-slug.md"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "draft", rev_parse_head(paths.repo_root))
+    setup_stories(paths, [entry("1", spec_checkpoint=True)], spec_folder=str(outer_spec_folder))
+    # setup_stories stages repo-wide even from app/: pin every tracked seed.
+    git(
+        paths.repo_root,
+        "ls-files",
+        "--error-unmatch",
+        decoy.as_posix(),
+        paths.deferred_work.as_posix(),
+        sp.as_posix(),
+        (outer_spec_folder / "SPEC.md").as_posix(),
+        (outer_spec_folder / "stories.yaml").as_posix(),
+    )
+
+    engine, _adapter = make_engine(paths, [], spec_folder=str(outer_spec_folder))
+    assert Path(engine._spec_folder_rel).is_absolute()
+    assert engine._stories_folder() == outer_spec_folder
+    baseline = rev_parse_head(paths.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    task.harvest_wrote_ledger = True
+
+    # The entire attempt: update the tracked plan and append the nested ledger.
+    write_spec(sp, "ready-for-dev", baseline)
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+    result_json = {"workflow": "auto-dev", "plan_halt": True}
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert outcome.ok
+    assert outcome.plan_halt_zero_diff is True
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is True
+
+    task.ledger_changed_before_harvest = True
+    control = engine._verify_dev_artifacts(task, result_json)
+    assert control.ok
+    assert control.plan_halt_zero_diff is False
+    assert engine._harvest_gate_exclude(task) == ()
+    task.ledger_changed_before_harvest = False
+    assert _kinds(engine.journal, "plan-halt-proof-of-work-skipped") == [record]
+
+    assert engine._harvest_gate_exclude(task) == (
+        "app/_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
+
+
+def test_replayed_plan_halt_does_not_duplicate_proof_waiver(project):
+    """Crash replay preserves the first observation for one session generation.
+
+    The first verification journals a clean waiver. A host death before the
+    accepted-session save can replay the same result after unrelated residue has
+    appeared; that replay must not append a conflicting second audit record.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline, generation=2)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+    result_json = {"workflow": "auto-dev", "plan_halt": True}
+
+    first = engine._verify_dev_artifacts(task, result_json)
+    (project.repo_root / "late-residue.txt").write_text("later\n", encoding="utf-8")
+    replay = engine._verify_dev_artifacts(task, result_json)
+
+    assert first.ok and first.plan_halt_zero_diff is True
+    assert replay.ok and replay.plan_halt_zero_diff is False
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["generation"] == 2
+    assert record["zero_diff"] is True
 
 
 def test_operator_spec_path_anchors_an_isolated_units_spec(project):
@@ -1033,11 +1355,12 @@ def test_plan_checkpoint_pause_journals_the_mount_anchored_spec(project):
     # this assertion no row in the repo observed ANY `gates.notify` body, so every
     # notification site could be reverted to a bare `task.spec_file` with the suite green.
     #
-    # Ablation: revert `_pause_plan_checkpoint`'s notify to `task.spec_file` and this
-    # reddens — the bare relpath appears and the anchored path does not.
+    # INVERSE ablation: replace only `_pause_plan_checkpoint`'s notification
+    # `_operator_spec_path(task)` call with `task.spec_file`; this focused test
+    # reddens because the bare relpath appears and the anchored path does not.
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert str(wt / rel) in attention
-    assert f"review {rel}," not in attention  # not the un-anchored spelling
+    assert f"review the planned spec {rel}," not in attention
 
 
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review
@@ -1329,7 +1652,7 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
     assert not any(s.role == "dev" for s in adapter.sessions)  # story 2 not leapfrogged
 
     # human fixed the frozen spec → re-arm (must run while still escalation-paused)
-    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False)
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False, resolution_recorded=True)
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
 
     # resume re-drives the re-armed story, then continues the schedule to story 2
@@ -1370,7 +1693,7 @@ def test_resolved_wedge_is_still_gated_on_redispatch(project):
     assert wedged.phase == Phase.ESCALATED and wedged.attempt == 0 and not wedged.sessions
 
     runs.rearm_escalation(
-        engine.run_dir, "1", isolated_redrive=False
+        engine.run_dir, "1", isolated_redrive=False, resolution_recorded=True
     )  # human fixed the frozen spec
     assert load_state(engine.run_dir).tasks["1"].rearmed  # ...and the re-drive is armed
     # a gate on story 1 lands while the run is down
@@ -1405,7 +1728,7 @@ def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):
     assert engine.run().paused
     assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"  # recorded
 
-    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False)
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False, resolution_recorded=True)
     assert not sentinel.exists()  # cleared by the recorded verdict
     assert (engine.run_dir / "sentinels" / "1-unresolved.md").is_file()  # copy preserved
     reloaded = load_state(engine.run_dir)
@@ -1920,6 +2243,39 @@ STORY_FINDING = {
     "location": "src/bmad_loop/stories.py:120",
     "severity": "low",
 }
+
+
+def test_stories_non_mapping_dev_result_skips_harvest_and_retries(project):
+    """A malformed result cannot select an id-keyed spec for harvesting.
+
+    Ablation: restore `_harvest_spec_path`'s `(result_json or {}).get(...)`
+    read and the first attempt crashes instead of reaching the successful retry.
+    """
+    write_ledger(project, {})
+    setup_stories(project, [entry("1")])
+    before = project.deferred_work.read_bytes()
+    malformed_effect = stories_dev_effect(deferred=[STORY_FINDING])
+    valid_effect = stories_dev_effect()
+
+    def malformed(spec):
+        malformed_effect(spec)
+        return SessionResult(status="completed", result_json=["nope"])
+
+    def retry(spec):
+        assert project.deferred_work.read_bytes() == before
+        assert not _kinds(engine.journal, "spec-deferrals-harvested")
+        return valid_effect(spec)
+
+    engine, adapter = make_engine(project, [malformed, retry])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert engine.state.tasks["1"].phase == Phase.DONE
+    assert engine.state.tasks["1"].attempt == 2
+    assert len(adapter.sessions) == 2
+    assert project.deferred_work.read_bytes() == before
+    assert not _kinds(engine.journal, "spec-deferrals-harvested")
 
 
 def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):

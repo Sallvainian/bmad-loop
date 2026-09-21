@@ -11,6 +11,8 @@ def test_defaults_when_file_missing(tmp_path):
     pol = policy.load(tmp_path / "nope.toml")
     assert pol.gates.mode == "per-epic"
     assert pol.limits.max_review_cycles == 3
+    assert pol.limits.artifact_file_max_mb == 5
+    assert pol.limits.artifact_payload_max_mb == 10
     assert pol.adapter.name == "claude"
     assert pol.adapter.extra_args is None  # None = use the profile's bypass flags
     assert pol.dev.skill == "bmad-dev-auto"  # the sole supported dev skill
@@ -173,6 +175,123 @@ name = "codex"
     assert review == policy.ResolvedAdapter("codex", "", None)
 
 
+def test_stage_client_switch_drops_base_effort(tmp_path):
+    """Effort is client-specific like `model`: its legal names belong to one
+    provider's models, so a stage that switches client must NOT inherit the base
+    value and falls back to "" (provider default).
+
+    ABLATION: replace the `same_client` fallback for effort in `resolved()` with a
+    plain `self.effort` and the review assert reddens."""
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "opencode-http"
+effort = "max"
+[adapter.review]
+name = "claude"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("review").effort == ""
+    # controls: the stages that keep the client inherit the base value
+    assert pol.adapter.resolved("dev").effort == "max"
+    assert pol.adapter.resolved("triage").effort == "max"
+
+
+@pytest.mark.parametrize(
+    ("base", "stage"),
+    [("opencode", "opencode-http"), ("opencode-http", "opencode"), ("claude-code-tmux", "claude")],
+)
+def test_stage_naming_an_alias_of_the_base_client_is_not_a_switch(tmp_path, base, stage):
+    """`get_profile` resolves an alias and its canonical name to ONE profile, so a
+    stage spelling the base client the other way runs the same client and must
+    inherit the client-specific keys (model, effort, extra_args) rather than
+    falling back to that profile's defaults.
+
+    ABLATION: compare raw names in `resolved()`'s `same_client` and every row
+    reddens on all three keys."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"""
+[adapter]
+name = "{base}"
+model = "anthropic/claude-x"
+effort = "max"
+extra_args = ["--foo"]
+[adapter.review]
+name = "{stage}"
+""")
+    review = policy.load(p).adapter.resolved("review")
+    assert review.name == stage  # the stage's own spelling is kept for get_profile
+    assert review.model == "anthropic/claude-x"
+    assert review.effort == "max"
+    assert review.extra_args == ("--foo",)
+
+
+def test_profile_aliases_are_the_table_get_profile_uses():
+    """`resolved()`'s same-client test and `get_profile`'s lookup must collapse
+    the same aliases: one table, re-exported, never two copies that can drift."""
+    from bmad_loop.adapters import profile as profile_mod
+
+    assert profile_mod.ALIASES is policy.PROFILE_ALIASES
+    for alias, canonical in policy.PROFILE_ALIASES.items():
+        assert profile_mod.get_profile(alias).name == canonical
+        assert policy.canonical_profile_name(alias) == canonical
+    assert policy.canonical_profile_name("claude") == "claude"  # canonical is a fixed point
+
+
+def test_base_effort_inherits_into_every_stage(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "opencode-http"
+effort = "high"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.effort == "high"
+    for role in ("dev", "review", "triage"):
+        assert pol.adapter.resolved(role).effort == "high"
+    # the base-only (unknown role) branch constructs ResolvedAdapter positionally
+    # and must carry effort too
+    assert pol.adapter.resolved("retro").effort == "high"
+
+
+def test_stage_effort_overrides_base(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+effort = "low"
+[adapter.review]
+effort = "max"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("review").effort == "max"
+    assert pol.adapter.resolved("dev").effort == "low"
+    assert pol.adapter.resolved("triage").effort == "low"
+
+
+def test_effort_defaults_empty_everywhere(tmp_path):
+    pol = policy.load(None)
+    assert pol.adapter.effort == ""
+    for role in ("dev", "review", "triage", "retro"):
+        assert pol.adapter.resolved(role).effort == ""
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ("[adapter]\neffort = 3\n", r"adapter\.effort must be a string"),
+        ("[adapter.dev]\neffort = 3\n", r"adapter\.dev\.effort must be a string"),
+        ("[adapter.review]\neffort = true\n", r"adapter\.review\.effort must be a string"),
+    ],
+)
+def test_effort_wrong_type_rejected(tmp_path, body, match):
+    """Effort is free-form (no catalog validation) but it IS typed: a non-string is
+    loud at policy load, like every other `[adapter]` string key."""
+    p = tmp_path / "policy.toml"
+    p.write_text(body)
+    with pytest.raises(policy.PolicyError, match=match):
+        policy.load(p)
+
+
 def test_stage_same_client_inherits_and_overrides(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("""
@@ -231,6 +350,12 @@ def _roundtrip_snapshot(pol):
         # (c) a stage name override — the client switch resets model to ""
         '[adapter]\nname = "claude"\nmodel = "opus"\n'
         'extra_args = ["--permission-mode", "plan"]\n[adapter.review]\nname = "codex"\n',
+        # (d) base effort inherited by every stage
+        '[adapter]\nname = "opencode-http"\neffort = "high"\n',
+        # (e) a stage effort override beside a base one
+        '[adapter]\nname = "opencode-http"\neffort = "low"\n[adapter.review]\neffort = "max"\n',
+        # (f) a stage name override — the client switch resets effort to ""
+        '[adapter]\nname = "opencode-http"\neffort = "max"\n[adapter.review]\nname = "claude"\n',
     ],
 )
 def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
@@ -430,6 +555,24 @@ def test_git_timeout_default_parse_and_template():
     assert doc["limits"]["git_timeout_s"] == 120
 
 
+def test_artifact_publication_limits_parse_validate_and_render():
+    import tomllib
+
+    loaded = policy.loads("[limits]\nartifact_file_max_mb = 7\nartifact_payload_max_mb = 21\n")
+    assert loaded.limits.artifact_file_max_mb == 7
+    assert loaded.limits.artifact_payload_max_mb == 21
+    template = tomllib.loads(policy.POLICY_TEMPLATE)["limits"]
+    assert template["artifact_file_max_mb"] == policy.LimitsPolicy.artifact_file_max_mb
+    assert template["artifact_payload_max_mb"] == policy.LimitsPolicy.artifact_payload_max_mb
+
+
+@pytest.mark.parametrize("key", ["artifact_file_max_mb", "artifact_payload_max_mb"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_artifact_publication_limits_must_be_positive(key, bad):
+    with pytest.raises(policy.PolicyError, match=rf"limits\.{key}"):
+        policy.loads(f"[limits]\n{key} = {bad}\n")
+
+
 @pytest.mark.parametrize("bad", [0, -5])
 def test_git_timeout_must_be_positive(bad):
     with pytest.raises(policy.PolicyError, match=r"limits\.git_timeout_s"):
@@ -506,6 +649,8 @@ def test_dev_contract_nudge_rejects_non_boolean():
     [
         "max_review_cycles",
         "max_dev_attempts",
+        "artifact_file_max_mb",
+        "artifact_payload_max_mb",
         "max_followup_reviews",
         "session_timeout_min",
         "git_timeout_s",

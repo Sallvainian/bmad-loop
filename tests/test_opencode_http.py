@@ -10,7 +10,8 @@ Everything binds 127.0.0.1; no real opencode binary or network access anywhere.
 
 from __future__ import annotations
 
-import importlib.util
+import contextlib
+import inspect
 import json
 import os
 import queue
@@ -22,15 +23,31 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import write_script_launcher
+from conftest import (
+    RECORDED_CHILD_GLOB,
+    bind_recorded_child,
+    kill_recorded_child,
+    preflight_pidfd_support,
+    proc_starttime,
+    recorded_child,
+    recorded_children_swept,
+    write_script_launcher,
+)
 
 from bmad_loop import runs
+from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import generic, opencode_http
-from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
+from bmad_loop.adapters.base import (
+    AdapterTaskDirectoryError,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+)
 from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDGE_TEXT
 from bmad_loop.adapters.opencode_http import (
     _RESET,
     _TOOL_COLOR,
+    USAGE_STASH_CAP,
     OpencodeDevAdapter,
     OpencodeHttpAdapter,
     OpencodeServerError,
@@ -44,6 +61,7 @@ from bmad_loop.adapters.opencode_http import (
 )
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.process_host import ProcessHostError, get_process_host
@@ -438,6 +456,21 @@ def test_config_content_shapes(tmp_path):
     )
     config = json.loads(adapter._config_content(spec_model))
     assert config["model"] == "anthropic/claude-x"
+
+    # Reasoning effort never lands in the config blob (#643): the config schema
+    # has no top-level `variant`, and `agent.<name>.variant` is inert unless that
+    # agent also pins a model — it rides the prompt_async body instead.
+    spec_effort = SessionSpec(
+        task_id="t",
+        role="triage",
+        prompt="p",
+        cwd=tmp_path,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    config = json.loads(adapter._config_content(spec_effort))
+    assert config == json.loads(adapter._config_content(spec_model))
+    assert "variant" not in json.dumps(config) and "effort" not in json.dumps(config)
 
 
 def test_session_env_carries_contract(tmp_path):
@@ -1290,15 +1323,332 @@ def test_missing_binary_is_a_clean_error(tmp_path):
         adapter.start_session(spec)
 
 
+@pytest.mark.parametrize(
+    "task_id_kind", ["absolute", "parent-traversal", "empty", "windows-reserved"]
+)
+def test_start_session_refuses_unconfined_task_id_without_side_effects(tmp_path, task_id_kind):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_ids = {
+        "absolute": str(outside),
+        "parent-traversal": str(Path("..") / ".." / "outside"),
+        "empty": "",
+        "windows-reserved": "CON",
+    }
+    task_id = task_ids[task_id_kind]
+    escaped_log = adapter.logs_dir / f"{task_id}.server.out"
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="expected one clean path segment"):
+        adapter.start_session(spec)
+
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert not escaped_log.exists()
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_symlinked_task_directory_without_side_effects(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (outside / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    try:
+        task_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(spec)
+
+    assert task_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+@pytest.mark.parametrize("name", generic.RESULT_FILE_ARTIFACTS)
+def test_start_session_refuses_a_redirected_mixin_artifact_without_side_effects(tmp_path, name):
+    """The inherited `_ResultFileMixin` writes the heartbeat and both breadcrumb
+    files under the task directory, so a reused directory carrying a symlink under
+    one of those names is the same hazard the generic adapter refuses: the heartbeat
+    overwrite truncates the link's target, a breadcrumb append lands outside the run.
+    This adapter validated `messages.json` alone — its own file — and let the three
+    mixin writes through.
+
+    Parametrized over `generic.RESULT_FILE_ARTIFACTS` so a fourth mixin write is a
+    new row here, not a new gap.
+
+    Ablation: validate `(task_dir / "messages.json",)` alone again and every row
+    reddens on the raise."""
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside-target"
+    outside.write_text("theirs", encoding="utf-8")
+    task_id = "reused-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir(parents=True)
+    try:
+        (task_dir / name).symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(spec)
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert (task_dir / name).is_symlink()
+    assert not (task_dir / "prompt.txt").exists()  # refused before the first write
+    assert spawn_calls == []
+
+
+def test_start_session_refuses_symlinked_tasks_root_without_side_effects(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "theirs.txt").write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in outside.iterdir()}
+    adapter.tasks_dir.rmdir()
+    try:
+        adapter.tasks_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(spec)
+
+    assert adapter.tasks_dir.is_symlink()
+    assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_junction_like_tasks_root_before_mutation(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == adapter.tasks_dir)
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="tasks directory is a symlink"):
+        adapter.start_session(spec)
+
+    assert list(adapter.tasks_dir.iterdir()) == []
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_replaces_prompt_symlink_without_following_it(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        prompt_path.symlink_to(outside_prompt)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert not prompt_path.is_symlink()
+    assert prompt_path.read_text(encoding="utf-8") == "p\n"
+    assert adapter._sessions == {}
+
+
+def test_start_session_replaces_prompt_hardlink_without_following_it(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    outside_prompt = tmp_path / "outside-prompt.txt"
+    outside_prompt.write_text("theirs", encoding="utf-8")
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        os.link(outside_prompt, prompt_path)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+
+    assert outside_prompt.read_text(encoding="utf-8") == "theirs"
+    assert prompt_path.stat().st_ino != outside_prompt.stat().st_ino
+    assert prompt_path.read_text(encoding="utf-8") == "p\n"
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_redirected_messages_before_mutation(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    task_dir = adapter.tasks_dir / "clean-task"
+    task_dir.mkdir()
+    outside = tmp_path / "outside-messages.json"
+    outside.write_text("theirs", encoding="utf-8")
+    try:
+        (task_dir / "messages.json").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact is a symlink"):
+        adapter.start_session(spec)
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert not (task_dir / "prompt.txt").exists()
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+@pytest.mark.parametrize("suffix", [".log", ".server.out", ".sse.jsonl"])
+def test_start_session_refuses_redirected_log_path_before_mutation(tmp_path, suffix):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside.log"
+    outside.write_text("theirs", encoding="utf-8")
+    try:
+        (adapter.logs_dir / f"clean-task{suffix}").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact is a symlink"):
+        adapter.start_session(spec)
+
+    assert outside.read_text(encoding="utf-8") == "theirs"
+    assert not (adapter.tasks_dir / "clean-task").exists()
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_redirected_logs_root_before_mutation(tmp_path):
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "clean-task.server.out"
+    outside_file.write_text("theirs", encoding="utf-8")
+    adapter.logs_dir.rmdir()
+    try:
+        adapter.logs_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    spec = SessionSpec(task_id="clean-task", role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="artifact directory is a symlink"):
+        adapter.start_session(spec)
+
+    assert outside_file.read_text(encoding="utf-8") == "theirs"
+    assert not (adapter.tasks_dir / "clean-task").exists()
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_refuses_junction_like_task_directory_before_mutation(tmp_path, monkeypatch):
+    """The adapter consumes the shared predicate's Windows-junction verdict.
+
+    platform_util's reparse-tag tests own junction detection itself; an ordinary
+    directory standing in here makes this composition arm run on every platform.
+    """
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spawn_calls = []
+    adapter._spawn_server = lambda spec: spawn_calls.append(spec)
+    task_id = "clean-task"
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir()
+    (task_dir / "prompt.txt").write_text("theirs", encoding="utf-8")
+    for artifact in TASK_CYCLE_ARTIFACTS:
+        (task_dir / artifact).write_text("theirs", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in task_dir.iterdir()}
+    monkeypatch.setattr(adapter_base, "is_link_like", lambda path: Path(path) == task_dir)
+    spec = SessionSpec(task_id=task_id, role="triage", prompt="p", cwd=tmp_path)
+
+    with pytest.raises(AdapterTaskDirectoryError, match="symlink or junction"):
+        adapter.start_session(spec)
+
+    assert {path.name: path.read_bytes() for path in task_dir.iterdir()} == before
+    assert list(adapter.logs_dir.iterdir()) == []
+    assert spawn_calls == []
+    assert adapter._sessions == {}
+
+
+def test_start_session_drops_every_reused_task_cycle_artifact(tmp_path):
+    """Parity with GenericAdapter: both adapters own a tasks/<id>/ dir, so both must
+    drop a prior cycle's artifacts before a re-armed run reusing the id lands there.
+    No fake server needed: the unlinks run BEFORE _spawn_server's PATH check raises,
+    so a missing binary still exercises them.
+
+    That parity is now STRUCTURAL rather than asserted twice in prose: both adapters
+    loop over `journal.TASK_CYCLE_ARTIFACTS`, this test iterates the same constant,
+    and `test_portability_guard.test_task_cycle_artifacts_named_only_through_the_constant`
+    refuses the bare literal that would let one adapter drift from the other. A third
+    artifact added to the constant is covered here with no edit."""
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spec = SessionSpec(task_id="t-1", role="triage", prompt="p", cwd=tmp_path)
+    task_dir = adapter.tasks_dir / "t-1"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    assert TASK_CYCLE_ARTIFACTS, "the constant is the list under test; an empty one is vacuous"
+    stale = [task_dir / name for name in TASK_CYCLE_ARTIFACTS]
+    for path in stale:
+        path.write_text(
+            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+    assert [p for p in stale if p.exists()] == []
+
+    # ...and the ordinary case — nothing left behind — reaches the same spawn error,
+    # i.e. the unlinks are missing_ok and did not become the failure themselves
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+
+
 def test_kill_unknown_handle_is_a_noop(tmp_path):
     adapter = make_adapter(tmp_path)
     adapter.kill(SessionHandle(task_id="never-started", native_id="ses_x"))
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="os.kill(0) reap probe is POSIX")
 @pytest.mark.skipif(
-    not sys.platform.startswith("linux") and importlib.util.find_spec("psutil") is None,
-    reason="descendant discovery off Linux needs psutil (the non-linux extra)",
+    not sys.platform.startswith("linux"),
+    reason="the detached child is identified by its /proc start time and signalled "
+    "through os.pidfd_open — both Linux-only facilities",
 )
 def test_kill_process_reaps_detached_descendant(tmp_path):
     """#183 mirror on the HTTP transport, deterministic without a real opencode
@@ -1309,30 +1659,79 @@ def test_kill_process_reaps_detached_descendant(tmp_path):
     is reaped, proving the pre-signal descendant harvest + reap covers a straggler
     the pane/pgid kill would leak (a live opencode binary is not required, and the
     live-server harness cannot easily be made to detach a child — noted in the
-    report)."""
+    report).
+
+    DW-136: this test never holds a bare pid. The server records the same
+    ``<pid> <starttime>`` identity the stories fakes write, and every signal —
+    the liveness poll and the cleanup kill alike — goes out through a pidfd bound
+    while that pair still matched, so a recycled pid can neither fake a survivor
+    nor absorb the cleanup SIGKILL.
+    """
     adapter = make_adapter(tmp_path)
     adapter.kill_wait_s = 3.0
-    child_pid_file = tmp_path / "detached.pid"
-    # The "server" detaches a session-leader child (records its pid), then idles so
-    # it is provably alive at harvest — the server (process.pid) is the parent of
-    # the detached child, so host.descendants(server) finds it before the SIGTERM.
+    # RECORDED_CHILD_GLOB-shaped, so `recorded_children_swept` can rediscover this
+    # child from disk if the pre-bind region below raises before any fd names it.
+    child_pid_file = tmp_path / ".bmad-loop" / "runs" / "r0" / "tasks" / "t0" / "fake-child.pid"
+    child_pid_file.parent.mkdir(parents=True, exist_ok=True)
+    assert child_pid_file.relative_to(tmp_path).match(
+        RECORDED_CHILD_GLOB
+    ), f"{child_pid_file} is outside RECORDED_CHILD_GLOB ({RECORDED_CHILD_GLOB})"
+    publication_target = tmp_path / "direct-write-target"
+    child_pid_file.symlink_to(publication_target)
+    # Fail before anything is spawned if this host cannot open or signal a pidfd.
+    preflight_pidfd_support()
+    # The "server" detaches a session-leader child, records its identity (start time
+    # read from /proc by splitting after the last ")" — field index 19, exactly as
+    # `recorded_child`'s parser and the stories fakes do), then idles so the child is
+    # provably alive at harvest: the server (process.pid) is the parent of the
+    # detached child, so host.descendants(server) finds it before the SIGTERM. The
+    # record lands via a sibling temp file plus os.replace, because the strict parser
+    # makes a torn read fatal rather than merely lucky. If the read or parse fails
+    # instead, the child is killed through the server's own Popen handle (reuse-safe,
+    # and the only cleanup path left: with no identity file, nothing downstream can
+    # ever authenticate that process).
     server_body = (
-        "import subprocess, sys, time\n"
+        "import os, subprocess, sys, time\n"
         "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'],"
         " start_new_session=True)\n"
-        f"open({str(child_pid_file)!r}, 'w', encoding='utf-8').write(str(p.pid))\n"
+        "try:\n"
+        "    stat = open(f'/proc/{p.pid}/stat', encoding='utf-8').read()\n"
+        "    starttime = stat[stat.rindex(')') + 1:].split()[19]\n"
+        f"    idfile = {str(child_pid_file)!r}\n"
+        "    tmp = idfile + '.tmp'\n"
+        "    with open(tmp, 'w', encoding='utf-8') as fh:\n"
+        "        fh.write(f'{p.pid} {starttime}\\n')\n"
+        "    os.replace(tmp, idfile)\n"
+        "except BaseException:\n"
+        "    p.kill()\n"
+        "    p.wait()\n"
+        "    raise\n"
         "time.sleep(300)\n"
     )
-    process = subprocess.Popen([sys.executable, "-c", server_body])
-    detached_pid = None
+    process: subprocess.Popen | None = None
+    detached_fd: int | None = None
     try:
-        deadline = time.monotonic() + 10
-        while not child_pid_file.is_file() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert child_pid_file.is_file(), "server never recorded its detached child"
-        detached_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
-        # sanity: the recorded pid is the setsid'd process and is currently alive
-        os.kill(detached_pid, 0)
+        # The pre-bind window: the grandchild is running under its own session but no
+        # fd names it until the bind below. The 10s wait and the two asserts inside are
+        # all raise points, and a `start_new_session=True` sleep(300) that escapes them
+        # is unreapable by any authenticated path — so the sweeper covers the stretch.
+        with recorded_children_swept(tmp_path):
+            process = subprocess.Popen([sys.executable, "-c", server_body])
+            deadline = time.monotonic() + 10
+            while not child_pid_file.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert child_pid_file.is_file(), "server never recorded its detached child"
+            assert (
+                not child_pid_file.is_symlink()
+            ), "the recorder must replace, not write through, the published identity name"
+            detached_pid, detached_start = recorded_child(child_pid_file)
+            # sanity: the recorded pid is the setsid'd process and is currently alive —
+            # binding succeeds only while /proc still reports the recorded start time.
+            detached_fd = bind_recorded_child(detached_pid, detached_start)
+            assert detached_fd is not None, (
+                f"the recorded detached child {detached_pid} was already gone (or its start "
+                f"time no longer matches {detached_start}) before the kill under test ran"
+            )
 
         sess = _ServerSession(process=process, port=0, base_url="", password="", log_fh=None)
         adapter._kill_process(sess)
@@ -1341,23 +1740,100 @@ def test_kill_process_reaps_detached_descendant(tmp_path):
         reap_deadline = time.monotonic() + 10
         while True:
             try:
-                os.kill(detached_pid, 0)
+                # Signal 0 through the bound fd keeps the old alive-or-zombie
+                # semantics without ever naming the raw number again.
+                signal.pidfd_send_signal(detached_fd, 0)
             except ProcessLookupError:
                 break  # detached child reaped by the descendant sweep
             assert time.monotonic() < reap_deadline, f"detached child {detached_pid} survived"
             time.sleep(0.05)
     finally:
-        for pid in (detached_pid, process.pid):
-            if pid is None:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        # The child goes through its authenticated fd; the server goes through the
+        # Popen handle this test owns — `kill()` no-ops once `returncode` is set, and
+        # an unreaped pid cannot be recycled, so neither path can hit a stranger.
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
+            kill_recorded_child(detached_fd)
+        finally:
+            if process is not None:
+                process.kill()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+def test_detached_descendant_row_is_gated_to_linux_only():
+    """DW-136: the row above authenticates its child by /proc start time and signals
+    it through a pidfd, both Linux-only. Its gate must say exactly that.
+
+    The old gate admitted macOS whenever psutil was importable — a host where neither
+    facility exists, so the only way to clean up was the bare-pid SIGKILL this change
+    removed. Widen the gate back and there is no authenticated signal to widen it to,
+    which is why the condition is pinned at the source level rather than by its value:
+    on Linux every candidate condition evaluates to False alike.
+    """
+    marks = [
+        m for m in test_kill_process_reaps_detached_descendant.pytestmark if m.name == "skipif"
+    ]
+    assert len(marks) == 1, f"expected exactly one skipif gate, got {marks}"
+    # Assert the gate's VALUE on this host, not a re-spelling of its own condition:
+    # `args[0] == (not sys.platform.startswith("linux"))` compares two expressions that
+    # agree everywhere for any platform-shaped condition, so it can never fail. This
+    # form does: a gate hardcoded True, or one keyed to the wrong platform, is caught
+    # on whichever leg it wrongly skips (CI runs ubuntu and windows).
+    skips_here = bool(marks[0].args[0])
+    if sys.platform.startswith("linux"):
+        assert not skips_here, "the gate skips the row on Linux, the one host it must run on"
+    else:
+        assert skips_here, "the gate admits a host with no /proc start times and no pidfd"
+    reason = marks[0].kwargs["reason"]
+    assert "/proc" in reason and "pidfd" in reason, reason
+
+    # ALL whitespace stripped, so `trunk fmt` re-wrapping the decorator across lines
+    # cannot silently break these substring checks.
+    source = "".join(inspect.getsource(test_kill_process_reaps_detached_descendant).split())
+    gate = source.split("deftest_kill_process_reaps_detached_descendant")[0]
+    assert 'sys.platform.startswith("linux")' in gate, gate
+    assert "psutil" not in gate, gate
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="plants a /proc-authenticated identity and reaps it through os.pidfd_open — "
+    "both Linux-only facilities",
+)
+def test_detached_descendant_row_sweeps_a_recorded_child_when_setup_fails(tmp_path, monkeypatch):
+    """DW-136 mirror of the stories DW-137 row: the row above spawns a session-leader
+    grandchild inside its pre-bind window, where a 10-second wait and two asserts can
+    all raise before any fd names it. Nothing else can clean that process up — it is
+    outside the server's process group and its number must never be signalled blind —
+    so the `recorded_children_swept` wrap is the only cleanup path. Delete the wrap and
+    the planted child below survives this test by ~5 minutes.
+
+    The row's own `recorded_child` binding is patched to raise, which is the shape a
+    torn or malformed record would take; the sweeper's copy lives in `conftest` and is
+    a different binding, so it still parses the planted file normally.
+    """
+    planted = tmp_path / ".bmad-loop" / "runs" / "r0" / "tasks" / "t9" / "fake-child.pid"
+    planted.parent.mkdir(parents=True)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        starttime = proc_starttime(proc.pid)
+        assert starttime is not None, f"planted child {proc.pid} has no /proc identity"
+        planted.write_text(f"{proc.pid} {starttime}\n", encoding="utf-8")
+
+        def malformed(_pid_file):
+            raise AssertionError("must hold exactly two positive ASCII-decimal tokens")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "recorded_child", malformed)
+            with pytest.raises(AssertionError, match="positive ASCII-decimal"):
+                test_kill_process_reaps_detached_descendant(tmp_path)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
 
 
 def test_kill_process_strikes_root_before_reraising_bad_host_override(tmp_path, monkeypatch):
@@ -1450,6 +1926,139 @@ def test_read_usage_returns_stash_by_session_id(tmp_path):
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_1")).total == 1
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_2")) is None
     assert adapter.read_usage(SessionResult(status="completed")) is None
+
+
+def test_stash_usage_bounded_by_cap_evicting_oldest_first(tmp_path):
+    """DW-117: `_usage` is session-keyed and read AFTER `run()` returns, so it
+    cannot ride `_evict_task_state`; the bound lives at the write site."""
+    adapter = make_adapter(tmp_path)
+    overflow = 5
+    for i in range(USAGE_STASH_CAP + overflow):
+        adapter._stash_usage(f"ses_{i}", TokenUsage(input_tokens=i))
+
+    assert len(adapter._usage) == USAGE_STASH_CAP
+    # the `overflow` oldest ids are gone, oldest-first
+    for i in range(overflow):
+        assert adapter.read_usage(SessionResult(status="completed", session_id=f"ses_{i}")) is None
+    # the boundary survivor and the newest id both still read back
+    for i in (overflow, USAGE_STASH_CAP + overflow - 1):
+        got = adapter.read_usage(SessionResult(status="completed", session_id=f"ses_{i}"))
+        assert got == TokenUsage(input_tokens=i)
+
+
+def test_stash_usage_rewrite_replaces_without_evicting(tmp_path):
+    """Re-stashing a live session must not evict a peer: only a NEW key evicts."""
+    adapter = make_adapter(tmp_path)
+    for i in range(USAGE_STASH_CAP):  # exactly full, so any eviction is observable
+        adapter._stash_usage(f"ses_{i}", TokenUsage(input_tokens=i))
+
+    adapter._stash_usage("ses_10", TokenUsage(input_tokens=999))  # a mid-order live id
+
+    assert len(adapter._usage) == USAGE_STASH_CAP  # count unchanged, nothing dropped
+    assert adapter.read_usage(SessionResult(status="completed", session_id="ses_10")) == TokenUsage(
+        input_tokens=999
+    )  # replaced in place
+    assert adapter.read_usage(  # the oldest peer was NOT evicted by the re-write
+        SessionResult(status="completed", session_id="ses_0")
+    ) == TokenUsage(input_tokens=0)
+
+
+def test_usage_stash_survives_session_teardown(tmp_path):
+    """DW-129: `read_usage(result)` runs AFTER `run()`/`kill()` return, so the
+    `_usage` stash must outlive teardown — which is precisely why DW-117 put the
+    capacity bound at the write site (`_stash_usage`) rather than on a lifecycle
+    hook. Until this row the invariant was only observed INCIDENTALLY, by three
+    fake-binary E2E cases that happen to read usage after `run()` has already
+    torn the session down: `test_e2e_completed`,
+    `test_e2e_budget_enforce_trips_nudges_and_aborts_over_budget` and
+    `test_e2e_dev_synthesizes_terminal_spec`. This row pins it directly at the
+    kill seam instead, so the guarantee no longer depends on an E2E keeping that
+    incidental ordering.
+
+    The kill path is real (no stub of `kill`, `_teardown` or `_kill_process`),
+    but with `client`, `sse_thread`, `server_fh` and `event_fh` all None the legs
+    that actually execute are `sse_stop.set()`, `_kill_process` and
+    `log_fh.close()` — `_abort` short-circuits on `client is None` and the four
+    optional-sink branches are skipped. That is enough: closing `log_fh` is
+    teardown's LAST leg, so asserting it proves teardown ran to completion rather
+    than stopping at `_kill_process`.
+
+    Ablation (run manually, DW-129): inserting `self._usage.clear()` at the top of
+    `kill()` reddens this row — `read_usage` returns None — along with the three
+    E2E cases above, so the assertion is load-bearing rather than passing for an
+    unrelated reason.
+    """
+    adapter = make_adapter(tmp_path)
+    # Bounds _kill_process's terminate -> wait -> force-kill ladder, so a slow
+    # SIGTERM cannot stall this row.
+    adapter.kill_wait_s = 3.0
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    # A real handle: _teardown closes it, guarded only by `except OSError`. Bound
+    # here so the `finally` can reclaim it if an assertion below fires first.
+    log_fh = (tmp_path / "t-1.log").open("w", encoding="utf-8")
+    try:
+        sess = _ServerSession(
+            process=process,
+            port=0,
+            base_url="",
+            password="",
+            log_fh=log_fh,
+        )
+        sess.session_id = "ses_1"
+        adapter._stash_usage("ses_1", TokenUsage(input_tokens=7))
+        adapter._sessions["t-1"] = sess
+
+        adapter.kill(SessionHandle(task_id="t-1", native_id="ses_1"))
+
+        assert "t-1" not in adapter._sessions  # kill() popped it
+        assert process.poll() is not None  # _kill_process reaped the child
+        assert sess.log_fh.closed  # ...and teardown ran through to its last leg
+        assert adapter.read_usage(
+            SessionResult(status="completed", session_id="ses_1")
+        ) == TokenUsage(input_tokens=7)
+    finally:
+        with contextlib.suppress(OSError):
+            log_fh.close()
+        process.kill()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def test_capture_usage_stashes_through_the_cap(tmp_path):
+    """The cap must bind the PRODUCTION write site, not just `_stash_usage`:
+    `_capture_usage` is the only caller, so an assignment that bypassed the
+    helper would restore the unbounded growth."""
+    adapter = make_adapter(tmp_path)
+    messages = [{"info": {"role": "assistant", "tokens": {"input": 3, "output": 1}}}]
+
+    class _Client200:
+        def get(self, path):
+            class _Resp:
+                status_code = 200
+
+                def json(self):
+                    return messages
+
+            return _Resp()
+
+    for i in range(USAGE_STASH_CAP + 2):
+        task_id = f"t{i}"
+        # a missing parent raises into `_capture_usage`'s except and skips the stash
+        (adapter.tasks_dir / task_id).mkdir(parents=True)
+        sess = _ServerSession(process=None, port=0, base_url="", password="", log_fh=None)
+        sess.session_id = f"ses_{i}"
+        sess.client = _Client200()
+        handle = SessionHandle(task_id=task_id, native_id=sess.session_id)
+        assert adapter._capture_usage(handle, sess) is not None  # the stash really ran
+
+    assert len(adapter._usage) == USAGE_STASH_CAP
+    assert adapter.read_usage(SessionResult(status="completed", session_id="ses_0")) is None
+    newest = USAGE_STASH_CAP + 1
+    assert adapter.read_usage(
+        SessionResult(status="completed", session_id=f"ses_{newest}")
+    ) == TokenUsage(input_tokens=3, output_tokens=1)
 
 
 def test_sample_weighted_usage_inert_on_http_failure(tmp_path):
@@ -1547,6 +2156,49 @@ def test_e2e_result_less_stop_nudges_then_completes(tmp_path, fake_opencode):
     texts = prompt_texts(rec)
     assert len(texts) == 2
     assert texts[1] == NUDGE_TEXT  # the wake-up carried the result-contract nudge
+    assert_server_gone(rec)
+
+
+def test_e2e_effort_rides_every_prompt_body_as_variant(tmp_path, fake_opencode):
+    """#643: `SessionSpec.effort` is sent as the per-call `variant` on EVERY
+    prompt_async body — the initial prompt AND the wake-up nudge. A nudge that
+    dropped back to the provider default would be silent mid-session drift, so
+    the value is stashed once on the server session and emitted by the single
+    `_prompt` primitive both paths share."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "nudge-then-complete", effort="max")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    bodies = read_jsonl(rec / "prompts.jsonl")
+    assert len(bodies) == 2  # initial prompt + one nudge
+    assert bodies[1]["parts"][0]["text"] == NUDGE_TEXT
+    assert [b["variant"] for b in bodies] == ["max", "max"]
+    assert_server_gone(rec)
+
+
+def test_e2e_effort_unset_omits_variant_from_every_prompt_body(tmp_path, fake_opencode):
+    """The inverse: with no effort the key is OMITTED, not sent empty, so the body
+    of an effort-less session is byte-identical to the pre-#643 shape
+    (`{"parts": [...]}` and nothing else) on the initial prompt and the nudge.
+
+    ABLATION: drop the `if sess.variant` guard in `_prompt` (always send the key)
+    and this reddens."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "nudge-then-complete")
+    assert spec.effort == ""
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    bodies = read_jsonl(rec / "prompts.jsonl")
+    assert len(bodies) == 2
+    for body in bodies:
+        assert "variant" not in body
+        assert set(body) == {"parts"}
     assert_server_gone(rec)
 
 
@@ -2646,6 +3298,33 @@ def test_e2e_dev_synthesizes_terminal_spec(tmp_path, fake_opencode):
     assert_server_gone(rec)
 
 
+def test_e2e_dev_retained_park_marker_is_not_reowned_by_unrelated_rewrite(tmp_path, fake_opencode):
+    """The HTTP transport also captures marker provenance before prompting."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec_path = impl / "spec-3-1-foo.md"
+    parked = (
+        "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+        "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+        "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+    )
+    spec_path.write_text(parked)
+    spec = make_dev_spec(
+        tmp_path,
+        rec,
+        "completed",
+        spec_path,
+        spec_text=parked.replace("# Story", "# Story\n\nUnrelated session edit."),
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert result.result_json["status"] == "awaiting-operator"
+    assert result.result_json["park_asserted"] is False
+    assert_server_gone(rec)
+
+
 def test_e2e_dev_stories_mode_resolves_by_id(tmp_path, fake_opencode, monkeypatch):
     """Folder+id dispatch (BMAD_LOOP_SPEC_FOLDER): the story spec is resolved
     at its deterministic id-keyed path — never via the mtime scan."""
@@ -2689,6 +3368,121 @@ def test_e2e_dev_post_kill_rescue(tmp_path, fake_opencode):
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
     assert result.result_json["post_kill_reconciled"] is True
+    assert_server_gone(rec)
+
+
+# ------------------------------------- _server_procs retention bound (DW-106)
+#
+# `_server_procs` retains a live `subprocess.Popen` per task past kill(), so an
+# entry per completed session pinned one for the adapter's lifetime. It is the
+# one per-task store `_DevSynthesisMixin` cannot reach, so OpencodeDevAdapter
+# overrides the mixin's `_evict_task_state` seam and delegates up; `run()`'s
+# `finally` is still provably past `_post_kill_reconcile`, which base `run()`
+# calls INSIDE the call the mixin's `try` wraps. Ablation note: absence alone is
+# a weak assertion here — `_probe_alive` reads a missing key as "never spawned"
+# and answers False, exactly what a dead process answers — so the ordering row
+# asserts the entry is PRESENT at probe time, not just the verdict.
+
+
+def test_e2e_dev_run_evicts_the_retained_server_proc(tmp_path, fake_opencode):
+    """The bound itself: a normal completed session leaves no process handle behind.
+
+    Also pins the override's `super()._evict_task_state(task_id)` delegation. The
+    override is the ONLY `_evict_task_state` on this transport's MRO, so dropping
+    that call bounds `_server_procs` while every mixin-owned store leaks here —
+    a regression no generic-adapter row can see."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert adapter._server_procs == {}
+    # the delegation up the MRO really happened: all four mixin stores evicted too
+    assert spec.task_id not in adapter._launch_auto_run_results
+    assert spec.task_id not in adapter._fm_fallback_obs
+    assert spec.task_id not in adapter._fm_transition_obs
+    assert spec.task_id not in adapter._contract_nudge_sent
+    assert_server_gone(rec)
+
+
+def test_e2e_dev_server_proc_outlives_the_post_kill_probe(tmp_path, fake_opencode):
+    """Eviction must land after the LAST in-lifecycle reader: `_post_kill_reconcile`
+    settles liveness through `_probe_alive`, which answers from this very store.
+    Records that the entry was still present when the rescue probed, and the
+    verdict it computed from it."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "busy-forever", impl / "spec-3-1-foo.md", timeout_s=1.5)
+
+    probes: list[tuple[bool, bool | None]] = []
+    real_probe = adapter._probe_alive
+
+    def recording(handle):
+        verdict = real_probe(handle)
+        probes.append((handle.task_id in adapter._server_procs, verdict))
+        return verdict
+
+    adapter._probe_alive = recording
+
+    result = adapter.run(spec)
+
+    # present at probe time, and provably dead -> the rescue was allowed to run
+    assert probes == [(True, False)]
+    assert result.status == "completed"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert adapter._server_procs == {}
+    assert_server_gone(rec)
+
+
+def test_e2e_dev_run_evicts_the_server_proc_when_wait_raises(tmp_path, fake_opencode):
+    """The store DW-106 is actually about is a live `Popen`, and an operator stop is
+    exactly when it leaks: a raising `wait_for_completion` never reaches
+    `_post_kill_reconcile`, so only the `finally` covers it. base `run()`'s inner
+    `finally` still tears the server down; the mixin's outer `finally` drops the
+    handle to it, and the original exception reaches the caller unchanged."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    started: list[bool] = []
+
+    def raising(handle, running_spec):
+        # the launch really happened: there is a live process handle to leak
+        started.append(running_spec.task_id in adapter._server_procs)
+        raise RuntimeError("stop requested")
+
+    adapter.wait_for_completion = raising
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert started == [True]
+    assert "3-1-dev-1" not in adapter._server_procs
+    assert_server_gone(rec)
+
+
+def test_e2e_dev_run_evicts_only_the_returning_task_ids_server_proc(tmp_path, fake_opencode):
+    """Scoped to `spec.task_id`: another dev session in flight on the same adapter
+    keeps its handle, so its own post-kill reconcile can still settle liveness."""
+    launcher, rec = fake_opencode
+    adapter, impl = make_dev_adapter(tmp_path, binary=str(launcher))
+
+    class _Proc:
+        def poll(self):
+            return None  # still running
+
+    adapter._server_procs["3-2-dev-1"] = _Proc()
+    spec = make_dev_spec(tmp_path, rec, "completed", impl / "spec-3-1-foo.md")
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert "3-1-dev-1" not in adapter._server_procs
+    # the survivor is still usable, not merely present
+    other = SessionHandle(task_id="3-2-dev-1", native_id="ses_y")
+    assert adapter._probe_alive(other) is True
     assert_server_gone(rec)
 
 

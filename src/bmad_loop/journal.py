@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,7 @@ from .platform_util import (
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
+    file_lock,
     is_link_like,
     open_dir_confined,
 )
@@ -24,6 +28,102 @@ LOGS_DIR = "logs"
 # Verifier subprocess streams, deliberately NOT under LOGS_DIR — see
 # Journal.write_verify_stream for why sharing that directory is a TUI bug.
 VERIFY_DIR = "verify"
+# The cycle-scoped artifacts a session writes into ``tasks/<task_id>/``: the ONE
+# list the three sites that touch them share. Both adapters clear these in
+# ``start_session`` (a caller-supplied task_id may be reused, and a silent session
+# must not inherit a stale predecessor's outputs) and
+# ``resolve._gather_escalations`` reads them back. Spelled here rather than three
+# times, because a fourth artifact added to the reader alone would silently miss
+# both adapters — which is the shape the parity was in before.
+#
+# ``result.json`` is the dev/review contract's own result file. ``escalation.json``
+# is the SWEEP SKILL's: its automation contract
+# (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a sweep session to
+# write that file and then mirror the same entries into ``result.json``'s
+# ``escalations``. That sentence lived in both adapters' comments and nowhere else,
+# and it is the whole reason the reader opens two names rather than one.
+#
+# ORDER IS LOAD-BEARING — but NOT because of the mirroring, which is the obvious
+# reading and the wrong one: ``_gather_escalations`` keys its map on canonical
+# JSON, so a mirrored entry's STORED value is byte-identical whichever copy is read
+# first. What the order fixes is the POSITION of DISTINCT entries in the
+# newest-first list the operator is shown — result.json's entries precede
+# escalation.json's, and a repeat keeps its first occurrence's slot. Swap these two
+# and ``tests/test_resolve.py``'s
+# ``test_gather_escalations_preserves_result_before_escalation_file_order`` and
+# ``test_gather_escalations_keeps_a_duplicates_first_position`` redden (measured,
+# not reasoned about).
+#
+# Appending a name is bounded twice, so it is not free. ``_gather_escalations``
+# JSON-parses every name here and skips anything that is not an
+# ``{"escalations": [...]}`` document, so a name that does not carry that shape
+# buys the reader nothing. And both adapters run this unlink loop AFTER
+# ``start_session`` has already written ``prompt.txt`` into the same directory, so
+# a name an earlier step of that method writes would be deleted on the way out.
+#
+# Four other cycle-scoped files live in ``tasks/<task_id>/`` and are deliberately
+# NOT here, because each is owned and read by ONE adapter rather than shared:
+# ``heartbeat.json``, ``resultless-stops.jsonl`` and ``session-lifecycle.jsonl``
+# (``adapters/generic.py``) and ``messages.json`` (``adapters/opencode_http.py``).
+TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ("result.json", "escalation.json")
+
+# The field names ``Journal.append`` stamps onto an entry ITSELF, rather than taking
+# from its caller's keywords — see the ``setdefault`` pair in that method. No call
+# site spells either one, which makes them invisible to anything reading call sites
+# and easy for a consumer to mistake for a producer-supplied field.
+#
+# Spelled here, at the minting site, because two consumers need exactly this set and
+# a third copy is how they drift: ``diagnostics._scrub_entry`` must exempt them from
+# the fail-closed arm it applies to a declared-schema kind (they are engine-minted,
+# never LLM-authored, so collapsing ``log_pos`` to a presence marker would throw away
+# a byte offset for no safety gain), and ``tests/test_portability_guard.py`` needs
+# them to keep its static call-site scan from calling them dead. Both import this
+# name; neither restates the pair.
+SELF_MINTED_FIELDS: frozenset[str] = frozenset({"log_task", "log_pos"})
+
+# The one kind in this file NO producer writes: both journal readers mint it in place
+# of a line they could not JSON-decode, so a lost record is counted and rendered
+# instead of vanishing under a bare ``continue``.
+#
+# Spelled here, next to ``SELF_MINTED_FIELDS`` and for the same reason: two readers
+# (``Journal.entries`` and ``tui.data.JournalTail.read_new``) need exactly one shape,
+# and a second copy is how they drift. ``tui.widgets.journal_line`` imports the constant
+# too and matches it by EQUALITY, so the styling rule cannot outlive a rename and cannot
+# leak red onto a producer kind that merely contains this spelling.
+#
+# NOT a ``tests/test_portability_guard.py`` ``JOURNAL_KINDS`` row, deliberately: that
+# inventory is scanned from the literal kinds passed to ``Journal.append``, so a
+# reader-minted kind would sit there as a row nothing writes and redden
+# ``test_journal_kind_inventory_is_complete``'s staleness arm.
+UNREADABLE_LINE_KIND = "journal-line-unreadable"
+
+
+def unreadable_line_entry(byte_len: int) -> dict[str, Any]:
+    """One unreadable journal line, reported in the stream position it occupied.
+
+    Deliberately one line, not one record: a marker stands for a LINE the reader could
+    not decode, and how many records that line cost is unknowable from the line alone.
+    A torn record that its own next append healed costs one; a line written before this
+    heal existed — or one a rival appender tore inside :meth:`Journal.append`'s
+    probe-to-write window — can be two records concatenated into a single unparseable
+    line. The ``bytes`` count is what is actually known.
+
+    Deliberately minimal. No ``ts``: ``diagnostics.summarize_journal`` derives
+    ``first_ts``/``last_ts``/``duration_s`` from entry timestamps, so a fabricated one
+    would corrupt them, and the true write time of an unparseable line is unknowable
+    (a ``ts``-less entry is simply skipped for those). No content from the offending
+    line, which can carry session text — a bounded byte count only. No line number:
+    ``entries()`` counts from the file and ``JournalTail`` from its chunk, so the same
+    field would mean two different things; the list position already carries it.
+
+    A plain ``dict``, so it survives ``runs.journal_entries_or_none``'s
+    ``isinstance(e, dict)`` filter and keeps that reader's ``len(before)`` watermark
+    exact across two reads of an unchanged file.
+    """
+    return {"kind": UNREADABLE_LINE_KIND, "bytes": byte_len}
+
+
+_STATE_LOCK_LOCAL = threading.local()
 
 
 class Journal:
@@ -42,7 +142,78 @@ class Journal:
         self._log_task = task_id
         self._log_path = self.run_dir / LOGS_DIR / f"{task_id}.log"
 
+    def _tail_is_terminated(self) -> bool:
+        """Whether the journal's last byte is a newline — an absent or zero-length
+        file counts as terminated (there is no fragment to close).
+
+        Read in ``"rb"`` and closed before the append opens the file, mirroring
+        ``install.py``'s read-then-write: ``"ab+"`` would put a read and a write on
+        one handle, which CPython only defines with an intervening seek/flush.
+
+        The two error directions are deliberately NOT the same, because their costs
+        are not symmetric. ``FileNotFoundError`` is the only one that justifies
+        ``True``: no file means no fragment, and healing it would put a leading blank
+        line in every fresh journal. Every OTHER ``OSError`` — a transient EACCES or
+        EMFILE, or the Windows sharing violation ``atomic_replace`` already retries
+        for — leaves a file that EXISTS and whose tail is unknown. Answering "already
+        terminated" there skips the heal, and if that tail is a fragment the next
+        append concatenates onto it: the exact two-record loss this method exists to
+        prevent, reintroduced on the unlucky path. Answering "unterminated" costs at
+        worst one blank line, which both readers skip. So the unknown case fails
+        toward the heal. Neither arm raises: a writer that is only trying to record
+        must not be taken down by a probe.
+        """
+        try:
+            with self.path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() == 0:
+                    return True
+                f.seek(-1, os.SEEK_END)
+                return f.read(1) == b"\n"
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
     def append(self, kind: str, **fields: Any) -> None:
+        """Append one record, healing an unterminated tail first.
+
+        The fault this closes (DW-97) costs TWO records, not one. This is the only
+        writer in this module without a durable path — ``save_state`` uses
+        ``atomic_replace``, ``write_verify_stream`` uses ``atomic_write_text`` — so a
+        partially flushed write leaves a fragment with no trailing newline. Without
+        the heal the NEXT append concatenates its own record onto that fragment, and
+        both readers then drop the combined line: one fault, two lost records, and one
+        of them may be an ``unit-merged`` that
+        ``engine._replay_unlatched_ledger_carries`` needs to avoid re-driving merged
+        work. Prepending the newline keeps the damage to the one record that was
+        actually torn.
+
+        Not routed through ``atomic_write_text``/``atomic_replace``: those rewrite the
+        whole target, and this journal is append-only and grows for a whole run, so an
+        "atomic append" would re-copy the entire file per record. The heal is the
+        in-repo precedent at ``install.py``'s exclude-file writer
+        (``existing if not existing or existing.endswith(b"\\n") else existing + b"\\n"``)
+        applied at O(1) cost.
+
+        Text mode stays, deliberately. Windows translates the ``"\\n"`` to ``"\\r\\n"``
+        on the way out, which both readers already tolerate (``splitlines`` +
+        ``strip``) and which leaves the file's LAST byte a newline either way, so the
+        probe above stays correct without a mode change no other line here needs.
+
+        The read-then-append window is racy, and the heal BOUNDS the loss rather than
+        eliminating it — do not read it as a guarantee. POSIX ``O_APPEND`` (and
+        Windows' append mode) places every write at the current end, so a rival
+        appender cannot interleave INTO this record; but it can tear its own write
+        inside the window, after the probe has already answered "terminated". That
+        leaves a fresh fragment this append then concatenates onto, and the two-record
+        loss recurs for that one pair. A rival that completes its line in the window
+        is harmless: the tail stays terminated and the prepended newline, if any, is a
+        blank line both readers skip. Closing the race needs a lock, which is
+        deliberately out of scope here (as is fsync): this defect is the SEQUENTIAL
+        concatenation — one writer's own torn record absorbing its own next one —
+        which the probe closes completely.
+        """
         entry = {"ts": time.time(), "kind": kind, **fields}
         if self._log_path is not None:
             try:
@@ -51,8 +222,11 @@ class Journal:
                 size = 0  # pipe-pane has not created the file yet
             entry.setdefault("log_task", self._log_task)
             entry.setdefault("log_pos", size)
+        text = json.dumps(entry, default=str) + "\n"
+        if not self._tail_is_terminated():
+            text = "\n" + text
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
+            f.write(text)
 
     def write_verify_stream(self, name: str, content: str) -> str:
         """Atomically retain one verifier subprocess stream under ``verify/`` and
@@ -151,26 +325,92 @@ class Journal:
         return (verify_dir / name).relative_to(self.run_dir).as_posix()
 
     def entries(self) -> list[dict[str, Any]]:
+        """Every record in the journal, with an unparseable line reported rather than
+        skipped: :func:`unreadable_line_entry` takes its place at the same stream
+        position, so a lost record is counted on the surfaces that read this list
+        instead of vanishing silently.
+
+        Blank lines are still skipped — a blank line lost no record, and the heal in
+        :meth:`append` can introduce one. Invalid UTF-8 still raises out of
+        ``read_text``: ``runs.journal_entries_or_none`` catches ``UnicodeDecodeError``
+        deliberately, so widening this to swallow it would take away a caller's ability
+        to tell a corrupt journal from an empty one. Only ``JSONDecodeError`` becomes a
+        marker.
+        """
         if not self.path.is_file():
             return []
-        out = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        out: list[dict[str, Any]] = []
+        for raw_line in self.path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
-                continue
+                # The raw line's own byte length, not the stripped spelling's: the
+                # count reports what sits in the file.
+                out.append(unreadable_line_entry(len(raw_line.encode("utf-8"))))
         return out
 
 
+@contextmanager
+def state_lock(run_dir: Path, *, blocking: bool = True) -> Iterator[None]:
+    """Serialize one run's state mutations, re-entering only for the same run.
+
+    ``blocking=False`` gives up instead of waiting, raising
+    :class:`platform_util.LockUnavailableError` when another holder has the run.
+    It is for a caller whose own semantics already say "in use ⇒ leave it alone"
+    and which must not stall on one busy run — ``cli.cmd_clean`` sweeping many.
+    The default stays blocking, because every other writer here is mutating one
+    run it means to mutate, and for those giving up is data loss, not politeness.
+    That error propagates out of this function UNCAUGHT and unwrapped: the whole
+    point is that the caller gets to tell contention apart from a real fault, and
+    a translation here would take that back.
+
+    The sidecar identity comes from :func:`runs.lock_path_for`, so alternate path
+    spellings of one ``state.json`` rendezvous on the same out-of-tree lock.  The
+    import is deliberately lazy: ``runs`` imports this module's persistence helpers.
+
+    Reentrancy is thread-local and intentionally limited to one run.  An outer
+    read-modify-write transaction can call the self-locking :func:`save_state`
+    without acquiring the OS lock twice, while nested mutation of another run is
+    refused before a second lock can introduce an ordering cycle.  A re-entrant
+    acquisition ignores ``blocking`` because it acquires nothing: this thread
+    already holds the run, so there is no one to wait for and nothing to refuse.
+    """
+    from . import runs
+
+    lock_path = runs.lock_path_for(run_dir / STATE_FILE, follow_final_symlink=False)
+    held_path = getattr(_STATE_LOCK_LOCAL, "path", None)
+    if held_path is not None:
+        if held_path != lock_path:
+            raise RuntimeError(
+                f"cannot nest run-state locks for different runs: {held_path} then {lock_path}"
+            )
+        _STATE_LOCK_LOCAL.depth += 1
+        try:
+            yield
+        finally:
+            _STATE_LOCK_LOCAL.depth -= 1
+        return
+
+    with file_lock(lock_path, blocking=blocking):
+        _STATE_LOCK_LOCAL.path = lock_path
+        _STATE_LOCK_LOCAL.depth = 1
+        try:
+            yield
+        finally:
+            del _STATE_LOCK_LOCAL.depth
+            del _STATE_LOCK_LOCAL.path
+
+
 def save_state(run_dir: Path, state: RunState) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    target = run_dir / STATE_FILE
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
-    atomic_replace(tmp, target)
+    with state_lock(run_dir):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        target = run_dir / STATE_FILE
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+        atomic_replace(tmp, target)
 
 
 def load_state(run_dir: Path) -> RunState:

@@ -53,6 +53,7 @@ from .model import (
     PAUSE_STORY_CHECKPOINT,
     Phase,
     StoryTask,
+    result_mapping,
 )
 from .runs import graceful_stop_requested
 
@@ -455,7 +456,7 @@ class StoriesEngine(Engine):
 
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the same id-keyed story spec that verification will accept."""
-        if not (result_json or {}).get("spec_file"):
+        if not result_mapping(result_json).get("spec_file"):
             return None
         state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
         return state.path if state.kind == stories.KIND_PRESENT else None
@@ -506,7 +507,7 @@ class StoriesEngine(Engine):
         # The adapter marks a plan-halt leg's synthesized result `plan_halt`; latch
         # it onto the task so _drive_story pauses for plan review (and clears it on
         # the leg-2 re-drive), and switch verify to the ready-for-dev plan gate.
-        plan_halt = bool((result_json or {}).get("plan_halt"))
+        plan_halt = bool(result_mapping(result_json).get("plan_halt"))
         task.plan_checkpoint_pending = plan_halt
         # Read-back detection: the just-run dev session HALTed pre-planning and left
         # a fixed-slug sentinel. Journal it (with its recorded blocking condition)
@@ -519,7 +520,7 @@ class StoriesEngine(Engine):
             # rearm clears it by recorded kind, not by re-deriving from the basename.
             task.sentinel_kind = state.sentinel_kind
             self._journal_sentinel_detected(task.story_key, state)
-        return verify.verify_dev_stories(
+        outcome = verify.verify_dev_stories(
             task,
             self.workspace.paths,
             result_json,
@@ -528,17 +529,49 @@ class StoriesEngine(Engine):
             plan_halt=plan_halt,
             engine_written=self._harvest_gate_exclude(task),
         )
+        # The marker remains the independent authority that this was a deliberate
+        # plan halt. Journal the proof waiver only after every artifact gate passes;
+        # `zero_diff` is an observation of the skipped gate, never an input to it.
+        waiver_already_recorded = (
+            plan_halt
+            and outcome.ok
+            and any(
+                entry.get("kind") == "plan-halt-proof-of-work-skipped"
+                and entry.get("story_key") == task.story_key
+                and entry.get("attempt") == task.attempt
+                and entry.get("generation", 0) == task.generation
+                for entry in self.journal.entries()
+            )
+        )
+        if plan_halt and outcome.ok and not waiver_already_recorded:
+            self.journal.append(
+                "plan-halt-proof-of-work-skipped",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                generation=task.generation,
+                zero_diff=outcome.plan_halt_zero_diff,
+            )
+        return outcome
 
     def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
         # A plan-halt leg produced only the plan (spec at ready-for-dev); there is
         # no implementation yet, so skip the project build/test gate — it would
         # fail on a half-built tree before the human ever sees the plan.
-        return not bool((result_json or {}).get("plan_halt"))
+        return not bool(result_mapping(result_json).get("plan_halt"))
 
     def _verify_review(self, task: StoryTask):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed
-        # story spec's own `done` frontmatter is authoritative.
-        return verify.verify_review_stories(task, self.workspace.paths, self.policy)
+        # story spec's own `done` frontmatter is authoritative. The sink is the
+        # base engine's: stories mode runs the same verifier commands and its
+        # results belong in the same journal record kind (see
+        # `Engine._review_command_sink`), so a mode-specific one would only be a
+        # way for the three gates to drift apart on what they record.
+        return verify.verify_review_stories(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _sprint_board_instruction(self) -> str:
         # Stories mode has no sprint-status.yaml: `_post_dev_state_sync` is a no-op

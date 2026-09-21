@@ -23,6 +23,7 @@ from conftest import (
     dev_effect,
     needs_strict_codec,
     review_effect,
+    scripted_verify_runner,
     write_sprint,
 )
 
@@ -446,7 +447,11 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
             seen.append((c.verification_stage, c.verification_sequence, c.command_results))
 
     result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: [result]),
+    )
 
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "verifyobs")))
     summary = engine.run()
@@ -454,9 +459,15 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     assert summary.done == 1
     assert seen == [("dev", 1, (result,))]
     # and the keys the plugin was handed are the ones its journal record carries,
-    # which is the correlation the whole surface exists for
-    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
-    assert (entry["verification_stage"], entry["verification_sequence"]) == ("dev", 1)
+    # which is the correlation the whole surface exists for. Scoped to the dev
+    # stage: the review gate journals its own pass now, and that one deliberately
+    # reaches no plugin — the single `seen` entry above is the other half of that.
+    (entry,) = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
+    ]
+    assert entry["verification_sequence"] == 1
     assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
 
 
@@ -470,7 +481,7 @@ def _resume_committing(project, engine, registry):
         policy=engine.policy,
         adapter=adapter,
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        journal=Journal(engine.run_dir),
         state=state,
         registry=registry,
     )
@@ -480,7 +491,15 @@ def _resume_committing(project, engine, registry):
 def test_pre_commit_hook_fires_on_commit_resume(project):
     """#115: the commit re-drive skips the pre_commit_gate workflows but must
     still emit the pre_commit hook — the message is regenerated on resume, so
-    a plugin's rewrite has to reach the squashed commit."""
+    a plugin's rewrite has to reach the squashed commit.
+
+    Ablation: restore `journal=engine.journal` in `_resume_committing` and the
+    clean resume-row assertion fails on inherited log_task/log_pos; the
+    persisted-history and active-log premises still pass.
+    With the earlier metadata assertion bypassed, each actual resume-commit
+    and story-done row also fails the emitted-row metadata assertion (checked
+    independently for each kind).
+    """
 
     class P(Plugin):
         def on_pre_commit(self, c):
@@ -489,8 +508,24 @@ def test_pre_commit_hook_fires_on_commit_resume(project):
     reg = registry_of(py_plugin(P, "msgmut"))
     engine, _ = make_engine(project, [], reg)
     committing_crash_state(project, engine)
+    log = engine.run_dir / "logs" / "1-1-a-dev-1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"pre-pause session output\n")
+    engine.journal.set_active_log("1-1-a-dev-1")
+    engine.journal.append("run-start", cycle=1)
+    history = engine.journal.entries()
+    assert history[-1]["log_task"] == "1-1-a-dev-1"
+    assert history[-1]["log_pos"] == log.stat().st_size > 0
 
     resumed, adapter = _resume_committing(project, engine, reg)
+    reopened_history = resumed.journal.entries()
+    assert reopened_history[: len(history)] == history
+    resumed.journal.append("run-start", cycle=2)
+    entries = resumed.journal.entries()
+    assert entries[:-1] == reopened_history
+    resume_row = entries[-1]
+    assert resume_row["kind"] == "run-start" and resume_row["cycle"] == 2
+    assert "log_task" not in resume_row and "log_pos" not in resume_row
     summary = resumed.run()
 
     assert summary.done == 1
@@ -498,6 +533,11 @@ def test_pre_commit_hook_fires_on_commit_resume(project):
     from conftest import git
 
     assert git(project.project, "log", "-1", "--format=%s") == "plugin-authored: 1-1-a"
+    for kind in ("resume-commit", "story-done"):
+        rows = [e for e in resumed.journal.entries() if e["kind"] == kind]
+        assert rows
+        for row in rows:
+            assert "log_task" not in row and "log_pos" not in row
 
 
 def test_pre_commit_pause_veto_on_commit_resume_escalates(project):
