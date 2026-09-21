@@ -22,6 +22,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Distinguish confirmed missing tmux-family sessions from failed window listings;
+  raise on unproven liveness failures and warn when metadata uses a sentinel (#525).
+
 - Prove ownership of an untagged control window before targeting it (#531). `ctl_window_id`
   admitted an untagged row whenever this project merely held a run dir for the run id, and
   `--run-id` is caller-supplied, so two projects scripting the same id each admitted the
