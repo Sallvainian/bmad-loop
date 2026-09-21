@@ -1217,6 +1217,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 stop_seen = True
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
+                    if transcript_path:
+                        # The one exit that does not go through `produced_work()`:
+                        # sample once more so an idle stretch that ended inside the
+                        # final interval is closed before `session-end` (#680).
+                        self._sample_transcript_idle(
+                            handle.task_id, transcript_path, idle, time.monotonic()
+                        )
                     return SessionResult(
                         status="completed",
                         result_json=result_json,
@@ -1345,8 +1352,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if idle.path != transcript_path:
             # A different transcript than the one sampled so far (a hook event
             # re-pointed it): start over on this file — its first key is a
-            # baseline, not a change, and any open stretch belonged to the old
-            # file. `moved` stays latched if it already was.
+            # baseline, not a change. An open stretch belonged to the old file
+            # and is closed here, since nothing else can close it: the TUI would
+            # otherwise read the old `session-idle` for as long as the new file
+            # keeps moving. `moved` stays latched if it already was.
+            if idle.open_since is not None and self.journal is not None:
+                try:
+                    self.journal.append(
+                        "session-active",
+                        task_id=task_id,
+                        idle_s=round(now - idle.last_change_mono, 3),
+                    )
+                except OSError:
+                    pass
             idle.path = transcript_path
             idle.last_key = None
             idle.idle_s = None

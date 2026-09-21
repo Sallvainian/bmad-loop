@@ -6979,6 +6979,87 @@ def test_plain_adapter_honours_the_idle_threshold_from_policy(tmp_path, monkeypa
     assert adapter.journal.entries[0]["threshold_s"] == 600.0
 
 
+def test_idle_stretch_is_closed_on_a_completing_stop(tmp_path, monkeypatch):
+    """The successful Stop is the one exit that bypasses `produced_work()`: an
+    open idle stretch whose transcript moved inside the final interval is still
+    closed before the `completed` return, so the journal reads
+    `session-idle`, `session-active` ahead of `session-end`.
+
+    ABLATION: drop the sample before the `completed` return — the
+    `session-active` is missing."""
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    impl = tmp_path / "impl"  # `make_dev_adapter`'s implementation-artifacts dir
+
+    def script(call_n):
+        if call_n >= 2:
+            _grow(log, "\r⠋".encode())
+        if 2 <= call_n <= 4:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # ages 30, 60 (crossing), 90
+        if call_n == 5:
+            clock["t"] += 10.0  # inside the final interval: no heartbeat fires
+            _grow(transcript, b'{"type":"assistant"}\n')
+            # the turn ends with its spec flipped to done: the dev adapter
+            # synthesizes the result from it
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\nbaseline_revision: abc123\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _session_start("3-1-dev-1", str(transcript)),
+            None,
+            None,
+            None,
+            _stop_event("3-1-dev-1", "sess", str(transcript)),
+        ],
+        on_call=script,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "completed"
+    assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
+
+
+def test_repointing_the_transcript_closes_an_open_idle_stretch(tmp_path, monkeypatch):
+    """A hook event re-points the transcript while a stretch is open on the old
+    one: the rebaseline closes that stretch with a `session-active`, since the
+    new file can never close it and the TUI would otherwise keep reading the old
+    `session-idle`.
+
+    ABLATION: drop the `session-active` inside the rebaseline — the journal ends
+    on an open `session-idle`."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+        if call_n == 6:
+            clock["t"] += 10_000.0
+
+    # tick 1 names the transcript; the stretch opens at age 60; tick 4's event
+    # re-points to `other`
+    events = [
+        _session_start("3-1-dev-1", str(transcript)),
+        None,
+        None,
+        _session_start("3-1-dev-1", str(other)),
+    ]
+    adapter.watcher = _ScriptedWatcher(events, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    entries = adapter.journal.entries
+    # the old file's stretch is closed at the re-point; the new file then runs its
+    # own clock from a fresh baseline and crosses on the final (jumped) sample
+    assert [e["kind"] for e in entries] == ["session-idle", "session-active", "session-idle"]
+    assert entries[2]["since_ts"] > entries[0]["since_ts"]
+
+
 def test_idle_events_need_a_positive_grace(tmp_path, monkeypatch):
     """`dev_stall_grace_s = 0` disables the events (no new knob); the heartbeat
     still stamps the age.
