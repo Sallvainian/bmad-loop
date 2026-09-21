@@ -702,6 +702,16 @@ persisted artifacts.
 - Add a CLI without touching Python: drop a TOML profile in `.bmad-loop/profiles/<name>.toml` (binary, prompt template, bypass flags, hook dialect, native→canonical event map). A CLI that needs its own adapter _class_ still needs Python — but not a core edit: the profile's `adapter` field names a kind resolved against the registry, which a co-installed package extends.
 - `bmad-loop probe-adapter` collects + sanitizes the data needed to finalize/add a profile (hook payload shape, transcript location/format, token schema): a zero-launch scan by default, opt-in `--probe` for live capture. See the [adapter authoring guide](adapter-authoring-guide.md).
 
+For Codex, `validate` and `probe-adapter` ask Codex's read-only `hooks/list` API
+whether the configured SessionStart and Stop relays are enabled and trusted.
+Stale, missing, or unverifiable hook trust is a failing result. A worktree run
+uses a different directory, so `validate` cannot certify its future trust from
+the main checkout. A live probe checks its temporary hook directory before
+launch; a fresh directory without a Codex trust grant stops with a hook-trust
+diagnostic.
+Profile or stage arguments that can change Codex hook discovery make the trust
+verdict unverifiable rather than certifying a different launch configuration.
+
 ### Budgeting & cost tracking
 
 - Mid-session per-session token budget (`max_tokens_per_session`, default 4M weighted): both adapter wait loops sample cumulative usage on the ~30s heartbeat and trip once on crossing, per `session_budget_mode` — `warn` (default) raises an ATTENTION + lifecycle breadcrumb only; `enforce` also sends a wrap-up nudge, grants `session_budget_grace_s` (default 240s) to finish, then terminates the session `over_budget` (ordinary retry→defer routing; an artifact flushed at kill time is still honored). Sampling is live-verified on `claude` and best-effort on other transcript-reading profiles (two independent unknowns there: whether the CLI delivers the transcript path early — until a hook event carries it the guard is inert — and whether it flushes usage mid-turn); the nudge into a busy pane is best-effort everywhere (the termination is the guarantee), and adapters with no mid-session usage signal (`usage_parser = "none"`, Copilot's shutdown-only flush) leave the guard inert.

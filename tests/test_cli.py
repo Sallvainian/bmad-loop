@@ -9903,7 +9903,7 @@ CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
 def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
-    """Set a project up so every validate gate passes, and pin the three gates whose
+    """Set a project up so every validate gate passes, and pin the gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
     binary is on PATH, whether it actually runs, and whether a multiplexer is
     installed. Without those pins the rc-0 leg would pass or fail by machine, which
@@ -9933,6 +9933,15 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     git(project.project, "commit", "-q", "-m", "validate fixture")
     monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
     monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
+    # A sandbox created during the test has no Codex trust grant, even when its
+    # registration is valid. Trust classification itself is tested separately.
+    from bmad_loop import codex_trust
+
+    monkeypatch.setattr(
+        codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_kw: codex_trust.TrustResult("trusted", "fixture trust grant"),
+    )
     monkeypatch.setattr(
         cli,
         "_platform_preflight",

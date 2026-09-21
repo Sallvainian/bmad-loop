@@ -741,6 +741,49 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
 
+        if profile.hooks.dialect == "codex-hooks-json":
+            from .codex_trust import hook_discovery_args_safe, project_hook_trust
+
+            unsafe_roles = []
+            if pol is not None:
+                for role in ROLES:
+                    cfg = pol.adapter.resolved(role)
+                    if cfg.name == profile.name and not hook_discovery_args_safe(cfg.extra_args):
+                        unsafe_roles.append(role)
+
+            if not profile.packaged:
+                trust_message = (
+                    "hook trust unverifiable: project-owned Codex profile may name an "
+                    "untrusted executable; validation will not launch it"
+                )
+            elif pol is not None and pol.scm.isolation == "worktree":
+                trust_message = (
+                    "hook trust unverifiable for future worktree sessions: each isolated "
+                    "directory needs its own Codex trust grant"
+                )
+            elif not hooks_ok:
+                trust_message = "hook trust cannot pass: Codex relay hooks are not registered"
+            elif unsafe_roles:
+                trust_message = (
+                    "hook trust unverifiable: adapter.extra_args may change Codex hook "
+                    f"discovery for {', '.join(unsafe_roles)}"
+                )
+            else:
+                trust = project_hook_trust(project, profile)
+                trust_message = None if trust.status == "trusted" else trust.reason
+            if trust_message is None:
+                report.ok(
+                    "hooks.trust",
+                    f"Codex hook trust current for {profile.name} in {project}",
+                    {"profile": profile.name, "project": str(project), "binary": profile.binary},
+                )
+            else:
+                report.fail(
+                    "hooks.trust",
+                    f"{profile.name}: {trust_message}",
+                    {"profile": profile.name, "project": str(project), "binary": profile.binary},
+                )
+
     # #461: `hooks.registered` above is a substring match on the config JSON — it
     # never touches the artifact the registered command points AT. A branch switch
     # (or a deleted .bmad-loop/) leaves the registration green while every hook
@@ -3106,8 +3149,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         # instead of reloading the predecessor's old paused state and double-driving.
         if runs.engine_liveness(run_dir) == "alive":
             print(
-                f"run {run_dir.name} is still live — resuming would double-drive it; "
-                "stop it first",
+                f"run {run_dir.name} is still live — resuming would double-drive it; stop it first",
                 file=sys.stderr,
             )
             return 1
@@ -5010,17 +5052,22 @@ def cmd_probe(args: argparse.Namespace) -> int:
     )
 
     profile = None
+    codex_profile_error = False
     try:
         profile = get_profile(args.cli, project)
     except ProfileError as e:
+        if args.cli == "codex":
+            codex_profile_error = True
         if not args.binary:
-            print(f"FAIL: {e}", file=sys.stderr)
+            prefix = "Codex hook trust unverifiable: " if codex_profile_error else ""
+            print(f"FAIL: {prefix}{e}", file=sys.stderr)
             return 1
         # Human-facing notice — stderr in JSON mode, where stdout is the document.
-        print(
-            f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
-            file=sys.stderr if args.json else sys.stdout,
-        )
+        if not codex_profile_error:
+            print(
+                f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
+                file=sys.stderr if args.json else sys.stdout,
+            )
 
     if profile is not None and profile.hookless:
         print(
@@ -5048,7 +5095,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
     if args.probe:
         if profile is None:
-            print("FAIL: --probe needs a known profile (its hook dialect/events)", file=sys.stderr)
+            prefix = "Codex hook trust unverifiable: " if codex_profile_error else ""
+            print(
+                f"FAIL: {prefix}--probe needs a known profile (its hook dialect/events)",
+                file=sys.stderr,
+            )
             return 1
         finding = probe_mod.probe(
             cli=args.cli,
@@ -5063,6 +5114,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
         finding = probe_mod.scan(
             cli=args.cli, profile=profile, project=project, hints=hints, pseudo=pseudo
         )
+    if codex_profile_error:
+        finding.hook_trust = "unverifiable"
+        finding.warnings.append("Codex hook trust unverifiable: profile cannot be loaded")
+        finding.next_steps.append("Repair the Codex profile, then re-run the probe")
 
     # One or the other, never both: --json selects the pure JSON document
     # (machine.py contract), otherwise the human-readable markdown report.
@@ -5104,6 +5159,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
     # Every `ok:` trailer is human-facing chatter, so in JSON mode it goes to
     # stderr — stdout is the document alone, or empty when --out took it.
     trailers = sys.stderr if args.json else sys.stdout
+    trust_ok = finding.hook_trust is None or finding.hook_trust == "trusted"
+    trailer_prefix = "ok" if trust_ok else "FAIL"
     if args.out:
         out_path = Path(args.out)
         if args.json:
@@ -5111,7 +5168,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else:
             out_path.write_text(report, encoding="utf-8")
         print(
-            f"  ok: {noun} written to {out_path} ({len(finding.warnings)} warning(s))",
+            f"  {trailer_prefix}: {noun} written to {out_path} ({len(finding.warnings)} warning(s))",
             file=trailers,
         )
     else:
@@ -5120,10 +5177,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else:
             print(report)
         print(
-            f"  ok: {finding.mode} {noun} for {args.cli} ({len(finding.warnings)} warning(s))",
+            f"  {trailer_prefix}: {finding.mode} {noun} for {args.cli} "
+            f"({len(finding.warnings)} warning(s))",
             file=trailers,
         )
-    return 0
+    return 0 if trust_ok else 1
 
 
 def cmd_diagnose(args: argparse.Namespace) -> int:

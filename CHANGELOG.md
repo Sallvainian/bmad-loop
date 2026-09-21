@@ -26,6 +26,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
+  before a live probe launches; check both relay events against Codex's read-only
+  hook discovery for the operation's directory and executable (#461).
+
 - Distinguish confirmed missing tmux-family sessions from failed window listings;
   raise on unproven liveness failures and warn when metadata uses a sentinel (#525).
 
