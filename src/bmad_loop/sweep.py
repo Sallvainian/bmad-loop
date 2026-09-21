@@ -1323,6 +1323,10 @@ class SweepEngine(Engine):
         self.adapters["triage"] = (
             triage_adapter if triage_adapter is not None else self.adapters["dev"]
         )
+        # `Engine.__init__` attached the journal to the adapters it knew about; a
+        # distinct triage adapter arrives after that, so attach it here too or every
+        # sweep triage session would emit no `session-idle`/`session-active` (#680).
+        self.adapters["triage"].journal = self.journal
         self.prompting = prompting
         self.decisions_only = decisions_only
         self.max_bundles = max_bundles if max_bundles is not None else self.policy.sweep.max_bundles

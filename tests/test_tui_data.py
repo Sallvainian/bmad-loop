@@ -7,11 +7,12 @@ import importlib
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from conftest import install_bmad_config, refuse_to_resolve, write_sprint
 
-from bmad_loop import bmadconfig, deferredwork, policy
+from bmad_loop import bmadconfig, deferredwork, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
@@ -30,10 +31,19 @@ def make_run(root: Path, run_id: str, **state_kwargs) -> Path:
     return run_dir
 
 
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def dead_pid() -> int:
-    """Pid guaranteed (modulo astronomically unlikely reuse) to be dead."""
+    """Return an exited child's PID, retaining its handle to prevent Windows reuse."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
@@ -933,6 +943,90 @@ def test_active_agent_labeled_session_peels_story_key():
     assert agent is not None
     assert agent.story_key == "4-2-gamma"  # "-tea-7" stripped despite role != "tea"
     assert (agent.name, agent.model) == ("codex", "gpt-5")
+
+
+def _stamped_start(task_id="1-1-alpha-dev-3"):
+    return {
+        "kind": "session-start",
+        "task_id": task_id,
+        "role": "dev",
+        "adapter": "claude",
+        "model": "opus",
+        "story_key": "1-1-alpha",
+    }
+
+
+def test_active_agent_idle_since_from_open_idle_stretch():
+    """#680: the last `session-idle` for the open session's task, not closed by a
+    later `session-active`, sets `idle_since` to its `since_ts`; the default is
+    None, so every existing construction and comparison stands.
+
+    ABLATION E: drop the `_idle_since` derivation and the first assertion reddens."""
+    entries = [
+        _stamped_start(),
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0, "idle_s": 60.0},
+    ]
+    agent = data.active_agent(entries, None)
+    assert agent is not None and agent.idle_since == 5030.0
+    assert data.active_agent([_stamped_start()], None).idle_since is None
+
+
+def test_active_agent_idle_since_cleared_by_session_active_and_session_end():
+    idle = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0}
+    active = {"kind": "session-active", "task_id": "1-1-alpha-dev-3", "idle_s": 120.0}
+    agent = data.active_agent([_stamped_start(), idle, active], None)
+    assert agent is not None and agent.idle_since is None
+    # a later stretch reopens it with its own since_ts
+    later = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5150.0}
+    agent = data.active_agent([_stamped_start(), idle, active, later], None)
+    assert agent is not None and agent.idle_since == 5150.0
+    # session-end closes the session: no agent at all
+    ended = {"kind": "session-end", "task_id": "1-1-alpha-dev-3"}
+    assert data.active_agent([_stamped_start(), idle, ended], None) is None
+
+
+def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
+    """A `session-idle` for another task, or one left behind by an EARLIER session
+    (before this session-start), is not this session's."""
+    stale = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 4000.0}
+    other = {"kind": "session-idle", "task_id": "2-2-beta-dev-1", "since_ts": 5030.0}
+    agent = data.active_agent([stale, _stamped_start(), other], None)
+    assert agent is not None and agent.idle_since is None
+
+
+def test_active_agent_idle_since_never_raises_on_malformed_entry():
+    """A `session-idle` without a numeric `since_ts` is skipped (the TUI ages the
+    text from it); the agent itself is still derived."""
+    for bad in (
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3"},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": "soon"},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": None},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": True},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("nan")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": float("-inf")},
+        {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 10**1000},
+    ):
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert agent is not None and agent.idle_since is None
+        agent = data.active_agent(
+            [
+                _stamped_start(),
+                {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0},
+                bad,
+            ],
+            None,
+        )
+        assert agent is not None and agent.idle_since == 5030.0
+    # an int since_ts is a number too
+    agent = data.active_agent(
+        [
+            _stamped_start(),
+            {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030},
+        ],
+        None,
+    )
+    assert agent is not None and agent.idle_since == 5030.0
 
 
 def test_active_agent_none_without_resolvable_snapshot():

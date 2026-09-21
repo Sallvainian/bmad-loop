@@ -113,8 +113,11 @@ class LimitsPolicy:
     # stalled. The grace starts at session launch and re-arms on transport
     # activity (pane-log output or parent/child OpenCode SSE frames) and fresh
     # Stop/idle evidence, so productive work keeps extending it. Bounded by
-    # session_timeout_min. 0 disables the launch timer while retaining fail-fast
-    # handling when a turn ends without a terminal spec/result.
+    # session_timeout_min. Also the transcript-idle notice threshold (#680): the
+    # journal's session-idle/session-active pair and the TUI's idle age fire when
+    # the live transcript sits still this long. 0 disables the launch timer (and
+    # the idle notice) while retaining fail-fast handling when a turn ends without
+    # a terminal spec/result.
     dev_stall_grace_s: int = 600
     # how many best-effort wake nudges a silent dev/review session receives on
     # dev_stall_grace_s expiry before it is called stalled. Transport activity
@@ -1350,7 +1353,7 @@ session_timeout_min = 90
 git_timeout_s = 120          # bound on any single git subprocess; exceeding it pauses/degrades (never crashes the run) — raise on a loaded host or a very large worktree
 teardown_grace_s = 20        # verified teardown: poll a killed session window up to this long, then force-kill its pane pids and re-kill (#157). 0 = single unverified best-effort kill
 stop_without_result_nudges = 1
-dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery. 0 = no launch timer, but a result-less turn end still fails fast
+dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery; also the transcript-idle notice threshold (journal session-idle/session-active, TUI idle age). 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast
 dev_stall_nudges = 2         # best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget. 0 = stall on grace expiry
 dev_stall_nudges_cap = 6     # total (never-restored) nudge bound per dev/review session; bounds launch-time recovery and Stop/idle budget refills because an accepted nudge does not guarantee a wake. 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry

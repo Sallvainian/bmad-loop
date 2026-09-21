@@ -423,7 +423,7 @@ session_timeout_min = 90
 git_timeout_s = 120              # bound on any single git subprocess; exceeding it pauses/degrades, never crashes the run
 teardown_grace_s = 20            # verified session teardown: poll a killed session up to this long, then force-kill its pane pids and re-kill; 0 = one best-effort kill
 stop_without_result_nudges = 1   # times to re-prompt a session that stopped with no result.json
-dev_stall_grace_s = 600          # silence grace armed at dev/review launch; transport activity or fresh Stop/idle evidence re-arms it; 0 = no launch timer, but a result-less turn end still fails fast
+dev_stall_grace_s = 600          # silence grace armed at dev/review launch; transport activity or fresh Stop/idle evidence re-arms it; 0 = no launch timer, but a result-less turn end still fails fast. Also the transcript-idle notice threshold (journal session-idle/session-active, TUI `idle <age>`); 0 disables the notice
 dev_stall_nudges = 2             # best-effort wake nudges per silent grace; fresh Stop/idle evidence restores this budget; 0 = stall on grace expiry
 dev_stall_nudges_cap = 6         # total never-restored nudge bound per dev/review session; an accepted nudge does not guarantee a wake; 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3    # same monotonic cap for an injected plugin-workflow session that finished but never wrote its completion marker

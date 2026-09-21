@@ -13,9 +13,24 @@ breaking changes may land in a minor release.
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
   sets it (#643).
+- Journal a session's idle stretches (#680). The tmux adapter stats the live transcript
+  on the heartbeat cadence, stamps `transcript_idle_s` on `heartbeat.json`, and — with
+  the engine's journal attached (`CodingCLIAdapter.journal`) — writes one `session-idle`
+  when the age crosses `limits.dev_stall_grace_s` and one `session-active` when the
+  transcript moves again; `0` disables the pair. The TUI agent line shows the open
+  stretch as `· idle <age>`. Observability only: nothing bounds the stretch.
 
 ### Fixed
 
+- Count Copilot shutdown metrics and increased Codex output-token totals as work
+  when a dev session exits before the next transcript heartbeat (#822).
+
+- Pause a dev session with no confirmed work instead of retrying into the same wall
+  (#727). `SessionResult.produced_work` is `false` when no turn ended and no
+  qualifying pane, transcript, or usage activity was observed (a permission
+  dialog, a login, a dead-on-arrival window); `decide_dev` pauses ahead of the budget as an
+  environment fault does, `dev-decision` and `session-end` carry the flag, and re-arm
+  resets the attempt.
 - Preserve inherited `model`, `effort` and `extra_args` when a stage names an alias
   of the base client (`opencode` / `opencode-http`, `claude-code-tmux` / `claude`)
   instead of treating it as a client switch.
