@@ -12,6 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
 from . import (
@@ -69,10 +70,16 @@ from .documents import (
     status_document,
     validate_document,
 )
-from .engine import Engine
-from .journal import Journal, load_state, save_state
+from .engine import Engine, _publication_refusal
+from .escalation import display_pause_reason
+from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
-from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
+from .platform_util import (
+    MAX_SEGMENT,
+    LockUnavailableError,
+    resolve_or_lexical,
+    walk_files_unlinked,
+)
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -88,7 +95,14 @@ from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
-from .sweep import SweepEngine
+from .sweep import (
+    DW_ID_RE,
+    SEVERITY_ORDER,
+    SweepEngine,
+    decimal_digits_key,
+    increment_decimal_digits,
+    select_entries,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -277,15 +291,22 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
     1 to abort, None to proceed — the `_reject_bad_run_id` shape.
 
-    Called from the three :class:`~engine.Engine` construction sites that return an
-    rc to a human: `cmd_run`, `cmd_sweep`, and `_resume_paused_run` — the shared
-    helper behind both `resume` and `resolve`'s re-arm. The fourth such site, the
-    auto-triggered child sweep in `_sweep_factory`, shares the refusal but not this
-    disposition: it has no rc channel, so it raises (see the comment there).
-    Keyed on Engine construction rather than on "loads policy.toml", which is a
-    wider set that does not all provision — `_configure_mux` reads the file on
-    every command and builds nothing; `cmd_validate` and `cmd_clean` load it and
-    never mount a worktree.
+    Called from the four sites that return an rc to a human: `cmd_run`, `cmd_sweep`,
+    `_resume_paused_run` — the shared helper behind both `resume` and `resolve`'s
+    re-arm — and `cmd_resolve`, which calls it TWICE: once before the interactive
+    session and once after the config re-read that authorises the re-arm. A fifth
+    site, the auto-triggered child sweep in `_sweep_factory`, shares the refusal but
+    not this disposition: it has no rc channel, so it raises (see the comment there).
+
+    Keyed on provisioning-or-arming a run against the config, NOT on Engine
+    construction: `cmd_resolve` constructs no Engine and delegates to
+    `_resume_paused_run` for that, but `runs.rearm_escalation` mutates persisted run
+    state — advancing the attempt baseline and re-stamping the spec — against the
+    same `repo_root` this refuses, and it does so BEFORE the delegate is reached. A
+    refusal keyed on Engine construction alone therefore arrives after the damage.
+    Both keyings exclude the same wider "loads policy.toml" set, which does not all
+    provision — `_configure_mux` reads the file on every command and builds nothing;
+    `cmd_validate` and `cmd_clean` load it and never mount a worktree.
 
     `validate` deliberately does not call this — it reports rather than aborts, so
     it renders the same message as a Finding and keeps running its other gates."""
@@ -300,8 +321,8 @@ def _reject_under_floor_git(project: Path) -> int | None:
     """Refuse to start against a git older than `verify.GIT_FLOOR`. Returns
     `ExitCode.FAILURE` to abort, None to proceed — the `_reject_bad_run_id` shape.
 
-    Called from the same four Engine-construction sites as
-    `_reject_isolation_conflict`, with the same split of dispositions: an rc to a
+    Called from the four Engine-construction sites, with the same split of
+    dispositions as `_reject_isolation_conflict`: an rc to a
     human from `cmd_run`, `cmd_sweep` and `_resume_paused_run`, and a raise from the
     auto-triggered child sweep in `_sweep_factory`, which has no rc channel.
 
@@ -868,6 +889,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{role} model {cfg.model!r} is not 'provider/model' — "
                     f"{prof.name} expects e.g. 'anthropic/claude-haiku-4-5'",
                     {"role": role, "model": cfg.model, "profile": prof.name},
+                )
+            # Reasoning effort (#643) has exactly one carrier: the opencode-http
+            # kind sends it as the per-prompt `variant`. The tmux generic family
+            # has no channel for it — no profile flag, no hook field — so a stage
+            # that sets it there runs at the provider default with nothing to show
+            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
+            # because "cannot carry effort" is a fact about that family; an
+            # out-of-tree kind's capability is not knowable here, so it stays
+            # silent rather than assert one. Advisory: severity `problem` is
+            # validate's exit code, and an ignored knob does not make a run unrunnable.
+            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+                report.warn(
+                    "policy.effort-unsupported",
+                    f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "
+                    f"only the opencode-http adapter carries a reasoning-effort value",
+                    {"role": role, "effort": cfg.effort, "profile": prof.name},
                 )
 
     base_findings = install.missing_base_skills(project, dev_trees)
@@ -1576,9 +1613,27 @@ def _validate_deferred_ledger(
     here, and swapping the two lines changes no severity and no exit code.
     """
     ledger = paths.deferred_work
+    # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather than
+    # routed through `read_for_observation`: `validate` writes nothing, but it has
+    # to REPORT the fault as a graded problem rather than degrade quietly to an
+    # empty ledger — see the reasoning below. Same classification, richer response.
+    # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267): the
+    # `is_file()` it replaced suppresses every OS error on Python 3.14 and answers
+    # False, so a refused ledger read as an empty one and `validate` reported a
+    # clean deferred check with the finding below unreachable. Only absence
+    # (`ENOENT`/`ENOTDIR`, a present non-regular file) is the empty text; a
+    # refused probe takes the same arm a refused `read_text` does. `ValueError`,
+    # not `UnicodeDecodeError` (its subclass): `Path.stat` raises a plain
+    # `ValueError` for an embedded NUL in the configured path and a
+    # `UnicodeEncodeError` for a lone surrogate, neither an `OSError`, which
+    # `is_file()` had answered False for — an observation arm attributes those
+    # as a fault, never as absence, so they are the same graded problem.
     try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-    except (OSError, UnicodeDecodeError) as e:
+        try:
+            text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
+        except (FileNotFoundError, NotADirectoryError):
+            text = ""
+    except (OSError, ValueError) as e:
         # Split from the manifest read in the checks below, which is silent for a
         # good reason that does not apply here: nothing else in `validate` reads
         # the ledger, so returning quietly reported success for preflights that
@@ -2066,19 +2121,27 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
+    from .adapters import registry as adapter_registry
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
-    if profile.hookless:
+    # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
+    # axes, so an `opencode-http` profile carrying a hook dialect still launches
+    # the HTTP adapter (and sends effort), while a hookless profile of another
+    # kind never does. The preview must follow the adapter `make_adapters` builds.
+    if profile.adapter == adapter_registry.OPENCODE_HTTP:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
         model = f" model={cfg.model}" if cfg.model else ""
+        # effort rides the prompt_async body as `variant` (#643); shown under the
+        # policy's own key so the preview distinguishes the configurations.
+        effort = f" effort={cfg.effort}" if cfg.effort else ""
         return (
             f"{profile.binary} serve --hostname 127.0.0.1 --port <auto> "
             f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
-            f"{model}"
+            f"{model}{effort}"
         )
     extra = cfg.extra_args if cfg.extra_args is not None else profile.bypass_args
     argv = [
@@ -2245,6 +2308,8 @@ def _start_sweep(
     repeat: bool | None = None,
     max_cycles: int | None = None,
     trigger: str,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
@@ -2272,6 +2337,8 @@ def _start_sweep(
         max_bundles=max_bundles,
         repeat=repeat,
         max_cycles=max_cycles,
+        only_ids=only_ids,
+        min_severity=min_severity,
         trigger=trigger,
         make_adapters=_make_adapters,
         sweep_engine_cls=SweepEngine,
@@ -2282,7 +2349,7 @@ def _start_sweep(
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
 def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
@@ -2358,6 +2425,8 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             decisions_only=False,
             max_bundles=None,
             trigger=trigger,
+            only_ids=None,
+            min_severity=None,
             profiles=profiles,
             on_started=started,
         )
@@ -2371,6 +2440,12 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
 
+    only_arg = getattr(args, "only", None)
+    min_severity = getattr(args, "min_severity", None)
+    if only_arg is not None and min_severity is not None:
+        print("--only cannot combine with --min-severity", file=sys.stderr)
+        return ExitCode.FAILURE
+
     if args.before is not None and not args.archive:
         print("--before requires --archive", file=sys.stderr)
         return ExitCode.FAILURE
@@ -2383,19 +2458,28 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             or args.max_cycles is not None
             or args.no_prompt
             or args.run_id is not None
+            or only_arg is not None
+            or min_severity is not None
         ):
             print(
                 "--archive cannot combine with --decisions-only, --repeat, "
-                "--max-bundles, --max-cycles, --no-prompt, or --run-id",
+                "--max-bundles, --max-cycles, --no-prompt, --run-id, --only, "
+                "or --min-severity",
                 file=sys.stderr,
             )
             return ExitCode.FAILURE
         return _sweep_archive(project, paths, args)
 
+    try:
+        only_ids = _parse_sweep_only(only_arg) if only_arg is not None else None
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+
     pol = policy_mod.load(_policy_path(project))
 
     if args.dry_run:
-        return _sweep_dry_run(paths, pol)
+        return _sweep_dry_run(paths, pol, only_ids=only_ids, min_severity=min_severity)
 
     if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
@@ -2421,6 +2505,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         max_bundles=args.max_bundles,
         repeat=args.repeat,
         max_cycles=args.max_cycles,
+        only_ids=only_ids,
+        min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
     )
@@ -2467,32 +2553,44 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     ledger = paths.deferred_work
     # Call the primitive BEFORE reporting a missing ledger, and report the
     # missing ledger from its empty result. `archive_closed` validates `before`
-    # ahead of its own `is_file` short-circuit precisely so a malformed date
-    # fails the same way whether or not a ledger exists; short-circuiting here
-    # first put that back, and `--before not-a-date` then exited 0 on a project
-    # that happens to have no ledger today and 1 on one that does — the same
+    # ahead of its own presence guard precisely so a malformed date fails the
+    # same way whether or not a ledger exists; short-circuiting here first put
+    # that back, and `--before not-a-date` then exited 0 on a project that
+    # happens to have no ledger today and 1 on one that does — the same
     # invocation graded by optional project data rather than by its own shape
     # (#711 review). The call is safe on a missing file: it short-circuits to
     # an empty list without writing.
+    #
+    # The post-report presence probe sits INSIDE the same `try`, as `stat` +
+    # `S_ISREG` (DW-265). It is reachable only in the window after
+    # `archive_closed`'s own guard answered without raising, but a probe that
+    # raised a traceback out of the CLI (Python 3.13, where `is_file()` raises
+    # EACCES) or reported "no deferred-work ledger" after a successful archive
+    # (3.14, where `is_file()` suppresses every OS error and answers False) is
+    # still wrong; a refused probe now reaches the FAILURE arm below, whose
+    # message already says the ledger could not be read.
     try:
         archived = deferredwork.archive_closed(
             ledger,
             before=args.before,
             dry_run=args.dry_run,
         )
+        try:
+            present = S_ISREG(ledger.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
-    except (OSError, runs.StateRootError) as exc:
+    except (OSError, deferredwork.LedgerReadFault, runs.StateRootError) as exc:
         # `archive_closed` serializes on the ledger's sidecar lock (#286/#469).
-        # THREE ways this arm is reached, not two: the acquisition raises
-        # `OSError` (a rival holder outlasting the blocking retry, or an
-        # unwritable locks dir); deriving the sidecar's path raises
+        # Acquisition raises `OSError` (a rival holder outlasting the blocking
+        # retry, or an unwritable locks dir); deriving the sidecar's path raises
         # `runs.StateRootError` — NOT an OSError — when the environment names no
-        # usable state root; and the archive's own I/O raises `OSError` too, for
-        # the ledger read and for either atomic write. Naming the lock is what
-        # makes the message actionable — a bare `error: [Errno 11] ...` from a
-        # command with no other lock in sight reads as a bug in the archive — but
+        # usable state root; pre-lock probes and atomic writes raise `OSError`,
+        # while the authoritative read wraps OS faults as `LedgerReadFault`
+        # (DW-279). Naming the lock makes the message actionable — a bare
+        # `error: [Errno 11] ...` from a command with no other lock in sight reads as a bug in the archive — but
         # the message must not ASSERT contention, or a full disk sends the
         # operator hunting a rival process that was never there. So it names both
         # possibilities and lets the carried cause decide between them. Existing
@@ -2504,7 +2602,7 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
             file=sys.stderr,
         )
         return ExitCode.FAILURE
-    if not ledger.is_file():
+    if not present:
         print(f"no deferred-work ledger at {ledger}")
         return ExitCode.OK
     archive_path = ledger.parent / deferredwork.ARCHIVE_REL
@@ -2524,39 +2622,167 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     return ExitCode.OK
 
 
-def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
+def _parse_sweep_only(value: str) -> tuple[str, ...]:
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ValueError("--only requires a comma-separated list of DW-<n> ids")
+    malformed = [part for part in parts if not DW_ID_RE.fullmatch(part)]
+    if malformed:
+        raise ValueError("--only contains malformed ids: " + ", ".join(malformed))
+    return tuple(dict.fromkeys(parts))
+
+
+def _sweep_dry_run(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    *,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
+) -> int:
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
     _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
-    if not ledger.is_file():
+    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
+    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
+    # would report "0 open" for a ledger nobody could read — a fabricated listing
+    # is worse than no listing. Say which file and which fault, and fail.
+    # Absence is taken from the reader's own `("", None)` answer rather than an
+    # `is_file()` pre-gate (DW-265): that gate suppressed every OS error on
+    # Python 3.14 and answered False, printing "no deferred-work ledger" for a
+    # refused one (and raised a traceback out of the CLI on 3.11–3.13), so the
+    # DW-254 attributed fault below was shadowed before the reader was asked. A
+    # 0-byte ledger answers the same empty text and is reported as absent too —
+    # deliberate, it holds nothing to list.
+    text, fault = deferredwork.read_for_observation(ledger)
+    if fault is not None:
+        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
+        return ExitCode.FAILURE
+    if not text:
+        if only_ids is not None:
+            try:
+                select_entries((), only_ids=only_ids, validate_only=True)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
-    text = ledger.read_text(encoding="utf-8")
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
+    legacy = deferredwork.parse_legacy(text)
+    highest_suffix = max(
+        (entry.id.removeprefix("DW-").lstrip("0") or "0" for entry in entries),
+        key=decimal_digits_key,
+        default="0",
+    )
+    next_suffix = increment_decimal_digits(highest_suffix)
+    projected_legacy = []
+    for entry in legacy:
+        projected_legacy.append((f"DW-{next_suffix}", entry))
+        next_suffix = increment_decimal_digits(next_suffix)
+    projected_open = [(dw_id, entry) for dw_id, entry in projected_legacy if not entry.done]
     closed = len(entries) - len(open_entries)
     print(f"{ledger}: {len(open_entries)} open, {closed} closed/non-open")
-    for entry in open_entries:
+    try:
+        selection = select_entries(
+            entries,
+            only_ids=only_ids,
+            min_severity=min_severity,
+            validate_only=only_ids is None,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    if only_ids is not None:
+        available = {entry.id for entry in open_entries} | {dw_id for dw_id, _ in projected_open}
+        unavailable = [dw_id for dw_id in only_ids if dw_id not in available]
+        if unavailable:
+            print(
+                "error: --only ids must exist and be open: " + ", ".join(unavailable),
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    shown = selection.selected if only_ids is not None or min_severity is not None else open_entries
+    for entry in shown:
         print(f"  {entry.id:8s} {entry.title}")
-    legacy = deferredwork.parse_legacy(text)
+    if selection.excluded:
+        print("excluded by sweep selector:")
+        for entry in selection.excluded:
+            print(f"  {entry.id:8s} {entry.title}")
+    if selection.missing_severity:
+        print("excluded for missing or unrecognized severity:")
+        for entry in selection.missing_severity:
+            print(f"  {entry.id:8s} {entry.title}")
     legacy_open = [e for e in legacy if not e.done]
+    projected_selected = projected_open
+    projected_excluded: list[tuple[str, deferredwork.LegacyEntry]] = []
+    projected_missing_severity: list[tuple[str, deferredwork.LegacyEntry]] = []
+    if only_ids is not None:
+        requested = set(only_ids)
+        projected_selected = [item for item in projected_open if item[0] in requested]
+        projected_excluded = [item for item in projected_open if item[0] not in requested]
+    elif min_severity is not None:
+        floor = SEVERITY_ORDER[min_severity]
+        projected_selected = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
+            if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
+        ]
+        selected_keys = {entry.key for _, entry in projected_selected}
+        projected_excluded = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
+            if entry.severity is not None and entry.key not in selected_keys
+        ]
+        projected_missing_severity = [
+            (dw_id, entry) for dw_id, entry in projected_open if entry.severity is None
+        ]
     if legacy:
         print(
             f"plus {len(legacy)} legacy (pre-DW-format) entries, {len(legacy_open)} open"
             " — a sweep would first migrate them to DW format"
         )
-        for entry in legacy_open:
-            print(f"  {entry.id or '-':8s} {entry.title}")
-    if open_entries or legacy_open:
+        if projected_selected:
+            print("projected legacy selection (pre-migration; provisional ids):")
+        for dw_id, entry in projected_selected:
+            print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if min_severity is not None and projected_selected:
+            print(
+                f"{len(projected_selected)} matching legacy entr"
+                f"{'y' if len(projected_selected) == 1 else 'ies'} will be migrated then triaged"
+            )
+        if projected_excluded:
+            print("projected legacy entries excluded by sweep selector:")
+            for dw_id, entry in projected_excluded:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if projected_missing_severity:
+            print("projected legacy entries excluded for missing or unrecognized severity:")
+            for dw_id, entry in projected_missing_severity:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+    if selection.selected or projected_selected:
         print("a sweep would triage the open entries in one LLM session, then run bundles")
-        print(f"  triage: {_render_invocation(pol, paths.project, 'triage', '/bmad-loop-sweep')}")
+        if projected_selected and (only_ids is not None or min_severity is not None):
+            print(
+                "  triage: projected legacy ids are provisional; semantic duplicate merging may "
+                "compact them, and the real run revalidates --only against the actual "
+                "post-migration universe"
+            )
+            return 0
+        prompt = "/bmad-loop-sweep"
+        if only_ids is not None or min_severity is not None:
+            selected_ids = {entry.id for entry in selection.selected}
+            ordered = (
+                [dw_id for dw_id in only_ids if dw_id in selected_ids]
+                if only_ids is not None
+                else [entry.id for entry in selection.selected]
+            )
+            prompt += " --only " + ",".join(ordered)
+        print(f"  triage: {_render_invocation(pol, paths.project, 'triage', prompt)}")
     return 0
 
 
-def _resume_paused_run(project: Path, run_dir: Path) -> int:
-    """Resume the engine for a paused/interrupted run. Shared by `resume` and
-    the re-arm step of `resolve`."""
+def _prepare_resume_locked(project: Path, run_dir: Path):
+    """Publish resume state while the caller holds this run's state lock."""
     # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
     # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
     # since a historical `ctl-foo` run has a genuine agent session and resumes
@@ -2587,6 +2813,22 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    sweep_options = None
+    if state.run_type == "sweep":
+        try:
+            runsetup.validate_sweep_options_version(state.sweep_options_version)
+            sweep_options = runsetup.load_sweep_resume_options(
+                run_dir,
+                required=state.sweep_options_version >= runsetup.SWEEP_OPTIONS_VERSION,
+                expected_digest=(
+                    state.sweep_options_digest
+                    if state.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+                    else None
+                ),
+            )
+        except runsetup.SweepOptionsError as exc:
+            print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
+            return 1
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -2703,6 +2945,18 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # The `bool(state.repo_root)` guard is what keeps a legacy state.json — written
     # before the field existed, and read back as "" — out of the comparison: it is a
     # missing value, not a divergent one, and the re-stamp migrates it silently.
+    #
+    # `code_root_restamp_pending` is deliberately NOT part of this compare. That marker
+    # is a RECORD DEBT — a move `runs.restamp_code_root` already persisted whose
+    # `rearm-code-root-restamped` record never landed — and not a move of its own: the
+    # mirror it left behind already agrees with config, which is precisely why the
+    # compare reads "no move". Counting it as one made resume warn that "the code root
+    # has changed since this run started" on a resume whose tree IS the tree the run
+    # started in, and discharged the owed record with a `run-resume` boolean that
+    # carries no root at all — so an operator who edited `repo_root:` between the failed
+    # append and the resume had the owed A→B row answered by a row describing a
+    # different move, unreconstructable after the fact. The debt is discharged just
+    # below, on its own line, under the root the marker still names.
     code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
@@ -2724,6 +2978,28 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     prior_weight = state.cache_read_weight()
     if prior_weight != pol.limits.cache_read_weight:
         fields["cache_read_weight_was"] = prior_weight
+    # Discharge an OWED record FIRST — before the `run-resume` row, before the pin
+    # re-baseline below, and before `state.repo_root` is overwritten. The twin of
+    # `runs.restamp_code_root`'s own discharge, same shape and same field names, and
+    # the same at-least-once bargain: this is the FIRST fallible write of the resume,
+    # so an append that raises here leaves journal, pin and run state intact — no
+    # resume row to duplicate, no re-baselined pin to silence the host-exec advisory
+    # on the retry, and a root and marker still exactly as the retry needs them.
+    # First also puts it in
+    # chronological order: the owed move pre-dates this resume, so its row must
+    # pre-date the `run-resume` row too, the way the twin appends it. The marker is a
+    # bare bool, so `state.repo_root` here — still the pre-overwrite value — is the
+    # only surviving description of the root the unlanded record was owed for; once
+    # the re-stamp below re-points it, that record can never be reconstructed. The one
+    # residual is the twin's: a `save_state` that fails after a successful append
+    # costs a duplicate — but TRUE — record on the retry, and a duplicate is
+    # recoverable from the journal where a missing or a false record is not.
+    if state.code_root_restamp_pending:
+        journal.append(
+            "rearm-code-root-restamped",
+            repo=state.repo_root,
+            code_root_changed=True,
+        )
     journal.append("run-resume", **fields)
     if security_config_changed:
         # STATIC category names — the ones config_digest covers. A single sha256
@@ -2793,6 +3069,13 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
     # migrates a pre-field state.json onto the root it was already using.
     state.repo_root = str(paths.repo_root)
+    # The debt the marker carried was discharged on its own line above, under its own
+    # root, ahead of the `run-resume` row — a `run-resume` boolean, which names no
+    # root, can no longer stand in for it. Unconditional, and on the same write that
+    # persists the resume: a separate write could land without the append and leave
+    # the run owing a record it has already written, or clear the marker for a record
+    # that never landed.
+    state.code_root_restamp_pending = False
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -2806,6 +3089,36 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
+    return paths, state, pol, journal, new_digest, profiles, sweep_options
+
+
+def _resume_paused_run(project: Path, run_dir: Path) -> int:
+    """Resume a paused/interrupted run without holding its lock across execution."""
+    with state_lock(run_dir):
+        # Cleanup removes the run under this same hold. A resume that resolved the
+        # path before cleanup won must not let Journal/save_state recreate it after
+        # its wait ends.
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
+        # Repeat the command's liveness decision after exclusion.  A concurrent
+        # resume publishes its pid under this same hold, so the waiter refuses
+        # instead of reloading the predecessor's old paused state and double-driving.
+        if runs.engine_liveness(run_dir) == "alive":
+            print(
+                f"run {run_dir.name} is still live — resuming would double-drive it; "
+                "stop it first",
+                file=sys.stderr,
+            )
+            return 1
+        prepared = _prepare_resume_locked(project, run_dir)
+    if isinstance(prepared, int):
+        return prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
+
+    # Adapter construction and the engine lifetime are deliberately outside the
+    # state hold.  The pid/state publication above makes a rival control command
+    # observe this process as live while these unbounded operations proceed.
     composed = runsetup.compose_resume(
         project=project,
         paths=paths,
@@ -2819,10 +3132,15 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
+        sweep_options=sweep_options,
     )
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return (
+        ExitCode.FAILURE
+        if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
+        else ExitCode.OK
+    )
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -2851,6 +3169,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
+    # DW-204: sweep runs only, for a ledger that cannot currently be read — bytes
+    # that do not decode, or (since DW-234) a read the OS refused; each names its
+    # own repair (see the helper). Gated HERE and not in `_resume_paused_run`, for
+    # the same reason the liveness block above is:
+    # that helper is also resolve's re-arm path, which has already run its
+    # interactive session and re-armed the escalation by the time it is reached, so
+    # a refusal there would be a refusal after the side effects. Deliberately AFTER
+    # the 'unknown' warning, so the recovery warning still prints; the live-engine
+    # refusal above still wins outright and never probes the ledger.
+    #
+    # The probe lives in `runs` because two more entry points take it at their own
+    # entries for that same reason (DW-229/DW-230): `cmd_resolve` below, and the
+    # TUI's `_do_rearm`. One implementation, so the three cannot drift.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     return _resume_paused_run(project, run_dir)
 
 
@@ -2940,7 +3274,7 @@ def _resolve_restore_patch(
     # answer here could pass containment on the wrong directory.
     try:
         patch = verify.resolve_restore_path(raw, project).resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         return None, (
             f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
             "lies inside or outside the project tree cannot be determined, so the "
@@ -2964,11 +3298,17 @@ def _resolve_restore_patch(
     return str(patch), None
 
 
-def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
-    """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
-    residue of the restore attempt it abandoned (runs._stale_restore_residue), and the
-    `rearm-*` records the status flip, the advance and the re-stamp write. The commits
-    variant is the one the human must act on — nothing else will.
+def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> None:
+    """Surface the events a just-completed re-arm journaled: the residue of the restore
+    attempt it abandoned — the `stale-restore-*` records AND `rearm-commits-probe-failed`,
+    all written by `runs._stale_restore_residue` — and the `rearm-*` records the status
+    flip, the advance and the re-stamp write. Split by PRODUCER, not on the prefix,
+    because the prefix does not partition them: the commits probe's failure record is
+    spelled `rearm-*` for the re-arm it degrades, not for the abandoned restore it
+    measures. The commits pair is what the human must act on — nothing else will tell
+    them — and it takes both, because `stale-restore-commits` is written only when the
+    probe ANSWERED: without its twin, that record's absence reads as "clean" whether or
+    not anyone could tell.
 
     Named for the re-arm, not for the stale restore: it began as a `stale-restore-*`
     echo and now carries the baseline family too, so a name from the narrower era
@@ -2987,33 +3327,30 @@ def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bo
     the whole degrade is journal-only — the invisibility #640(b) exists to end, not to
     relocate.
 
-    Returns True when one of those records HOLDS the resume
-    (`runs.rearm_holds_the_resume`): the caller re-arms and resumes in a single gesture,
-    and a record proving the re-drive cannot route has to break that gesture, or its own
-    "before resuming" imperative is already unactionable the moment it prints. The
-    question is asked here because this is the one walk over the entries the re-arm
-    added, and the answer has to survive the `finally` it is computed in."""
+    This is abort-only diagnostic recovery: a raised call has no authoritative outcome,
+    so the journal is the only place to recover records that were appended before the
+    abort. It deliberately does not infer a resume hold for a call that did not succeed."""
     after = runs.journal_entries_or_none(run_dir)
     if before is None or after is None:
         # Either end of the diff is unreadable, so there is no trustworthy "new since
         # the re-arm" window. Skip rather than guess: this runs from a `finally`, and a
         # raise here would replace the `RearmError` the operator needs, while treating a
         # failed read as "no entries seen" would replay the whole journal as new. The
-        # hold degrades with the echo, for the same reason: an unproven hold is a guess,
-        # and this is what the gesture did before either existed.
-        return False
-    holds = False
+        return
     for entry in after[len(before) :]:
-        # asked of every entry, BEFORE the routing table can drop it — a `None` notice
-        # means "nothing to print here", never "nothing to decide here"
-        holds = runs.rearm_holds_the_resume(entry) or holds
         notice = runs.rearm_event_notice(entry)
         if notice is None:
             continue
         severity, message, next_step = notice
         tail = f"; {next_step}" if next_step else ""
         print(f"{severity}: {message}{tail}", file=sys.stderr)
-    return holds
+
+
+def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
+    """Render a successful re-arm's authoritative notices in append order."""
+    for notice in notices:
+        tail = f"; {notice.next_step}" if notice.next_step else ""
+        print(f"{notice.severity}: {notice.message}{tail}", file=sys.stderr)
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -3081,6 +3418,19 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
 
+    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
+    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
+    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
+    # has spent the escalation, so a refusal there is a refusal after the side
+    # effects. LAST in this gate block, not first: the refusals above answer "this
+    # gesture does not apply to this run at all" (alias, not paused at an escalation,
+    # live engine, no escalated story) and must not be displaced by a ledger-repair
+    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
+    # also wins outright and the ledger gate follows it.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
+
     pol = policy_mod.load(_policy_path(project))
 
     # intent-gap patch-restore latch (#2564), explicit-flag path: everything about
@@ -3098,14 +3448,84 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             print(err, file=sys.stderr)
             return 1
 
+    # DW-11: whether THIS gesture accepted a resolution, which is what gates the
+    # `escalations_resolved_upto` watermark in `runs.rearm_escalation`. False here
+    # covers `--no-interactive` deliberately: that path accepted nothing IN THIS
+    # GESTURE (the human may have fixed the spec by hand, but nothing recorded which
+    # escalations that answered), so the next cycle shows everything — today's
+    # behavior, and the safe direction. Not derived from `resolution.json`: the marker
+    # survives the re-arm that consumed it, so its presence says nothing about this
+    # gesture.
+    resolution_recorded = False
     if args.interactive:
+        # The interactive session uses the CURRENT CLI project as cwd. Its code root
+        # must come from the CURRENT config too: both can have moved since state.json
+        # was written. This is best-effort observation only; the mandatory config
+        # re-read after the human conversation remains the authority for re-arm.
+        #
+        # Read BEFORE `_make_adapters` so the refusal below can precede it. Ordering
+        # only, no new failure mode: `load_paths` is a read, and the arm that cannot
+        # read degrades exactly as it did when it sat lower.
+        try:
+            pre_session_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pre_session_code_root = state.code_root
+        else:
+            pre_session_code_root = pre_session_paths.repo_root
+            # Refuse the unsupported config BEFORE the interactive session, not only
+            # after it. Both inputs are already in hand here — `pol` was loaded at the
+            # top of this function and is being read for `isolation` two calls below —
+            # so the late refusal alone let an operator build adapters, converse with a
+            # full agent session and answer the re-arm prompt, only to be handed rc 1
+            # for a configuration knowable before any of it. `cmd_run` and `cmd_sweep`
+            # refuse the same config before provisioning anything; this restores the
+            # parity, and honours the rule the restore latch states one screen down
+            # ("validate before the interactive resolve session, not after a whole
+            # agent conversation the abort would throw away"). Ahead of the adapter
+            # build for the same reason `cmd_run` puts it ahead of the queue and
+            # worktree-clean gates: this one says the configuration cannot run at all,
+            # so an adapter fault reported first would send the operator at the wrong
+            # problem — and would be refused again anyway.
+            #
+            # It does NOT replace the refusal after the confirm: that one re-reads the
+            # config, which is the authority for the re-arm and is the only check the
+            # `--no-interactive` path reaches. This is a strictly earlier exit on the
+            # same predicate, so an operator who declines still gets no config lecture.
+            if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
+                return rc
         adapters = _make_adapters(project, run_dir, pol)
-        model = pol.adapter.resolved("dev").model
-        resolve.build_context(state, run_dir, story_key, isolation=pol.scm.isolation)
+        dev_cfg = pol.adapter.resolved("dev")
+        model = dev_cfg.model
+        effort = dev_cfg.effort
+        _ctx_path, withheld, unreadable = resolve.build_context(
+            state,
+            run_dir,
+            story_key,
+            isolation=pol.scm.isolation,
+            project_root=project,
+            code_root=pre_session_code_root,
+        )
+        if pre_session_code_root != project:
+            print(
+                f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
+                "code fixes and commits belong in the run's code root at "
+                f"{pre_session_code_root.as_posix()!r}",
+                file=sys.stderr,
+            )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
-                adapters["dev"], project, run_dir, story_key, model=model
+                adapters["dev"],
+                project,
+                run_dir,
+                story_key,
+                # This CALL precedes the re-arm below, so the generation it passes is
+                # the one still on disk — the pre-bump value. Not an ordering of the
+                # read: `rearm_escalation` reloads state and bumps its own copy, so
+                # this `task` object reads the same either way.
+                generation=task.generation,
+                model=model,
+                effort=effort,
             )
         except NotImplementedError:
             print(
@@ -3114,6 +3534,46 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        # DW-11, second half. `produced` alone is not enough to record coverage,
+        # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
+        # covers every recorded session, INCLUDING the ones whose artifacts this walk
+        # could not read. `_gather_escalations` degrades on those by design (an
+        # observation path must not raise out of an interactive command), but the
+        # watermark turns that transient silence into a durable claim: the next cycle
+        # reads the file fine and withholds it as already answered. So a skipped
+        # artifact withholds COVERAGE instead. The cost is one repeated presentation;
+        # the alternative cost is an escalation nobody ever sees.
+        resolution_recorded = bool(produced) and not unreadable
+        # DW-11. Reported to the operator, never into `context.json`: filtering the
+        # agent's list silently would trade one misleading surface for another — the
+        # human would have no way to tell "nothing else was ever raised" from "the rest
+        # is hidden". Worded for what the code can prove: these entries were PRESENTED
+        # to an earlier resolve cycle that recorded a resolution — not that any
+        # particular one of them was individually answered.
+        #
+        # Printed here rather than beside the context build, because until
+        # `run_session` returns without `NotImplementedError` this adapter is not known
+        # to support an interactive session at all — and an operator whose command is
+        # about to fail must not be told escalations were withheld from an agent that
+        # never launched.
+        if withheld:
+            print(
+                f"{withheld} earlier escalation(s) for {story_key} were not shown to the "
+                "agent: they were presented to an earlier resolve cycle that recorded a "
+                "resolution"
+            )
+        if produced and unreadable:
+            # Only when a resolution WAS produced: with nothing recorded the watermark
+            # would not have advanced anyway, and reporting a withheld coverage the
+            # operator never had is noise. Counts, not paths — the operator's action is
+            # the same for one unreadable artifact as for five, and the run-dir names
+            # are not theirs to chase.
+            print(
+                f"{unreadable} session artifact(s) for {story_key} could not be read, so "
+                "this resolution was NOT recorded as covering the escalations they hold "
+                "— the next resolve will show every escalation for this story again",
+                file=sys.stderr,
+            )
         if not produced:
             print(
                 f"no resolution recorded for {story_key} (agent did not write resolution.json)",
@@ -3170,6 +3630,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     try:
         paths = bmadconfig.load_paths(project)
     except (bmadconfig.BmadConfigError, OSError) as e:
+        paths = None
         # An observation, so it degrades: without the config this process cannot NAME
         # the tree, and re-pointing the mirror at a guess is the one outcome worse than
         # leaving it alone. The re-arm then reads the root the run recorded — precisely
@@ -3182,6 +3643,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     else:
+        if args.interactive and paths.repo_root != pre_session_code_root:
+            print(
+                "error: the code root changed during the resolve session from "
+                f"{pre_session_code_root.as_posix()!r} to {paths.repo_root.as_posix()!r}; "
+                "the agent's guidance no longer names the tree the re-drive would use. "
+                "No re-arm was performed; reconcile the code change, then run resolve again.",
+                file=sys.stderr,
+            )
+            return 1
         # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
         # below — because aiming the mirror at the tree config.yaml names is only
         # correct for a configuration the orchestrator will actually run, and this is
@@ -3208,17 +3678,59 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
             return rc
-        if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
-            print(f"warning: {moved}", file=sys.stderr)
     before_entries = runs.journal_entries_or_none(run_dir)
-    hold_resume = False
+    outcome: runs.RearmOutcome | None = None
     try:
-        runs.rearm_escalation(
-            run_dir,
-            story_key,
-            restore_patch=restore_patch,
-            isolated_redrive=pol.scm.isolation == "worktree",
-        )
+        with state_lock(run_dir):
+            # The pre-session checks intentionally stay lock-free; this is the
+            # mutation boundary, so repeat every state/liveness precondition from
+            # the snapshot left by the preceding writer before restamping anything.
+            fresh_state = load_state(run_dir)
+            if fresh_state.paused_stage != PAUSE_ESCALATION:
+                print(
+                    f"run {args.run_id} is not paused at an escalation "
+                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-arm. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not re-arming",
+                    file=sys.stderr,
+                )
+                return 1
+            if paths is not None:
+                if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+                    print(f"warning: {moved}", file=sys.stderr)
+            outcome = runs.rearm_escalation(
+                run_dir,
+                story_key,
+                restore_patch=restore_patch,
+                isolated_redrive=pol.scm.isolation == "worktree",
+                resolution_recorded=resolution_recorded,
+                # The tree this invocation is acting in, which is also the tree
+                # `build_context` published a `spec_file` from. `state.project` is where the
+                # run was LAUNCHED and nothing re-stamps it, so a moved project would have
+                # the agent edit one file and the re-arm flip another.
+                project_root=project,
+            )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -3226,10 +3738,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # In the `finally`, not after the `try`: `_stale_restore_residue` journals
         # BEFORE the re-stamp block that raises `RearmError`, so on that path the
         # records were already written and returning early threw them away — including
-        # `stale-restore-commits`, the one record whose whole point is that nothing
-        # else will tell the human. An abort is when that residue matters most: the
+        # the commits PAIR (`stale-restore-commits` when the probe answered,
+        # `rearm-commits-probe-failed` when it could not), whose whole point is that
+        # nothing else will tell the human. An abort is when that residue matters most: the
         # re-arm half-ran and the operator has to decide what to do with the tree.
-        hold_resume = _echo_rearm_events(run_dir, before_entries)
+        if outcome is None:
+            _echo_rearm_events(run_dir, before_entries)
+    assert outcome is not None
+    _echo_rearm_notices(outcome.notices)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")
@@ -3237,7 +3753,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
-    if hold_resume:
+    if outcome.hold_resume:
         # The re-arm SUCCEEDED — the task is armed and persisted — so this is a 0, and it
         # stops the GESTURE, not the run. `--resume` does not override it: that flag
         # skips the confirmation prompt, while the hold is not a question but a proof
@@ -3572,14 +4088,53 @@ def _land_confirmation(
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
-    try:
-        verify.commit_paths(
-            paths.repo_root,
-            f"chore(operator): confirm {story.story_key}",
-            [spec, record] if board_ignored else [spec, paths.sprint_status, record],
+    # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
+    # `commit_paths` forces every operand LITERAL, so an operand replaced by a
+    # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
+    # an unrelated tree published under this `chore(operator):` message.
+    # Family `"store"` at all three: the family names the validation POLICY, not
+    # the file's role, and a spec, a board and a park record all want exactly
+    # "a regular file is there" and nothing about their bytes.
+    # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
+    # not sink its siblings, which is the whole point of the `board_ignored` drop
+    # this joins.
+    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    survivors: list[Path] = []
+    for path in operands:
+        # The SAME resolve-then-guard the four carries take, imported rather than
+        # re-spelled: one rule, one place it can drift from. Its resolve fold matters
+        # here too — an operand `confirm` cannot even NAME must not be handed to git.
+        refusal = _publication_refusal(path, "store")
+        if refusal is None or refusal[0] == "target-absent":
+            # An ABSENT operand STAYS (#356): `record` was unlinked by the drop a few
+            # lines above, and its DELETION is exactly what must ride this commit —
+            # `commit_paths` keeps a missing-but-TRACKED path for that reason and
+            # drops one git has never seen. Only a present-but-wrong-TYPE or
+            # unreadable operand is a hazard to git, and only those are dropped.
+            survivors.append(path)
+            continue
+        cause, error = refusal
+        # ONE collapsed line per dropped operand: git's own text is multi-line
+        # where this prints on one, and the operator needs the full path (not the
+        # basename a journal row carries) to find what is sitting there.
+        detail = "" if error is None else f": {' '.join(error.split())}"
+        print(
+            f"warning: {path} was left out of the {story.story_key} confirm commit "
+            f"({cause}){detail} — the confirm's on-disk change landed before the path "
+            f"took this shape; inspect it and commit it by hand once the path is repaired.",
+            file=sys.stderr,
         )
-    except verify.GitError:
-        pass  # files are written; git history is best effort (as `decisions`)
+    if survivors:
+        # An empty list spawns no git at all, rather than handing `commit_paths`
+        # nothing and letting it decide what that means.
+        try:
+            verify.commit_paths(
+                paths.repo_root,
+                f"chore(operator): confirm {story.story_key}",
+                survivors,
+            )
+        except verify.GitError:
+            pass  # files are written; git history is best effort (as `decisions`)
     print(f"✓ {story.story_key} confirmed — spec and board are done")
     return 0
 
@@ -3592,10 +4147,36 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
     project = _project(args)
     try:
+        paths = bmadconfig.load_paths(project)
         pending = decisions.pending_missed_decisions(project)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # The OBSERVATION arm's evidence, surfaced HERE because it cannot be surfaced
+    # where the degrade happens (DW-146). `pending_missed_decisions` reads the
+    # ledger through `read_for_observation` and discards the fault, because no
+    # journal is reachable from a module-level function handed only a project path
+    # — so an unreadable ledger yields no open ids and this command would print
+    # "no unanswered decisions from past sweeps" and exit 0. That is indisputably
+    # the WRONG silence: the answer is not "nothing is pending", it is "nothing
+    # could be read". The contract says an observation site degrades with an
+    # attributed fault, and for this one the operator's own terminal is the only
+    # place the attribution can land. Same probe the helper runs, so the two
+    # cannot disagree about whether the file is readable.
+    #
+    # stderr, never stdout: `--json` promises exactly one document on stdout, and
+    # a note there would corrupt the contract for every machine consumer. Exit
+    # stays 0 for the same reason `_sweep_dry_run` does NOT — nothing here is
+    # fabricated, the empty listing is honest once the note explains it, and an
+    # operator answering an unrelated decision must not be blocked by a ledger
+    # this command was not asked to repair.
+    _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
+    if ledger_fault is not None:
+        print(
+            f"note: {paths.deferred_work} cannot be read ({ledger_fault}) — "
+            "no pending decisions could be resolved from it",
+            file=sys.stderr,
+        )
     if args.json:
         # Before the empty-set early return (nothing pending is a valid empty
         # document, not the text line), and regardless of --list: --json *is*
@@ -3622,8 +4203,14 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            decisions.apply_pre_answer(project, decision, option, date=today)
-        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+            result = decisions.apply_pre_answer(project, decision, option, date=today)
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
             # What this buys is the `{decision.id}` in the message, and only
             # that: `main`'s tail catches BmadConfigError by name and everything
             # else through a bare `except Exception`, so none of these ever
@@ -3646,6 +4233,17 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # or broken mid-prompt raises here even though the read at the top of
             # this command succeeded. Leaving it out gave the likelier failure the
             # worse message.
+            #
+            # LedgerReadError is the SAME reachable shape as BmadConfigError, and it
+            # is here for the same reason (DW-146). `prompter.ask` blocks on the
+            # human, so a ledger that goes undecodable while the prompt is open
+            # raises out of `record_decision`'s locked `read_for_write` — the exact
+            # failure this tuple used to catch as a bare `ValueError`, back when the
+            # codec error escaped untyped. Retyping it to a plain `Exception` is what
+            # dropped it out of this handler; naming it puts it back, so the
+            # attribution this arm exists for is not lost to the contract that made
+            # the fault attributable. Its `LedgerReadFault` subclass also covers
+            # OS metadata/text-read failures since DW-279.
             print(f"error: could not record {decision.id}: {e}", file=sys.stderr)
             return 1
         if option.effect == "close":
@@ -3654,6 +4252,51 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             outcome = "queued — the next sweep will build it"
         else:
             outcome = "kept open (recorded)"
+        if not result.recorded:
+            # Replace success claims with what apply_pre_answer actually persisted.
+            # This later probe is only diagnostic: paths predates the prompt and
+            # may differ from the writer's reloaded config. A probe fault must not
+            # turn a completed non-write into a failed walk.
+            #
+            # The probe is the observation reader, not `is_file()` inside a
+            # `try/except OSError` (DW-282): `is_file()` answers False for a
+            # refused ledger on Python 3.14 — it suppresses every OS error there —
+            # so the fault never reached the `except` and a ledger sitting in
+            # place, unreadable, was reported as GONE, the sentence that says every
+            # `decision:` line already written went with it. The reader never
+            # raises: absence is its own `(None, None)` answer, and a refused ledger
+            # is an attributed fault on every interpreter, which keeps the
+            # "ledger state unavailable" wording.
+            #
+            # `observe_ledger`, not `read_for_observation`: this sentence says
+            # whether the FILE is there, and the text-only reader folds a present
+            # 0-byte ledger into the same `""` as a missing one, so testing the
+            # text reported a ledger that exists and holds no entry as GONE — the
+            # sentence that tells the operator every `decision:` line already
+            # written went with it (PR #794 review). `None` is absence; `""` is a
+            # present, empty ledger, which the recorder reached and found no entry
+            # in, the same news as any other missing entry.
+            outcome = "no decision line was written"
+            text, fault = deferredwork.observe_ledger(paths.deferred_work)
+            if fault is not None:
+                outcome += "; ledger state unavailable"
+            elif text is None:
+                outcome += ": the ledger file is gone"
+            else:
+                outcome += ": the ledger holds no entry for this id"
+            if option.effect != "close":
+                outcome += "; your answer was saved to the pre-answer store"
+        # A written operand that could not be published, in either of its two
+        # lanes: REFUSED before any git ran (DW-209/213), or FAILED once git ran
+        # and answered `GitError` (DW-225/226 — an operand in no repository, a
+        # gitignored path). Separate from the non-write above and reportable on TOP
+        # of a successful record: the operand list is already gated on what the
+        # call wrote, so either lane means an answer that really landed on disk is
+        # missing from git history. Neither is an error — the exit code, the walk
+        # and the outcome wording above are all unchanged by both.
+        note = result.publish_note()
+        if note is not None:
+            outcome += f"; {note}"
         print(f"  {decision.id}: {outcome}")
     print("\nrun `bmad-loop sweep` to act on any builds.")
     return 0
@@ -3693,7 +4336,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if state.finished:
         print("status: finished")
     elif state.paused:
-        print(f"status: PAUSED ({state.paused_stage}) — {state.paused_reason}")
+        print(f"status: PAUSED ({state.paused_stage}) — {display_pause_reason(state)}")
     elif graceful_pending:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
@@ -3935,6 +4578,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
         return rc
     try:
         runs.delete_run(project, run_dir, force=args.force)
+    except runs.LiveEngineError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -3955,6 +4601,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
         return rc
     try:
         dest = runs.archive_run(project, run_dir, force=args.force)
+    except runs.LiveEngineError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except runs.LiveSessionError as e:
         print(f"{e} (or pass --force)", file=sys.stderr)
         return 1
@@ -4139,7 +4788,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
     archive/delete runs past the retention window. Only terminal (finished or
     stopped) runs are touched; running, unknown-host, paused and interrupted
-    runs are always left intact."""
+    runs are always left intact.
+
+    Every per-candidate refusal is DATA, never an abort: this is a sweep, so one
+    busy run must not cost the operator the report of the runs already reclaimed
+    around it (they only reach stdout in the post-loop emission). That is why the
+    removals here take the run's state lock with ``wait_for_lock=False`` — a lock
+    someone else holds already means what this command reports anyway, and
+    waiting for it is unbounded on POSIX, where ``fcntl.flock`` never times
+    out."""
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     repo = paths.repo_root
@@ -4219,21 +4876,28 @@ def cmd_clean(args: argparse.Namespace) -> int:
             try:
                 if args.hard or not pol.cleanup.archive_old:
                     if not dry:
-                        runs.delete_run(project, run_dir)
+                        runs.delete_run(project, run_dir, wait_for_lock=False)
                     deleted.append(run_dir.name)
                 else:
                     if not dry:
-                        runs.archive_run(project, run_dir)
+                        runs.archive_run(project, run_dir, wait_for_lock=False)
                     archived.append(run_dir.name)
-            except runs.LiveSessionError:
-                # A session appeared between the loop-top guard and here — a resume
-                # of a stopped run, racing this clean. The chokepoint refused the
-                # removal; record the run instead of letting one racing run abort
-                # the whole invocation. Correct the estimate down to what actually
-                # went. The wider race — every mutation in this loop against a
-                # concurrent resume — is older than this guard (`reclaimable` is
-                # sampled in the loop above and never re-read) and is tracked in
-                # issue #533.
+            except (runs.LiveEngineError, runs.LiveSessionError, LockUnavailableError) as e:
+                # A session or engine appeared between the loop-top sample and the
+                # authoritative removal transaction — or the run's state lock is
+                # held, which says the same thing one layer down and is the only
+                # one of the three that reports it in this window: `resume` takes
+                # the lock FIRST and publishes its pid LAST, so for its whole
+                # preflight (git work bounded by `[limits] git_timeout_s`) the
+                # pid/session guards above still read dead and only the lock
+                # objects. Record this run instead of letting one racer abort the
+                # whole invocation, then continue with its siblings. Correct the
+                # estimate down to what actually went.
+                #
+                # `LockUnavailableError` and NOT a bare `except OSError`: that
+                # would also catch `platform_util.UnconfinedWriteError`, an
+                # OSError subclass raised when a write escapes its root, and file
+                # a containment refusal as a benign "left untouched".
                 freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
@@ -4242,8 +4906,14 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # trimmed, which is exactly the state it ends in.
                 (trimmed if run_worktrees or shrunk else protected).append(run_dir.name)
                 if not args.json:
+                    if isinstance(e, runs.LiveSessionError):
+                        reason = "agent session appeared mid-clean"
+                    elif isinstance(e, LockUnavailableError):
+                        reason = "run state locked by another process"
+                    else:
+                        reason = "engine resumed mid-clean"
                     print(
-                        f"run {run_dir.name}: agent session appeared mid-clean — not removed",
+                        f"run {run_dir.name}: {reason} — not removed",
                         file=sys.stderr,
                     )
         elif pol.cleanup.trim_artifacts:
@@ -4755,6 +5425,17 @@ def main(argv: list[str] | None = None) -> int:
         help="triage + answer decisions + record them; run no bundles",
     )
     sweep_p.add_argument("--max-bundles", type=int, help="override [sweep] max_bundles")
+    selectors = sweep_p.add_mutually_exclusive_group()
+    selectors.add_argument(
+        "--only",
+        metavar="DW-ID,...",
+        help="triage only the named open DW-<n> entries",
+    )
+    selectors.add_argument(
+        "--min-severity",
+        choices=("low", "medium", "high", "critical"),
+        help="triage open entries at this severity or higher",
+    )
     sweep_p.add_argument(
         "--repeat",
         action=argparse.BooleanOptionalAction,

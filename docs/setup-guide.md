@@ -298,7 +298,9 @@ them to whoever owns the machine:
 - **opencode** — install the HTTP client extra (`pip install 'bmad-loop[opencode]'`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
-  `provider/model` (e.g. `[adapter] model = "anthropic/claude-haiku-4-5"`). No hooks are
+  `provider/model` (e.g. `[adapter] model = "anthropic/claude-haiku-4-5"`). A reasoning
+  `effort` (e.g. `[adapter.review] effort = "max"`) is sent as the per-prompt variant and is
+  opencode-only — the tmux CLIs ignore it. No hooks are
   registered — the adapter drives a headless `opencode serve` over HTTP/SSE, so there is no
   tmux window to attach to; watch a session via its `logs/<task-id>.log` — a curated
   transcript of the agent's prose, tool calls, file edits and permission decisions — or the
