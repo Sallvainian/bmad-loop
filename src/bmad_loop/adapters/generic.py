@@ -589,6 +589,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # keeps the fail-fast behavior; the dev adapter raises it so a session
         # that ended its turn awaiting a background process isn't mis-stalled.
         self._stall_grace_s = 0.0
+        # Threshold for the #680 transcript-idle notice, in seconds: the policy's
+        # `dev_stall_grace_s` read directly, NOT `_stall_grace_s`, because the base
+        # adapter leaves that at 0 (no stall detection for triage / plugin-workflow
+        # / non-synthesizing sessions) while the idle notice is observation only
+        # and belongs to every pane-driven session the same. Same knob, no new
+        # policy field; 0 disables the notice along with the stall timer.
+        self._idle_threshold_s = float(policy.limits.dev_stall_grace_s)
         # Wake-nudges to spend on grace expiry before stalling. 0 here is moot for
         # the base adapter (grace 0 never opens the window); the dev adapter sets
         # it from policy so an idle wait is re-invoked rather than killed outright.
@@ -1314,9 +1321,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
         for a stat. A key that moved closes any open stretch with one
         `session-active` carrying the stretch's full length; a key that has not
-        moved for `_stall_grace_s` opens one with one `session-idle` (`idle_s`,
+        moved for `_idle_threshold_s` opens one with one `session-idle` (`idle_s`,
         `since_ts`, `threshold_s`), latched until the key moves again. The
-        threshold is the stall grace on purpose: the event fires exactly when the
+        threshold is `limits.dev_stall_grace_s` on purpose — read from policy, so
+        the plain adapter (triage, plugin workflows) honours it although it arms
+        no stall timer: on a dev/review session the event fires exactly when the
         session WOULD have stalled had its pane not kept repainting, so the two
         records are directly comparable, and `0` disables both. No journal
         attached (`resolve.run_session`, `probe`, fixtures) means no events; the
@@ -1346,8 +1355,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if (
             idle.open_since is None
             and self.journal is not None
-            and self._stall_grace_s > 0
-            and idle.idle_s >= self._stall_grace_s
+            and self._idle_threshold_s > 0
+            and idle.idle_s >= self._idle_threshold_s
         ):
             idle.open_since = idle.last_change_wall
             try:
@@ -1356,7 +1365,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     task_id=task_id,
                     idle_s=idle.idle_s,
                     since_ts=idle.open_since,
-                    threshold_s=self._stall_grace_s,
+                    threshold_s=self._idle_threshold_s,
                 )
             except OSError:
                 pass

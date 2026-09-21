@@ -6777,6 +6777,7 @@ def _idle_adapter(tmp_path, monkeypatch, *, grace=60.0, journal=True):
     mux = _UnitMux()
     adapter, _ = make_dev_adapter(tmp_path, mux=mux)
     adapter._stall_grace_s = grace
+    adapter._idle_threshold_s = grace  # the same knob, read from policy in production
     adapter._stall_nudges = 0
     adapter._window_alive = lambda handle: True
     if journal:
@@ -6883,6 +6884,36 @@ def test_idle_stretch_ending_in_the_final_interval_is_closed_at_exit(tmp_path, m
     assert result.status == "timeout"
     assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
     assert result.produced_work is True  # the same write is the #727 latch
+
+
+def test_plain_adapter_honours_the_idle_threshold_from_policy(tmp_path, monkeypatch):
+    """The plain `GenericAdapter` — what `runsetup.make_adapters` builds for the
+    sweep's triage role — arms no stall timer (`_stall_grace_s` stays 0), yet the
+    idle notice must still fire at `limits.dev_stall_grace_s` (600 by default):
+    the threshold is read from policy, not from the stall knob.
+
+    ABLATION: gate the notice on `_stall_grace_s` instead and this emits nothing."""
+    adapter, clock, _sent = _budget_adapter(tmp_path, monkeypatch)
+    assert adapter._stall_grace_s == 0.0 and adapter._idle_threshold_s == 600.0
+    adapter.journal = _FakeJournal()
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += 300.0  # heartbeats at ages 300 and 600 (the crossing)
+            clock["wall"] += 300.0
+        if call_n == 4:
+            clock["t"] += 100_000.0  # past the deadline
+
+    adapter.watcher = _ScriptedWatcher([_start_event(transcript)], on_call=script)
+    result = adapter.wait_for_completion(
+        _budget_handle(), _budget_spec(tmp_path, mode="off", timeout_s=5000.0)
+    )
+    assert result.status == "timeout"
+    kinds = [e["kind"] for e in adapter.journal.entries]
+    assert kinds == ["session-idle"]
+    assert adapter.journal.entries[0]["threshold_s"] == 600.0
 
 
 def test_idle_events_need_a_positive_grace(tmp_path, monkeypatch):
