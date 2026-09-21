@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -17,17 +18,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters.profile import CLIProfile
+from .process_host import ProcessHostError, get_process_host
 
 _EVENTS = {"SessionStart": "sessionStart", "Stop": "stop"}
 _RELAY_MARKER = "bmad_loop_hook.py"
 _PROBE_MARKER = "bmad_loop_probe_hook.py"
 _TIMEOUT_S = 5.0
+_SAFE_BYPASS_ARG = "--dangerously-bypass-approvals-and-sandbox"
 
 
 @dataclass(frozen=True)
 class TrustResult:
     status: str  # trusted | untrusted | unverifiable
     reason: str
+
+
+def hook_discovery_args_safe(args: tuple[str, ...] | None) -> bool:
+    """Whether extra launch args can leave hook discovery unchanged."""
+    return args is None or all(arg == _SAFE_BYPASS_ARG for arg in args)
 
 
 def _commands(config: object, profile: CLIProfile, marker: str) -> dict[str, list[str]] | None:
@@ -136,7 +144,16 @@ def _hooks_list(binary: str, cwd: Path, env: dict[str, str]) -> object:
         )
         return response(2)
     finally:
-        child.kill()
+        if child.poll() is None:
+            if os.name == "nt":
+                # An npm .cmd shim is a cmd.exe parent. Kill its tree before
+                # the wrapper exits and leaves the app server running.
+                try:
+                    get_process_host().force_kill(child.pid)
+                except (OSError, ProcessHostError):
+                    child.kill()
+            else:
+                child.kill()
         child.wait(timeout=2)
 
 
@@ -152,9 +169,7 @@ def project_hook_trust(
         return TrustResult("unverifiable", "hook trust applies only to Codex hooks")
     # The default bypass switch changes approvals, not hook configuration. Other
     # launch arguments can select a different config and cannot be mirrored here.
-    if profile.launch_args or any(
-        arg != "--dangerously-bypass-approvals-and-sandbox" for arg in profile.bypass_args
-    ):
+    if profile.launch_args or not hook_discovery_args_safe(profile.bypass_args):
         return TrustResult("unverifiable", "hook trust cannot verify profile launch arguments")
     config_path = (project / profile.hooks.config_path).resolve()
     try:
@@ -169,8 +184,15 @@ def project_hook_trust(
         return TrustResult(
             "untrusted", "hook trust: a required SessionStart or Stop hook is not registered"
         )
+    # Windows npm installs expose a codex.cmd shim through PATHEXT. Popen with
+    # a bare name need not find it; which() returns the executable run would use.
+    resolved_binary = shutil.which(
+        binary or profile.binary, path={**os.environ, **profile.env}.get("PATH")
+    )
+    if resolved_binary is None:
+        return TrustResult("unverifiable", "hook trust Codex binary is unavailable")
     try:
-        result = _hooks_list(binary or profile.binary, project, profile.env)
+        result = _hooks_list(resolved_binary, project, profile.env)
     except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
         return TrustResult("unverifiable", "hook trust could not be queried from Codex")
     if not isinstance(result, dict) or not isinstance(result.get("data"), list):

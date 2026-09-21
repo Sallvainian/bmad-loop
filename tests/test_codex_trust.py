@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config
+from conftest import install_bmad_config, write_script_launcher
 
 from bmad_loop import cli, codex_trust, probe
 from bmad_loop.adapters.profile import get_profile
@@ -48,10 +47,10 @@ def test_scripted_app_server_executes_request_sequence_and_reads_environment(tmp
     """An actual zero-token child parses initialize and hooks/list, not a mocked RPC."""
     data = _config(tmp_path)
     reply = _rpc(tmp_path, data)
-    script = tmp_path / "codex-stub"
     log = tmp_path / "requests.json"
-    script.write_text(
-        f"#!{sys.executable}\n"
+    script = write_script_launcher(
+        tmp_path,
+        "codex-stub",
         "import json, os, sys\n"
         "requests = []\n"
         "for line in sys.stdin:\n"
@@ -62,15 +61,34 @@ def test_scripted_app_server_executes_request_sequence_and_reads_environment(tmp
         "        assert os.environ['CODEX_HOME'] == 'test-home'\n"
         f"        open({str(log)!r}, 'w').write(json.dumps(requests))\n"
         f"        print(json.dumps({{'id': 2, 'result': {reply!r}}}), flush=True)\n",
-        encoding="utf-8",
     )
-    script.chmod(0o755)
     profile = replace(get_profile("codex"), binary=str(script), env={"CODEX_HOME": "test-home"})
     result = codex_trust.project_hook_trust(tmp_path, profile)
     assert result.status == "trusted", result.reason
     requests = json.loads(log.read_text(encoding="utf-8"))
     assert [item["method"] for item in requests] == ["initialize", "initialized", "hooks/list"]
     assert requests[-1]["params"]["cwds"] == [str(tmp_path.resolve())]
+
+
+def test_trust_resolves_codex_cmd_shim_before_spawning(tmp_path, monkeypatch):
+    data = _config(tmp_path)
+    resolved = r"C:\Program Files\nodejs\codex.cmd"
+    profile = replace(get_profile("codex"), env={"PATH": r"C:\Program Files\nodejs"})
+
+    def which(binary, *, path=None):
+        assert binary == "codex"
+        assert path == profile.env["PATH"]
+        return resolved
+
+    monkeypatch.setattr(codex_trust.shutil, "which", which)
+
+    def hooks_list(binary, cwd, env):
+        assert binary == resolved
+        assert cwd == tmp_path
+        return _rpc(tmp_path, data)
+
+    monkeypatch.setattr(codex_trust, "_hooks_list", hooks_list)
+    assert codex_trust.project_hook_trust(tmp_path, profile).status == "trusted"
 
 
 @pytest.mark.parametrize(
@@ -116,6 +134,12 @@ def test_missing_profile_stop_and_unsupported_launch_args_fail_closed(tmp_path, 
     profile = get_profile("codex")
     assert (
         codex_trust.project_hook_trust(tmp_path, replace(profile, launch_args=("-c", "x=1"))).status
+        == "unverifiable"
+    )
+    assert (
+        codex_trust.project_hook_trust(
+            tmp_path, replace(profile, bypass_args=("-C", "other"))
+        ).status
         == "unverifiable"
     )
     assert (
@@ -176,16 +200,15 @@ def test_validate_does_not_run_project_owned_codex_profile(project, tmp_path, ca
     policy = project.project / ".bmad-loop/policy.toml"
     policy.write_text('[adapter]\nname = "codex"\n', encoding="utf-8")
     sentinel = tmp_path / "executed"
-    binary = project.project / "codex-stub"
-    binary.write_text(
-        f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(sentinel)!r}).write_text('yes')\n",
-        encoding="utf-8",
+    binary = write_script_launcher(
+        project.project,
+        "codex-stub",
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('yes')\n",
     )
-    binary.chmod(0o755)
     overlay = project.project / ".bmad-loop/profiles/codex.toml"
     overlay.parent.mkdir(parents=True, exist_ok=True)
     overlay.write_text(
-        f'name = "codex"\nbinary = "{binary}"\n'
+        f'name = "codex"\nbinary = {json.dumps(str(binary))}\n'
         '[hooks]\ndialect = "codex-hooks-json"\nconfig_path = ".codex/hooks.json"\n'
         'events = { SessionStart = "SessionStart", Stop = "Stop" }\n',
         encoding="utf-8",
@@ -195,6 +218,31 @@ def test_validate_does_not_run_project_owned_codex_profile(project, tmp_path, ca
     assert not sentinel.exists()
     finding = next(f for f in doc["findings"] if f["check"] == "hooks.trust")
     assert finding["severity"] == "problem" and "project-owned" in finding["message"]
+
+
+def test_validate_refuses_codex_stage_extra_args_that_change_hook_root(
+    project, monkeypatch, capsys
+):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    install_into(project.project, clis=("codex",))
+    capsys.readouterr()
+    policy = project.project / ".bmad-loop/policy.toml"
+    policy.write_text(
+        '[adapter]\nname = "codex"\n[adapter.dev]\nextra_args = ["-C", "/another/project"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_kw: pytest.fail("a different launch root cannot certify hook trust"),
+    )
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    trust = next(f for f in doc["findings"] if f["check"] == "hooks.trust")
+    assert trust["severity"] == "problem"
+    assert "adapter.extra_args" in trust["message"] and "dev" in trust["message"]
 
 
 def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, monkeypatch):
@@ -321,20 +369,19 @@ def test_probe_scan_with_unregistered_codex_hooks_is_non_green(tmp_path, monkeyp
 
 
 def test_continuous_unrelated_messages_cannot_extend_rpc_deadline(tmp_path, monkeypatch):
-    script = tmp_path / "chatty-codex"
-    script.write_text(
-        f"#!{sys.executable}\n"
-        "import json, sys\n"
+    script = write_script_launcher(
+        tmp_path,
+        "chatty-codex",
+        "import json, sys, time\n"
         "for line in sys.stdin:\n"
         "    message = json.loads(line)\n"
         "    if message.get('method') == 'initialize':\n"
         "        print(json.dumps({'id': 1, 'result': {}}), flush=True)\n"
         "    if message.get('method') == 'hooks/list':\n"
-        "        while True:\n"
+        "        deadline = time.monotonic() + 1\n"
+        "        while time.monotonic() < deadline:\n"
         "            print(json.dumps({'method': 'unrelated'}), flush=True)\n",
-        encoding="utf-8",
     )
-    script.chmod(0o755)
     monkeypatch.setattr(codex_trust, "_TIMEOUT_S", 0.1)
     with pytest.raises(TimeoutError):
         codex_trust._hooks_list(str(script), tmp_path, {})

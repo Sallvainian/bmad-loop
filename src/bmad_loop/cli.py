@@ -742,7 +742,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
             )
 
         if profile.hooks.dialect == "codex-hooks-json":
-            from .codex_trust import project_hook_trust
+            from .codex_trust import hook_discovery_args_safe, project_hook_trust
+
+            unsafe_roles = []
+            if pol is not None:
+                for role in ROLES:
+                    cfg = pol.adapter.resolved(role)
+                    if cfg.name == profile.name and not hook_discovery_args_safe(cfg.extra_args):
+                        unsafe_roles.append(role)
 
             if not profile.packaged:
                 trust_message = (
@@ -756,6 +763,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 )
             elif not hooks_ok:
                 trust_message = "hook trust cannot pass: Codex relay hooks are not registered"
+            elif unsafe_roles:
+                trust_message = (
+                    "hook trust unverifiable: adapter.extra_args may change Codex hook "
+                    f"discovery for {', '.join(unsafe_roles)}"
+                )
             else:
                 trust = project_hook_trust(project, profile)
                 trust_message = None if trust.status == "trusted" else trust.reason

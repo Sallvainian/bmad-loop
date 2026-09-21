@@ -709,6 +709,8 @@ uses a different directory, so `validate` cannot certify its future trust from
 the main checkout. A live probe checks its temporary hook directory before
 launch; a fresh directory without a Codex trust grant stops with a hook-trust
 diagnostic.
+Profile or stage arguments that can change Codex hook discovery make the trust
+verdict unverifiable rather than certifying a different launch configuration.
 
 ### Budgeting & cost tracking
 
