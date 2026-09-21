@@ -379,26 +379,48 @@ class _ResultFileMixin:
 
         The idle detector remains stat-only. Reading content here is solely for
         the no-work verdict. A line crossing the old EOF is included so a torn
-        line completed by the latest append can still prove work.
+        line completed by the latest append can still prove work. Gemini's
+        `$set.messages` snapshots can replay older messages, so a model message
+        with an ID only proves work when it is new or changed.
         """
+        seen_messages: dict[str, dict] = {}
         try:
             with Path(transcript_path).open("rb") as stream:
                 while line := stream.readline():
-                    if stream.tell() <= since_size:
-                        continue
+                    after_baseline = stream.tell() > since_size
                     try:
                         entry = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     if not isinstance(entry, dict):
                         continue
-                    if entry.get("type") == "assistant" or entry.get("role") in (
-                        "assistant",
-                        "model",
-                    ):
-                        return True
+                    messages = [entry]
+                    set_patch = entry.get("$set")
+                    if isinstance(set_patch, dict):
+                        snapshot = set_patch.get("messages")
+                        if isinstance(snapshot, list):
+                            messages.extend(
+                                message for message in snapshot if isinstance(message, dict)
+                            )
+                    for message in messages:
+                        if message.get("type") not in ("assistant", "gemini") and message.get(
+                            "role"
+                        ) not in ("assistant", "model"):
+                            continue
+                        message_id = message.get("id")
+                        if isinstance(message_id, str):
+                            previous = seen_messages.get(message_id)
+                            seen_messages[message_id] = message
+                            if after_baseline and message != previous:
+                                return True
+                        elif after_baseline:
+                            return True
                     payload = entry.get("payload")
-                    if isinstance(payload, dict) and payload.get("type") == "agent_message":
+                    if (
+                        after_baseline
+                        and isinstance(payload, dict)
+                        and payload.get("type") == "agent_message"
+                    ):
                         return True
         except OSError:
             pass

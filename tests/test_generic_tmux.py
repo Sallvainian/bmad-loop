@@ -6521,7 +6521,14 @@ def test_transcript_growth_under_a_static_pane_is_work(tmp_path, monkeypatch):
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
-def test_setup_only_transcript_growth_is_not_work(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "setup_record",
+    [
+        {"type": "user", "message": "setup"},
+        {"$set": {"messages": [{"id": "u1", "type": "user", "content": []}]}},
+    ],
+)
+def test_setup_only_transcript_growth_is_not_work(tmp_path, monkeypatch, setup_record):
     """A prompt echo or metadata append before any nudge is not model output.
 
     ABLATION: treat any transcript stat change as work and this reads True.
@@ -6531,7 +6538,7 @@ def test_setup_only_transcript_growth_is_not_work(tmp_path, monkeypatch):
 
     def script(call_n):
         if call_n == 2:
-            _grow(transcript, b'{"type":"user","message":"setup"}\n')
+            _grow(transcript, (json.dumps(setup_record) + "\n").encode())
         elif call_n == 3:
             clock["t"] += 10_000.0
 
@@ -6563,6 +6570,46 @@ def test_old_assistant_record_is_not_credited_to_a_new_user_append(tmp_path, mon
         _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
     )
     assert (result.status, result.produced_work) == ("timeout", False)
+
+
+@pytest.mark.parametrize(
+    ("reply_content", "produced_work"),
+    [("earlier reply", False), ("continued reply", True)],
+)
+def test_gemini_snapshot_only_counts_new_model_content(
+    tmp_path, monkeypatch, reply_content, produced_work
+):
+    """A `$set.messages` snapshot can replay or update a model message.
+
+    ABLATION: credit any Gemini record in the appended snapshot and the replay
+    reads True; compare IDs alone and the update reads False.
+    """
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch, journal=False)
+    adapter._stall_grace_s = 0.0
+    old_reply = {"id": "g1", "type": "gemini", "content": "earlier reply"}
+    _grow(transcript, (json.dumps(old_reply) + "\n").encode())
+
+    def script(call_n):
+        if call_n == 2:
+            patch = {
+                "$set": {
+                    "messages": [
+                        {**old_reply, "content": reply_content},
+                        {"id": "u2", "type": "user", "content": "retry"},
+                    ]
+                }
+            }
+            _grow(transcript, (json.dumps(patch) + "\n").encode())
+        elif call_n == 3:
+            clock["t"] += 10_000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    )
+    assert (result.status, result.produced_work) == ("timeout", produced_work)
 
 
 def test_empty_transcript_creation_is_not_work(tmp_path, monkeypatch):
@@ -6670,12 +6717,22 @@ def test_transcript_write_inside_the_first_heartbeat_interval_is_work(tmp_path, 
     assert (result.status, result.produced_work) == ("timeout", True)
 
 
-def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "model_record",
+    [
+        {"type": "assistant"},
+        {"id": "g1", "type": "gemini", "content": "reply"},
+        {"$set": {"messages": [{"id": "g1", "type": "gemini", "content": "reply"}]}},
+        {"$set": {"messages": [{"id": "g1", "role": "model", "content": "reply"}]}},
+    ],
+)
+def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch, model_record):
     """The transcript's only write lands after the last heartbeat sample and the
     deadline elapses before another: the exit verdict compares the transcript
     against the tracker's baseline itself. `timeout`, `produced_work=True`.
 
-    ABLATION: drop the transcript sample inside `produced_work()` — False."""
+    Includes Gemini's bare and `$set.messages` records. ABLATION: drop the
+    transcript sample inside `produced_work()` or the model-record predicate — False."""
     adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
         tmp_path, monkeypatch, journal=False
     )
@@ -6684,7 +6741,7 @@ def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch):
     def script(call_n):
         if call_n == 2:
             clock["t"] += 10.0
-            _grow(transcript, b'{"type":"assistant"}\n')
+            _grow(transcript, (json.dumps(model_record) + "\n").encode())
         elif call_n == 3:
             clock["t"] += 10_000.0  # no heartbeat fires before the deadline check
 
