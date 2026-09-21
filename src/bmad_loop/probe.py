@@ -494,10 +494,16 @@ def _check_hook_trust(
                 "Codex has no trust grant for this fresh temporary workspace; "
                 "live capture cannot proceed until that workspace is trusted"
             )
-        else:
+        elif "stale" in trust.reason:
             finding.next_steps.append(
                 "Open Codex in the project checkout and accept its hook trust prompt"
             )
+        elif "not registered" in trust.reason or "omitted" in trust.reason:
+            finding.next_steps.append(
+                f"Re-register the Codex relay with `bmad-loop init --cli {profile.name}`"
+            )
+        else:
+            finding.next_steps.append("Resolve the Codex hook trust diagnostic and re-run the scan")
 
 
 # ----------------------------------------------------------------- SCAN mode
@@ -602,6 +608,10 @@ class _ProbeLauncher:
 
 
 def _probe_argv(profile: CLIProfile, binary: str, hints: Hints) -> list[str]:
+    if profile.hooks.dialect == "codex-hooks-json":
+        from .codex_trust import resolved_codex_binary
+
+        binary = resolved_codex_binary(binary, profile.env) or binary
     argv = [
         binary,
         *profile.launch_args,
@@ -706,7 +716,13 @@ def probe(
         mux_ready = bool(mux.available())
     except Exception:  # a raising host probe means "cannot probe", not a crash
         mux_ready = False
-    if not mux_ready or not shutil.which(binary):
+    if profile.hooks.dialect == "codex-hooks-json":
+        from .codex_trust import resolved_codex_binary
+
+        binary_found = resolved_codex_binary(binary, profile.env) is not None
+    else:
+        binary_found = shutil.which(binary) is not None
+    if not mux_ready or not binary_found:
         # finding.binary, not the raw local — see the identical note in scan()
         missing = f"multiplexer backend {type(mux).__name__}" if not mux_ready else finding.binary
         finding.warnings.append(f"{missing} not on PATH — cannot probe; falling back to scan")

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters.profile import CLIProfile
+from .install import _hook_command
 from .process_host import ProcessHostError, get_process_host
 
 _EVENTS = {"SessionStart": "sessionStart", "Stop": "stop"}
@@ -38,7 +39,14 @@ def hook_discovery_args_safe(args: tuple[str, ...] | None) -> bool:
     return args is None or all(arg == _SAFE_BYPASS_ARG for arg in args)
 
 
-def _commands(config: object, profile: CLIProfile, marker: str) -> dict[str, list[str]] | None:
+def resolved_codex_binary(binary: str, env: dict[str, str]) -> str | None:
+    """Resolve with the same PATH used by the trust query and session launch."""
+    return shutil.which(binary, path={**os.environ, **env}.get("PATH"))
+
+
+def _commands(
+    config: object, profile: CLIProfile, project: Path, marker: str
+) -> dict[str, list[str]] | None:
     if not isinstance(config, dict) or not isinstance(config.get("hooks"), dict):
         raise ValueError("malformed Codex hook config")
     events = profile.hooks.events
@@ -46,6 +54,13 @@ def _commands(config: object, profile: CLIProfile, marker: str) -> dict[str, lis
         return None
     found: dict[str, list[str]] = {}
     for canonical in _EVENTS:
+        if marker == _RELAY_MARKER:
+            expected_command = _hook_command(project, profile, canonical)
+        else:
+            host = get_process_host()
+            expected_command = (
+                f"{host.hook_interpreter()} {host.shell_quote(str(project / marker))} {canonical}"
+            )
         handlers = config["hooks"].get(canonical)
         if handlers is None:
             return None
@@ -60,6 +75,13 @@ def _commands(config: object, profile: CLIProfile, marker: str) -> dict[str, lis
                     raise ValueError("malformed Codex hook entry")
                 command = hook.get("command")
                 if isinstance(command, str) and marker in command:
+                    # A SessionStart matcher can exclude startup even when
+                    # Codex reports the command trusted and enabled. The
+                    # installed relay has none; refuse customized matchers.
+                    if canonical == "SessionStart" and group.get("matcher") not in (None, ""):
+                        return None
+                    if command != expected_command:
+                        return None
                     commands.append(command)
         if not commands:
             return None
@@ -177,18 +199,16 @@ def project_hook_trust(
     except (OSError, UnicodeError, ValueError):
         return TrustResult("unverifiable", "hook trust config is unreadable")
     try:
-        commands = _commands(config, profile, marker)
+        commands = _commands(config, profile, project, marker)
     except ValueError:
         return TrustResult("unverifiable", "hook trust config has malformed fields")
     if commands is None:
         return TrustResult(
-            "untrusted", "hook trust: a required SessionStart or Stop hook is not registered"
+            "untrusted", "hook trust: a required SessionStart or Stop relay is not usable"
         )
     # Windows npm installs expose a codex.cmd shim through PATHEXT. Popen with
     # a bare name need not find it; which() returns the executable run would use.
-    resolved_binary = shutil.which(
-        binary or profile.binary, path={**os.environ, **profile.env}.get("PATH")
-    )
+    resolved_binary = resolved_codex_binary(binary or profile.binary, profile.env)
     if resolved_binary is None:
         return TrustResult("unverifiable", "hook trust Codex binary is unavailable")
     try:

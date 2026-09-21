@@ -726,8 +726,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         extra = self.extra_args
         if extra is None:
             extra = self.profile.bypass_args
+        binary = self.binary
+        if self.profile.hooks.dialect == "codex-hooks-json":
+            from ..codex_trust import resolved_codex_binary
+
+            binary = resolved_codex_binary(binary, self.profile.env) or binary
         argv = [
-            self.binary,
+            binary,
             *self.profile.launch_args,
             self.profile.render_prompt(spec.prompt),
             *extra,

@@ -11,15 +11,14 @@ from conftest import install_bmad_config, write_script_launcher
 
 from bmad_loop import cli, codex_trust, probe
 from bmad_loop.adapters.profile import get_profile
-from bmad_loop.install import merge_hooks
+from bmad_loop.install import _hook_command, merge_hooks
 
 
 def _config(root: Path, commands: dict[str, str] | None = None) -> dict:
     profile = get_profile("codex")
     if commands is None:
         commands = {
-            event: f"python3 {root}/.bmad-loop/bmad_loop_hook.py {event}"
-            for event in ("SessionStart", "Stop")
+            event: _hook_command(root, profile, event) for event in ("SessionStart", "Stop")
         }
     data, _ = merge_hooks({}, commands, profile.hooks.dialect)
     path = root / profile.hooks.config_path
@@ -95,8 +94,10 @@ def test_trust_resolves_codex_cmd_shim_before_spawning(tmp_path, monkeypatch):
     ("mutation", "expected"),
     [
         ("start-modified", "untrusted"),
+        ("start-untrusted", "untrusted"),
         ("start-omitted", "untrusted"),
         ("modified", "untrusted"),
+        ("untrusted", "untrusted"),
         ("disabled", "untrusted"),
         ("omitted", "untrusted"),
         ("wrong-command", "untrusted"),
@@ -110,10 +111,14 @@ def test_trust_refuses_stale_or_unmatched_relay(tmp_path, monkeypatch, mutation,
     hooks = result["data"][0]["hooks"]
     if mutation == "start-modified":
         hooks[0]["trustStatus"] = "modified"
+    elif mutation == "start-untrusted":
+        hooks[0]["trustStatus"] = "untrusted"
     elif mutation == "start-omitted":
         hooks.pop(0)
     elif mutation == "modified":
         hooks[1]["trustStatus"] = "modified"
+    elif mutation == "untrusted":
+        hooks[1]["trustStatus"] = "untrusted"
     elif mutation == "disabled":
         hooks[1]["enabled"] = False
     elif mutation == "omitted":
@@ -126,6 +131,23 @@ def test_trust_refuses_stale_or_unmatched_relay(tmp_path, monkeypatch, mutation,
         hooks[1]["sourcePath"] = "/tmp/other/hooks.json"
     monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: result)
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == expected
+
+
+def test_trust_refuses_relay_for_old_checkout_and_startup_excluding_matcher(tmp_path, monkeypatch):
+    data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
+    assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "trusted"
+
+    data["hooks"]["SessionStart"][0]["matcher"] = "^resume$"
+    (tmp_path / ".codex/hooks.json").write_text(json.dumps(data), encoding="utf-8")
+    assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
+
+    data["hooks"]["SessionStart"][0].pop("matcher")
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = _hook_command(
+        tmp_path / "old-checkout", get_profile("codex"), "Stop"
+    )
+    (tmp_path / ".codex/hooks.json").write_text(json.dumps(data), encoding="utf-8")
+    assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
 
 def test_missing_profile_stop_and_unsupported_launch_args_fail_closed(tmp_path, monkeypatch):
@@ -191,6 +213,31 @@ def test_validate_names_untrusted_hook_and_refuses_worktree_inference(project, m
     assert len(findings) == 1 and "worktree" in findings[0]["message"]
 
 
+def test_validate_trust_query_uses_selected_project(project, tmp_path, monkeypatch, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    install_into(project.project, clis=("codex",))
+    capsys.readouterr()
+    (project.project / ".bmad-loop/policy.toml").write_text(
+        '[adapter]\nname = "codex"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    queried = []
+
+    def trust(path, _profile):
+        queried.append(path)
+        return codex_trust.TrustResult("trusted", "hook trust current")
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    finding = next(
+        f for f in json.loads(capsys.readouterr().out)["findings"] if f["check"] == "hooks.trust"
+    )
+    assert finding["severity"] == "ok"
+    assert queried == [project.project]
+
+
 def test_validate_does_not_run_project_owned_codex_profile(project, tmp_path, capsys):
     from bmad_loop.install import install_into
 
@@ -220,8 +267,9 @@ def test_validate_does_not_run_project_owned_codex_profile(project, tmp_path, ca
     assert finding["severity"] == "problem" and "project-owned" in finding["message"]
 
 
+@pytest.mark.parametrize("role", ["dev", "review", "triage"])
 def test_validate_refuses_codex_stage_extra_args_that_change_hook_root(
-    project, monkeypatch, capsys
+    project, monkeypatch, capsys, role
 ):
     from bmad_loop.install import install_into
 
@@ -230,7 +278,8 @@ def test_validate_refuses_codex_stage_extra_args_that_change_hook_root(
     capsys.readouterr()
     policy = project.project / ".bmad-loop/policy.toml"
     policy.write_text(
-        '[adapter]\nname = "codex"\n[adapter.dev]\nextra_args = ["-C", "/another/project"]\n',
+        f'[adapter]\nname = "codex"\n[adapter.{role}]\n'
+        'extra_args = ["-C", "/another/project"]\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -242,7 +291,7 @@ def test_validate_refuses_codex_stage_extra_args_that_change_hook_root(
     doc = json.loads(capsys.readouterr().out)
     trust = next(f for f in doc["findings"] if f["check"] == "hooks.trust")
     assert trust["severity"] == "problem"
-    assert "adapter.extra_args" in trust["message"] and "dev" in trust["message"]
+    assert "adapter.extra_args" in trust["message"] and role in trust["message"]
 
 
 def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, monkeypatch):
@@ -277,7 +326,7 @@ def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, mon
 
     monkeypatch.setattr(probe, "get_multiplexer", Mux)
     monkeypatch.setattr(probe, "_ProbeLauncher", Launcher)
-    monkeypatch.setattr(probe.shutil, "which", lambda _binary: "/bin/true")
+    monkeypatch.setattr(probe.shutil, "which", lambda _binary, **_kwargs: "/bin/true")
     live = probe.probe(
         cli="codex", profile=profile, project=tmp_path, hints=probe.Hints(binary="chosen")
     )
@@ -323,7 +372,7 @@ def test_trusted_live_probe_checks_temp_config_then_starts_zero_token_launcher(
     monkeypatch.setattr(probe, "get_multiplexer", Mux)
     monkeypatch.setattr(probe, "_ProbeLauncher", Launcher)
     monkeypatch.setattr(probe, "SignalWatcher", Watcher)
-    monkeypatch.setattr(probe.shutil, "which", lambda _binary: "/bin/true")
+    monkeypatch.setattr(probe.shutil, "which", lambda _binary, **_kwargs: "/bin/true")
     monkeypatch.setattr(probe, "run_version_help", lambda binary: probe.FlagFinding(binary, True))
     monkeypatch.setattr(probe, "discover_transcript", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(probe.time, "sleep", lambda _seconds: None)
@@ -334,7 +383,7 @@ def test_trusted_live_probe_checks_temp_config_then_starts_zero_token_launcher(
     assert finding.hook_trust == "trusted"
     assert events[0][0] == "trust" and events[0][1] != tmp_path
     assert events[0][2:] == ("chosen", probe.PROBE_HOOK_NAME)
-    assert events[1] == ("start", events[0][1], "chosen")
+    assert events[1] == ("start", events[0][1], "/bin/true")
     assert events[-1] == ("kill",)
 
 
@@ -366,6 +415,20 @@ def test_probe_scan_with_unregistered_codex_hooks_is_non_green(tmp_path, monkeyp
     assert doc["hooks_registered"] is False
     assert doc["hook_trust"] != "trusted"
     assert any("hook trust" in warning for warning in doc["warnings"])
+
+
+def test_probe_codex_with_invalid_profile_cannot_fall_back_to_green_scan(tmp_path, capsys):
+    overlay = tmp_path / ".bmad-loop/profiles/codex.toml"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text("invalid = [", encoding="utf-8")
+    rc = cli.main(
+        ["probe-adapter", "codex", "--project", str(tmp_path), "--binary", "chosen", "--json"]
+    )
+    out, err = capsys.readouterr()
+    doc = json.loads(out)
+    assert rc == 1 and "FAIL" in err
+    assert doc["hook_trust"] == "unverifiable"
+    assert any("hook trust unverifiable" in warning for warning in doc["warnings"])
 
 
 def test_continuous_unrelated_messages_cannot_extend_rpc_deadline(tmp_path, monkeypatch):

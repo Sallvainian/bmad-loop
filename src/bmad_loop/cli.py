@@ -5052,17 +5052,22 @@ def cmd_probe(args: argparse.Namespace) -> int:
     )
 
     profile = None
+    codex_profile_error = False
     try:
         profile = get_profile(args.cli, project)
     except ProfileError as e:
+        if args.cli == "codex":
+            codex_profile_error = True
         if not args.binary:
-            print(f"FAIL: {e}", file=sys.stderr)
+            prefix = "Codex hook trust unverifiable: " if codex_profile_error else ""
+            print(f"FAIL: {prefix}{e}", file=sys.stderr)
             return 1
         # Human-facing notice — stderr in JSON mode, where stdout is the document.
-        print(
-            f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
-            file=sys.stderr if args.json else sys.stdout,
-        )
+        if not codex_profile_error:
+            print(
+                f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
+                file=sys.stderr if args.json else sys.stdout,
+            )
 
     if profile is not None and profile.hookless:
         print(
@@ -5090,7 +5095,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
     if args.probe:
         if profile is None:
-            print("FAIL: --probe needs a known profile (its hook dialect/events)", file=sys.stderr)
+            prefix = "Codex hook trust unverifiable: " if codex_profile_error else ""
+            print(
+                f"FAIL: {prefix}--probe needs a known profile (its hook dialect/events)",
+                file=sys.stderr,
+            )
             return 1
         finding = probe_mod.probe(
             cli=args.cli,
@@ -5105,6 +5114,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
         finding = probe_mod.scan(
             cli=args.cli, profile=profile, project=project, hints=hints, pseudo=pseudo
         )
+    if codex_profile_error:
+        finding.hook_trust = "unverifiable"
+        finding.warnings.append("Codex hook trust unverifiable: profile cannot be loaded")
+        finding.next_steps.append("Repair the Codex profile, then re-run the probe")
 
     # One or the other, never both: --json selects the pure JSON document
     # (machine.py contract), otherwise the human-readable markdown report.
