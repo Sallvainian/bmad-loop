@@ -820,13 +820,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # Read at call time, after a final frame sample, so every exit below
             # reports the loop's final view of the pane rather than the last tick's.
             sample_frame()
-            if transcript_path and not idle.moved and idle.last_key is not None:
+            if transcript_path:
                 # Same for the transcript: a write inside the final heartbeat
-                # interval has not been sampled yet. Compare against the tracker's
-                # baseline without advancing it — the idle record is the heartbeat's.
-                key = self._transcript_activity_key(transcript_path)
-                if key is not None and key != idle.last_key:
-                    idle.moved = True
+                # interval has not been sampled yet. A full sample, not a bare
+                # compare, so an idle stretch that ended in that interval is closed
+                # with its `session-active` before `session-end` lands, and the
+                # #727 latch (`idle.moved`) sees the write.
+                self._sample_transcript_idle(
+                    handle.task_id, transcript_path, idle, time.monotonic()
+                )
             return self._work_verdict(handle, stop_seen, activity_seen or idle.moved or usage_seen)
 
         while True:

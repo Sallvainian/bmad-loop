@@ -6554,7 +6554,7 @@ def test_transcript_write_in_the_final_interval_is_work(tmp_path, monkeypatch):
     deadline elapses before another: the exit verdict compares the transcript
     against the tracker's baseline itself. `timeout`, `produced_work=True`.
 
-    ABLATION: drop the transcript comparison inside `produced_work()` — False."""
+    ABLATION: drop the transcript sample inside `produced_work()` — False."""
     adapter, _, _log, transcript, clock, heartbeats = _idle_adapter(
         tmp_path, monkeypatch, journal=False
     )
@@ -6854,6 +6854,37 @@ def test_idle_stretch_journals_one_pair_and_stamps_heartbeat(tmp_path, monkeypat
     assert second["idle_s"] == 60.0
 
 
+def test_idle_stretch_ending_in_the_final_interval_is_closed_at_exit(tmp_path, monkeypatch):
+    """An open idle stretch whose transcript moves after the last heartbeat, with
+    the deadline elapsing before another: the exit-time sample closes it, so the
+    journal reads `session-idle` then `session-active` ahead of the engine's
+    `session-end` rather than a stretch that never recovered.
+
+    ABLATION: replace the exit-time `_sample_transcript_idle` with a bare key
+    compare and the `session-active` is missing."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n >= 2:
+            _grow(log, "\r⠋".encode())  # the spinner keeps the pane alive throughout
+        if 2 <= call_n <= 4:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S  # ages 30, 60 (crossing), 90
+        if call_n == 5:
+            clock["t"] += 10.0  # inside the final interval: no heartbeat fires
+            _grow(transcript, b'{"type":"assistant"}\n')
+        if call_n == 6:
+            clock["t"] += 10_000.0  # deadline next tick, still no heartbeat first
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
+    assert result.produced_work is True  # the same write is the #727 latch
+
+
 def test_idle_events_need_a_positive_grace(tmp_path, monkeypatch):
     """`dev_stall_grace_s = 0` disables the events (no new knob); the heartbeat
     still stamps the age.
@@ -6926,7 +6957,11 @@ def test_unreadable_transcript_stat_skips_the_sample(tmp_path, monkeypatch):
     """A transcript the hook named but that does not exist yet (or is mid-rename):
     the stat raises, the key is None, the tick is skipped and the loop goes on.
     When the file appears the clock starts from THAT sample."""
-    adapter, _, log, transcript, clock, heartbeats = _idle_adapter(tmp_path, monkeypatch)
+    # grace far above the timeline, so the exit-time sample after the final clock
+    # jump cannot open a stretch: this row is about the None-key skip only
+    adapter, _, log, transcript, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, grace=100_000.0
+    )
     transcript.unlink()
     assert generic.GenericAdapter._transcript_activity_key(str(transcript)) is None
 
