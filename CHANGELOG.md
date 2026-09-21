@@ -22,6 +22,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Prove ownership of an untagged control window before targeting it (#531). `ctl_window_id`
+  admitted an untagged row whenever this project merely held a run dir for the run id, and
+  `--run-id` is caller-supplied, so two projects scripting the same id each admitted the
+  _other's_ window — `a` attached to it, the return stamp landed on it, and `x` killed a live
+  orchestrator next door. An untagged row now needs the record this project's own launch
+  wrote for that exact window; with no record the lookup answers nothing rather than guessing
+  by listing order. A window minted before its record exists (a fresh `run`/`sweep`) is
+  unreachable by `a`/`x` until a relaunch records one.
+
 - Count Copilot shutdown metrics and increased Codex output-token totals as work
   when a dev session exits before the next transcript heartbeat (#822).
 
