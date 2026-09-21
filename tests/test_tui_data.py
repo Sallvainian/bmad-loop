@@ -7,11 +7,12 @@ import importlib
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from conftest import install_bmad_config, refuse_to_resolve, write_sprint
 
-from bmad_loop import bmadconfig, deferredwork, policy
+from bmad_loop import bmadconfig, deferredwork, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
@@ -30,10 +31,19 @@ def make_run(root: Path, run_id: str, **state_kwargs) -> Path:
     return run_dir
 
 
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def dead_pid() -> int:
-    """Pid guaranteed (modulo astronomically unlikely reuse) to be dead."""
+    """Return an exited child's PID, retaining its handle to prevent Windows reuse."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
