@@ -39,6 +39,10 @@ breaking changes may land in a minor release.
 
 - Count `plugin-hook-error` entries in `diagnose`'s plugin-errors total (#779).
 
+- Register Windows hook commands with forward-slash paths so Git Bash no longer strips
+  their separators and stalls every session (#773); re-run `bmad-loop init` to migrate.
+  Paths with spaces remain unsupported under the PowerShell fallback.
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`

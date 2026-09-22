@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config, write_script_launcher
+from conftest import install_bmad_config, windows_relay_builder, write_script_launcher
 
 from bmad_loop import cli, codex_trust, probe
 from bmad_loop.adapters.profile import ProfileError, get_profile
@@ -75,6 +75,32 @@ def test_trust_rejects_installed_relay_at_wrong_path(tmp_path, monkeypatch):
     (tmp_path / ".codex/hooks.json").write_text(json.dumps(data))
     monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: pytest.fail("wrong relay path"))
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
+
+
+def test_trust_reads_backslash_windows_relay_as_stale_and_forward_slash_as_current(
+    tmp_path, monkeypatch
+):
+    """After #773 the expected Windows relay names its executable with forward
+    slashes. A pre-#773 backslash registration (broken under Git Bash anyway) is
+    still recognized as the relay but differs from the command init writes now:
+    it reads untrusted — re-run init — without querying Codex or raising."""
+    windows_exe = r"C:\Users\me\.local\bin\bmad-loop.exe"
+    build = windows_relay_builder(monkeypatch, tmp_path, windows_exe)
+    monkeypatch.setattr(codex_trust, "_hook_command", build)
+    old = _config(tmp_path, {e: rf"{windows_exe} relay {e}" for e in ("SessionStart", "Stop")})
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: pytest.fail("stale relay"))
+    result = codex_trust.project_hook_trust(tmp_path, get_profile("codex"))
+    assert result.status == "untrusted" and "not usable" in result.reason
+
+    profile = get_profile("codex")
+    current = _config(tmp_path, {e: build(tmp_path, profile, e) for e in ("SessionStart", "Stop")})
+    assert current != old
+    assert current["hooks"]["Stop"][0]["hooks"][0]["command"] == (
+        "C:/Users/me/.local/bin/bmad-loop.exe relay Stop"
+    )
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, current))
+    assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "trusted"
 
 
 def test_trust_degrades_when_installed_relay_disappears(tmp_path, monkeypatch):

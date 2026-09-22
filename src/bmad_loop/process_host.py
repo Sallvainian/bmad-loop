@@ -223,9 +223,20 @@ class WindowsProcessHost(ProcessHost):
         return self.shell_quote(str(Path(sys.executable).absolute()))
 
     def shell_quote(self, arg: str) -> str:
-        # POSIX single-quoting breaks Windows paths; list2cmdline is the stdlib's
-        # Windows argument quoter (the inverse of how CreateProcess parses argv).
-        return subprocess.list2cmdline([arg])
+        # Hook runners hand these commands to a shell, not CreateProcess: Claude
+        # Code uses Git Bash on Windows (PowerShell without it), and Git Bash eats
+        # an unquoted backslash — `C:\Users\me\bmad-loop.exe` runs as
+        # `C:Usersmebmad-loop.exe` and every session stalls to timeout (#773). So
+        # separators become forward slashes, which Windows and Python accept and
+        # sh, PowerShell and cmd.exe pass through unchanged; list2cmdline then
+        # double-quotes a path with spaces as before. Every caller passes a path
+        # (interpreter, relay executable, hook script), so no backslash here is an
+        # escape. Known gap: on the PowerShell fallback a double-quoted executable
+        # followed by arguments is a parse error without `&` (which would break
+        # sh), so paths WITH spaces stay unsupported there. Claude's exec-form
+        # `args` would avoid shells entirely but is Claude-only and changes the
+        # registered JSON shape older versions mis-run.
+        return subprocess.list2cmdline([arg.replace("\\", "/")])
 
 
 def _proc_starttime(pid: int) -> float | None:

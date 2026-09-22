@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from conftest import (
@@ -22,9 +22,11 @@ from conftest import (
     install_build_auto_skill,
     install_dev_shim,
     refuse_to_resolve,
+    windows_relay_builder,
 )
 
 import bmad_loop.install as install_mod
+import bmad_loop.worktree_flow as worktree_flow_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import (
@@ -415,6 +417,122 @@ def test_hook_command_refuses_unreadable_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(install_mod.os, "access", access)
     with pytest.raises(ProfileError, match="installed bmad-loop command is unavailable"):
         install_mod._hook_command(tmp_path, get_profile("claude"), "Stop")
+
+
+WINDOWS_RELAY = r"C:\Users\me\.local\bin\bmad-loop.exe"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="POSIX bash stands in for Git Bash; the win32 rows execute the real shells",
+)
+@pytest.mark.parametrize(
+    "windows_path", [WINDOWS_RELAY, r"C:\Program Files\x y\bmad-loop.exe"], ids=["plain", "spaces"]
+)
+def test_windows_relay_command_survives_bash(tmp_path, monkeypatch, windows_path):
+    """Claude Code runs hook commands under Git Bash on Windows (#773), where an
+    unquoted backslash is an escape: the registered executable must reach argv[0]
+    with every separator. `printf` echoes argv in place of the relay."""
+    build = windows_relay_builder(monkeypatch, tmp_path, windows_path)
+    command = build(tmp_path, get_profile("claude"), "Stop")
+    ran = subprocess.run(
+        ["bash", "-c", "printf '%s\\n' " + command], capture_output=True, text=True, check=True
+    )
+    argv = ran.stdout.splitlines()
+    assert argv[1:] == ["relay", "Stop"]
+    assert PureWindowsPath(argv[0]) == PureWindowsPath(windows_path)
+
+
+def test_relay_executable_recognizes_backslash_and_forward_slash_windows_forms(
+    tmp_path, monkeypatch
+):
+    build = windows_relay_builder(monkeypatch, tmp_path, WINDOWS_RELAY)
+    current = build(tmp_path, get_profile("claude"), "Stop")
+    assert current == "C:/Users/me/.local/bin/bmad-loop.exe relay Stop"
+    for command in (current, rf"{WINDOWS_RELAY} relay Stop"):
+        executable = relay_executable(command)
+        assert executable is not None
+        assert PureWindowsPath(str(executable)) == PureWindowsPath(WINDOWS_RELAY)
+
+
+def _stop_commands(config: dict) -> list[str]:
+    return [hook["command"] for group in config["hooks"]["Stop"] for hook in group["hooks"]]
+
+
+def test_merge_hooks_replaces_backslash_windows_relay_with_forward_slash_form(
+    tmp_path, monkeypatch
+):
+    """An install registered before #773 names the same executable with
+    backslashes: re-registration replaces it rather than adding a second relay,
+    and a second pass over the forward-slash form changes nothing."""
+    profile = get_profile("claude")
+    build = windows_relay_builder(monkeypatch, tmp_path, WINDOWS_RELAY)
+    registrations = {
+        native: build(tmp_path, profile, canonical)
+        for native, canonical in profile.hooks.events.items()
+    }
+    old = rf"{WINDOWS_RELAY} relay Stop"
+    config = {
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": old},
+                        {"type": "command", "command": "make lint"},
+                    ]
+                }
+            ]
+        }
+    }
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert sorted(_stop_commands(config)) == sorted([registrations["Stop"], "make lint"])
+    again, changed = merge_hooks(
+        json.loads(json.dumps(config)), registrations, profile.hooks.dialect
+    )
+    assert not changed and again == config
+
+
+def test_init_and_provision_replace_backslash_windows_relay(tmp_path, monkeypatch):
+    """Both writers — `init` and worktree provisioning — go through the Windows
+    builder here and replace the pre-#773 backslash registration exactly once."""
+    build = windows_relay_builder(monkeypatch, tmp_path, WINDOWS_RELAY)
+    monkeypatch.setattr(install_mod, "_hook_command", build)
+    monkeypatch.setattr(worktree_flow_mod, "_hook_command", build)
+    profile = get_profile("claude")
+    old = rf"{WINDOWS_RELAY} relay Stop"
+    current = "C:/Users/me/.local/bin/bmad-loop.exe relay Stop"
+    seeded = json.dumps(
+        {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": old},
+                            {"type": "command", "command": "make lint"},
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+
+    project = tmp_path / "project"
+    config = project / profile.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(seeded)
+    assert install_into(project, skills=False) == 0
+    migrated = config.read_bytes()
+    assert sorted(_stop_commands(json.loads(migrated))) == [current, "make lint"]
+    assert install_into(project, skills=False) == 0
+    assert config.read_bytes() == migrated
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / profile.hooks.config_path).parent.mkdir(parents=True)
+    (repo / profile.hooks.config_path).write_text(seeded)
+    provision_worktree(wt, [profile], repo, seed_files=[profile.hooks.config_path])
+    provisioned = json.loads((wt / profile.hooks.config_path).read_text())
+    assert sorted(_stop_commands(provisioned)) == [current, "make lint"]
 
 
 def test_provision_worktree_refuses_missing_installed_command(tmp_path, monkeypatch):
