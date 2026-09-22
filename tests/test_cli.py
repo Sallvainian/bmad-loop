@@ -9724,6 +9724,33 @@ def test_validate_json_reports_null_hook_handlers_without_crashing(project, caps
     )
 
 
+def test_validate_checks_valid_relay_when_another_event_is_malformed(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    missing = project.project / "missing" / "bmad-loop"
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{missing} relay Stop"
+    data["hooks"]["SessionStart"] = None
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        finding["check"] == "hooks.config-parse" and finding["severity"] == "problem"
+        for finding in doc["findings"]
+    )
+    assert any(
+        finding["check"] == "hooks.relay-present"
+        and finding["severity"] == "problem"
+        and str(missing) in finding["message"]
+        for finding in doc["findings"]
+    )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
 @pytest.mark.skipif(
     os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root executes mode-000 files"

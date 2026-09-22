@@ -741,12 +741,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{hook_config} is not valid JSON",
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
-        if hooks_ok:
+        if isinstance(parsed, dict):
             registered_relay_paths.update(
                 install.registered_relay_paths(
                     parsed, profile.hooks.dialect, profile.hooks.events, project
                 )
             )
+        if hooks_ok:
             report.ok(
                 "hooks.registered",
                 f"bmad-loop hooks registered for {profile.name}",
