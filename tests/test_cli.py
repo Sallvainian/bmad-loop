@@ -47,7 +47,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import cli, deferredwork, envvars, platform_util
+from bmad_loop import bmadconfig, cli, deferredwork, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
@@ -1698,6 +1698,225 @@ def test_status_stories_mode_bad_manifest_is_soft(project, capsys):
     _make_stories_run(project)
     assert cli.main(["status", "--project", str(project.project)]) == 0
     assert "no stories.yaml found" in capsys.readouterr().out
+
+
+# ------------------------------------------- status: a sweep's effective options
+
+# `sweep.json` holds a sweep run's nullable launch overrides; `policy_snapshot`
+# holds `[sweep]` from policy.toml. The engine enforces `override ?? snapshot`, so
+# the snapshot alone misreports an overridden cap (#815). These rows compose the
+# run through the same `runsetup.compose_sweep` `cmd_sweep` uses.
+
+SWEEP_STATUS_POLICY = "[sweep]\nmax_bundles = 5\nrepeat = true\nmax_cycles = 3\n"
+
+
+class _ComposedSweepEngine:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _compose_sweep_run(project, policy_text=SWEEP_STATUS_POLICY, **overrides):
+    """A sweep run composed from the sandbox's real policy.toml. The pid file
+    `compose_sweep` publishes names this test process, so it is removed: the run
+    reads as interrupted, which is what `status` and `resume` expect of it."""
+    _write_policy(project.project, policy_text)
+    options = {"max_bundles": None, "repeat": None, "max_cycles": None} | overrides
+    composed = runsetup.compose_sweep(
+        project=project.project,
+        paths=bmadconfig.ProjectPaths(
+            project=project.project,
+            implementation_artifacts=project.project / "impl",
+            planning_artifacts=project.project / "plan",
+        ),
+        policy=policy_mod.load(cli._policy_path(project.project)),
+        run_id="20260101-000000-sw01",
+        prompting=False,
+        decisions_only=False,
+        trigger="cli",
+        make_adapters=lambda *a, **k: {role: None for role in runsetup.ROLES},
+        sweep_engine_cls=_ComposedSweepEngine,
+        trusted_config_digest="deadbeef",
+        **options,
+    )
+    (composed.run_dir / runs.PID_FILE).unlink()
+    return composed.run_dir
+
+
+def _status_sweep_options(project, capsys) -> str:
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out, err = capsys.readouterr()
+    assert "Traceback" not in out + err
+    (line,) = [ln for ln in out.splitlines() if ln.startswith("sweep options:")]
+    return line
+
+
+def test_status_sweep_shows_an_override_as_effective(project, capsys):
+    _compose_sweep_run(project, max_bundles=15)
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 15 (override; policy 5)" in line
+
+
+def test_status_sweep_omitted_override_shows_the_snapshot_value(project, capsys):
+    _compose_sweep_run(project, max_bundles=15)
+    line = _status_sweep_options(project, capsys)
+    assert "repeat true (policy)" in line
+    assert "max_cycles 3 (policy)" in line
+
+
+def test_status_sweep_explicit_false_override_is_an_override(project, capsys):
+    """ABLATION: resolve the override by truthiness and this fails — `repeat=False`
+    against policy `repeat = true` would read as the policy's `true`."""
+    _compose_sweep_run(project, repeat=False, max_cycles=0)
+    line = _status_sweep_options(project, capsys)
+    assert "repeat false (override; policy true)" in line
+    assert "max_cycles 0 (override; policy 3)" in line
+
+
+def test_status_sweep_reads_the_snapshot_not_live_policy(project, capsys):
+    """The engine loaded policy once, at launch; a later policy.toml edit does not
+    reach it, so it must not reach status either.
+
+    ABLATION: resolve against live policy.toml instead of `policy_snapshot` and
+    this fails on the edited `9`."""
+    _compose_sweep_run(project)
+    _write_policy(project.project, "[sweep]\nmax_bundles = 9\nrepeat = false\nmax_cycles = 3\n")
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 5 (policy)" in line
+    assert "repeat true (policy)" in line
+
+
+def test_status_sweep_after_resume_reports_the_restamped_policy(project, monkeypatch, capsys):
+    """Resume reloads policy.toml, hands it to the rebuilt SweepEngine and re-stamps
+    `policy_snapshot` to match (#189) — while `sweep.json` is left byte-identical,
+    so the launch override survives and its digest still binds."""
+    from conftest import install_base_skills
+
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {})
+    run_dir = _compose_sweep_run(project, max_bundles=15)
+    state = load_state(run_dir)
+    state.paused_reason, state.paused_stage = "escalation", "escalation"
+    save_state(run_dir, state)
+    _write_policy(project.project, "[sweep]\nmax_bundles = 6\nrepeat = true\nmax_cycles = 4\n")
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    capsys.readouterr()
+
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 15 (override; policy 6)" in line
+    assert "max_cycles 4 (policy)" in line
+
+
+def test_status_sweep_shows_the_selector(project, capsys):
+    _compose_sweep_run(project, only_ids=("DW-3", "DW-1"))
+    assert _status_sweep_options(project, capsys).endswith(", only DW-3,DW-1")
+
+
+def test_status_sweep_shows_the_severity_selector(project, capsys):
+    _compose_sweep_run(project, min_severity="high")
+    assert _status_sweep_options(project, capsys).endswith(", min_severity high")
+
+
+def _mark_legacy(run_dir) -> None:
+    from bmad_loop.journal import load_state, save_state
+
+    state = load_state(run_dir)
+    state.sweep_options_version, state.sweep_options_digest = 0, ""
+    save_state(run_dir, state)
+
+
+def test_status_sweep_legacy_run_reports_its_recorded_options(project, capsys):
+    """A pre-marker run resumes on its sweep.json limits but never its selectors
+    (`load_sweep_resume_options(required=False)`), so status reports the same."""
+    run_dir = _compose_sweep_run(project, max_bundles=15, only_ids=("DW-1",))
+    _mark_legacy(run_dir)
+    line = _status_sweep_options(project, capsys)
+    assert "max_bundles 15 (override; policy 5)" in line
+    assert "only" not in line
+    assert line.endswith("[legacy options format]")
+
+
+def test_status_sweep_legacy_run_without_options_says_so(project, capsys):
+    run_dir = _compose_sweep_run(project, max_bundles=15)
+    _mark_legacy(run_dir)
+    (run_dir / "sweep.json").unlink()
+    line = _status_sweep_options(project, capsys)
+    assert line == "sweep options: unknown — legacy run with no readable sweep.json"
+
+
+@pytest.mark.parametrize("fault", ["corrupt", "digest-mismatch", "missing"])
+def test_status_sweep_unverifiable_options_degrade(project, capsys, fault):
+    """Status observes; resume would refuse this run, status reports why and still
+    exits 0 — and prints no policy value, which would read as the enforced one."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _compose_sweep_run(project, max_bundles=15)
+    options = run_dir / "sweep.json"
+    if fault == "corrupt":
+        options.write_bytes(b"{not json")
+        # Re-bind the digest so the parse, not the binding, is what refuses.
+        state = load_state(run_dir)
+        state.sweep_options_digest = hashlib.sha256(options.read_bytes()).hexdigest()
+        save_state(run_dir, state)
+        reason = "not valid JSON"
+    elif fault == "digest-mismatch":
+        # The widening swap the digest exists to catch: valid, but not launch's.
+        options.write_text(json.dumps({"only": None, "min_severity": None}), encoding="utf-8")
+        reason = "no longer matches the options bound at launch"
+    else:
+        options.unlink()
+        reason = "sweep.json is missing"
+
+    line = _status_sweep_options(project, capsys)
+    assert line.startswith("sweep options: unverifiable — ")
+    assert reason in line
+    assert "policy" not in line
+
+
+def test_status_json_for_a_sweep_run_is_unchanged(project, capsys):
+    """#815 is text-only: `status --json` stays the pure `status_document` projection
+    of state.json, with its keys exactly as before — no sweep-options key."""
+    from bmad_loop.documents import status_document
+    from bmad_loop.journal import load_state
+
+    run_dir = _compose_sweep_run(project, max_bundles=15, only_ids=("DW-1",))
+    assert cli.main(["status", "--json", "--project", str(project.project)]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document == status_document(load_state(run_dir))
+    assert set(document) == {
+        "schema_version",
+        "run_id",
+        "run_type",
+        "source",
+        "started_at",
+        "status",
+        "finished",
+        "stopped",
+        "graceful_stop_pending",
+        "crashed",
+        "crash_error",
+        "paused_stage",
+        "paused_reason",
+        "paused_story_key",
+        "cache_read_weight",
+        "tokens",
+        "adapters",
+        "sweeps_refused",
+        "tasks",
+    }
+
+
+def test_status_story_run_prints_no_sweep_options(project, capsys):
+    _make_run_with_tokens(project, {}, weight=0.1)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "sweep options" not in capsys.readouterr().out
 
 
 def test_emit_document_verifies_without_altering_the_bytes(capsys):

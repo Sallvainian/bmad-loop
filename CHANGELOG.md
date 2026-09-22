@@ -61,6 +61,10 @@ breaking changes may land in a minor release.
   triage universe, so a `--only` or `--min-severity` triage no longer lists every open
   entry and burns a retry (#824).
 
+- Show a sweep run's effective `max_bundles`, `repeat` and `max_cycles` in text `status`,
+  labelled launch override or policy snapshot, plus its selector; unreadable or
+  tampered `sweep.json` reports `unverifiable` (#815).
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`

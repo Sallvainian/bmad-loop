@@ -18,7 +18,7 @@ import stat
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, NoReturn, assert_never
+from typing import Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
 
 from . import deferredwork, gates, verify
 from .engine import (
@@ -1300,6 +1300,22 @@ def _rearm_generation(task: StoryTask) -> None:
     task.generation += 1
 
 
+# The launch overrides a sweep run resolves against `[sweep]` policy. `sweep.json`
+# persists each as nullable (None = "not given"); `SweepEngine.__init__` and
+# `bmad-loop status` both resolve through `resolve_sweep_override`.
+SWEEP_OVERRIDE_KEYS = ("max_bundles", "repeat", "max_cycles")
+
+_T = TypeVar("_T")
+
+
+def resolve_sweep_override(override: _T | None, policy_value: _T) -> _T:
+    """The value a sweep run enforces for one of `SWEEP_OVERRIDE_KEYS`: its own
+    override when one was given, else the policy's. Tested with `is not None`,
+    never truthiness — an explicit `repeat=False` or `max_bundles=0` is an
+    override, not an absence."""
+    return override if override is not None else policy_value
+
+
 class SweepEngine(Engine):
     """Engine variant whose loop processes the deferred-work ledger instead
     of sprint-status. Bundles reuse the inherited story pipeline through the
@@ -1329,9 +1345,9 @@ class SweepEngine(Engine):
         self.adapters["triage"].journal = self.journal
         self.prompting = prompting
         self.decisions_only = decisions_only
-        self.max_bundles = max_bundles if max_bundles is not None else self.policy.sweep.max_bundles
-        self.repeat = repeat if repeat is not None else self.policy.sweep.repeat
-        self.max_cycles = max_cycles if max_cycles is not None else self.policy.sweep.max_cycles
+        self.max_bundles = resolve_sweep_override(max_bundles, self.policy.sweep.max_bundles)
+        self.repeat = resolve_sweep_override(repeat, self.policy.sweep.repeat)
+        self.max_cycles = resolve_sweep_override(max_cycles, self.policy.sweep.max_cycles)
         self.only_ids = only_ids
         self.min_severity = min_severity
         self._selection_started = self.state.sweep_cycle > 1 or any(

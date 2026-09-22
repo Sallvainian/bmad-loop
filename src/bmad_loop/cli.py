@@ -98,9 +98,11 @@ from .stories_engine import StoriesEngine
 from .sweep import (
     DW_ID_RE,
     SEVERITY_ORDER,
+    SWEEP_OVERRIDE_KEYS,
     SweepEngine,
     decimal_digits_key,
     increment_decimal_digits,
+    resolve_sweep_override,
     select_entries,
 )
 
@@ -4375,6 +4377,57 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sweep_options_line(run_dir: Path, state: RunState) -> str:
+    """The text-status line naming a sweep run's effective options (#815).
+
+    `policy_snapshot` alone reads as the enforced cap, but a launch override in
+    `sweep.json` wins over it (`resolve_sweep_override`, as `SweepEngine.__init__`
+    applies it). The policy half comes from the run's snapshot, never live
+    policy.toml: the engine loads policy once, and resume re-stamps the snapshot
+    to the policy it reloads. `sweep.json` is read the way resume reads it —
+    bounded, version-checked and digest-bound — but status only observes, so a
+    refusal degrades to "unverifiable" rather than failing the command."""
+    version = state.sweep_options_version
+    try:
+        runsetup.validate_sweep_options_version(version)
+        current = version == runsetup.SWEEP_OPTIONS_VERSION
+        options = runsetup.load_sweep_resume_options(
+            run_dir,
+            required=version >= runsetup.SWEEP_OPTIONS_VERSION,
+            expected_digest=state.sweep_options_digest if current else None,
+        )
+        runsetup.validate_sweep_options_binding(version, state.sweep_options_digest, options)
+    except runsetup.SweepOptionsError as exc:
+        return f"sweep options: unverifiable — {exc}"
+    if options.digest is None:
+        # The legacy loader's tolerant empty shape: no readable sweep.json, so the
+        # launch overrides were never recorded (resume would run on policy alone).
+        return "sweep options: unknown — legacy run with no readable sweep.json"
+    raw_policy = state.policy_snapshot.get("sweep")
+    snapshot: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+    parts: list[str] = []
+    for key in SWEEP_OVERRIDE_KEYS:
+        override = options.values.get(key)
+        from_policy = snapshot.get(key)
+        if override is None and from_policy is None:
+            parts.append(f"{key} unknown (no override; not in the policy snapshot)")
+            continue
+        value = json.dumps(resolve_sweep_override(override, from_policy))
+        if override is None:
+            source = "policy"
+        elif from_policy is None:
+            source = "override"
+        else:
+            source = f"override; policy {json.dumps(from_policy)}"
+        parts.append(f"{key} {value} ({source})")
+    if options.only_ids is not None:
+        parts.append(f"only {','.join(options.only_ids)}")
+    if options.min_severity is not None:
+        parts.append(f"min_severity {options.min_severity}")
+    legacy = " [legacy options format]" if version == 0 else ""
+    return f"sweep options: {', '.join(parts)}{legacy}"
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project = _project(args)
     if args.run_id:
@@ -4414,6 +4467,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    if state.run_type == "sweep":
+        print(_sweep_options_line(run_dir, state))
     if state.sweeps_refused:
         detail = ", ".join(f"{trigger} ({why})" for trigger, why in state.sweeps_refused.items())
         print(f"auto-sweep not run: {detail} — deferred work is untouched")
