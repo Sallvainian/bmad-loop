@@ -26,6 +26,9 @@ breaking changes may land in a minor release.
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
   managed registrations. `validate` warns when a hook still points to another installation.
+- Name an earlier attempt's parked work in the retry dev prompt (sprint, stories, sweep)
+  once Git confirms the ref still resolves on this task's baseline and a dev session
+  produced it; commits-only preservation is labelled, and nothing is replayed (#777).
 - Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
 
 ### Fixed

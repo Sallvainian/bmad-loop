@@ -2958,6 +2958,10 @@ class SweepEngine(Engine):
           no-op once set, so a survivor would also refuse the replacement bundle's
           own spec on escalation.
         - ``restore_patch`` -- the diff of the superseded bundle's attempt.
+        - ``preserve_from_attempt`` -- the claim that ``preserve_ref`` holds THIS
+          task's attempt. The ref itself stays (below); the flag goes so the retry
+          dev prompt does not offer the superseded bundle's work as this one's
+          (#777). Git cannot tell the two apart: same run, key and baseline.
         - ``attempt`` + ``review_cycle`` + ``followup_reviews_spent`` -- reset the
           retry and review counters; clear the associated ``defer_reason`` and
           advance ``generation`` for fresh session ids. These operations follow
@@ -2992,7 +2996,7 @@ class SweepEngine(Engine):
           reset that got us here.
         - ``preserve_ref`` / ``preserve_partial`` -- a ref to a rolled-back
           worktree that still exists on disk; clearing the name would orphan it
-          rather than release it.
+          rather than release it. Its provenance flag is cleared instead (above).
         - the ``baseline_*`` pair and ``worktree_path`` / ``branch`` -- mount and
           rollback anchors owned by the reset, not by either bundle.
         - ``dispatched_spec_file`` / ``dispatched_spec_snapshot`` -- ``Sweep``
@@ -3035,6 +3039,7 @@ class SweepEngine(Engine):
         task.artifact_publication_complete = False
         task.spec_file = None
         task.restore_patch = None
+        task.preserve_from_attempt = False
         task.attempt = 0
         task.review_cycle = 0
         task.followup_reviews_spent = 0
@@ -7426,12 +7431,15 @@ class SweepEngine(Engine):
                     f"Do NOT edit the deferred-work ledger; the orchestrator records "
                     f"resolution.{artifact_only_guidance}"
                 )
+            # A retry after a rolled-back attempt names its verified parked work
+            # (#777); a superseded bundle's ref is suppressed by the shared builder.
+            preserved = self._retry_preserve_notice(task)
             return (
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
                 f"orchestrator records resolution.{artifact_only_guidance}"
-            )
+            ) + (f"\n\n{preserved}" if preserved else "")
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
         return (

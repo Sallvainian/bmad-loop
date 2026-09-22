@@ -9324,6 +9324,59 @@ def test_rollback_preserves_uncommitted_attempt_worktree(project):
     assert git(repo, "show", f"{ref}:new_test.txt") == "uncommitted new file"
 
 
+def _dirty_timeout_effect(paths, text: str):
+    """A dev session that times out mid-work, leaving an uncommitted edit that
+    the non-fixable retry's rollback parks under a worktree snapshot."""
+
+    def effect(spec):
+        (paths.project / "src.txt").write_text(text)
+        return SessionResult(status="timeout")
+
+    return effect
+
+
+def test_retry_dev_prompt_names_the_earlier_attempts_parked_work(project):
+    """#777: attempt 1 times out with work on the tree; the retry rolls it back
+    and parks it. Attempt 2's prompt names that verified snapshot — and only
+    attempt 2's: the first dispatch has nothing earlier to point at."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            _dirty_timeout_effect(project, "half-built attempt 1\n"),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+    )
+
+    assert engine.run().done == 1
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    ref = entry["ref"]
+    first, second = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    assert "earlier attempt" not in first
+    base = engine.state.tasks["1-1-a"].baseline_commit
+    assert (
+        "\n\nAn earlier attempt at this work was rolled back; its work is preserved at " in second
+    )
+    assert f"`git diff {base} {ref}`" in second
+    assert "every gate must pass fresh on this attempt" in second
+    assert "half-built attempt 1" in git(project.project, "show", f"{ref}:src.txt")
+
+
+def test_retry_dev_prompt_has_no_preserve_paragraph_when_nothing_was_parked(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout"), dev_effect(project, "1-1-a", followup_review=False)],
+    )
+
+    assert engine.run().done == 1
+
+    assert engine.state.tasks["1-1-a"].preserve_ref is None
+    second = [s.prompt for s in adapter.sessions if s.role == "dev"][1]
+    assert "earlier attempt" not in second
+
+
 def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(project):
     """Two dirty rollbacks against the SAME baseline_commit (mimicking the dev retry
     loop, where baseline_commit is fixed) must each park their uncommitted work under

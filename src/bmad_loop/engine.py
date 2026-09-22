@@ -868,7 +868,8 @@ class Engine:
         # active workspace; `escalate` routes an intent-gap restore failure through
         # the engine's escalation; `escalation_pause` raises RunPaused for it
         # (injected so recovery_flow need not import engine — that would reintroduce
-        # a runtime<->engine cycle).
+        # a runtime<->engine cycle); `dev_attempt_recorded` is the preserve-ref
+        # provenance probe (#777).
         self._recovery_flow = RecoveryFlow(
             paths=self.paths,
             policy=self.policy,
@@ -880,6 +881,7 @@ class Engine:
             save=self._save,
             escalate=self._escalate,
             escalation_pause=self._escalation_pause,
+            dev_attempt_recorded=lambda task: self._current_dev_session_index(task) is not None,
         )
 
     def _escalation_pause(
@@ -1547,6 +1549,9 @@ class Engine:
 
     def _protected_relpaths(self) -> tuple[str, ...]:
         return self._recovery_flow.protected_relpaths()
+
+    def _retry_preserve_notice(self, task: StoryTask) -> str:
+        return self._recovery_flow.retry_preserve_notice(task)
 
     def _rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
         self._recovery_flow.rollback_or_pause(task, cause=cause)
@@ -7084,6 +7089,13 @@ class Engine:
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
                 ) + after_sentence
+            # The two fresh-baseline legs below may follow a rolled-back attempt:
+            # point at its parked work in a paragraph of its own (#777). It sits
+            # after the park clause, which stays last on the invocation line; these
+            # legs carry no feedback-file pointer for its backticks to be read as.
+            preserved = self._retry_preserve_notice(task)
+            after_sentence += f"\n\n{preserved}" if preserved else ""
+            after_key += f"\n\n{preserved}" if preserved else ""
             # The attempt binding was resolved in the active workspace immediately
             # before DEV_RUNNING became durable. A retained `spec_file` alone may
             # name a discarded unit worktree, so it cannot authorize this route or

@@ -50,13 +50,14 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import RunPaused
+from bmad_loop.engine import RunPaused, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_STORY_GATE,
     Phase,
     RunState,
+    SessionRecord,
     StoryTask,
     TokenUsage,
     VerifyOutcome,
@@ -25953,6 +25954,50 @@ def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
     prompt = engine._generic_bundle_prompt(task, None)
     assert task.bundle_file is not None and task.bundle_file in prompt
     assert "spec-superseded-dw-1.md" not in prompt
+
+
+@pytest.mark.parametrize("adopted", [["DW-1"], ["DW-2"]], ids=["same-bundle", "replacement"])
+def test_bundle_retry_prompt_never_offers_a_superseded_bundles_parked_work(
+    project, monkeypatch, adopted
+):
+    """#777: a bundle retry names the earlier attempt's verified parked work. A
+    divergent adoption keeps the superseded bundle's ref (it is still that work's
+    only copy) on the same key and baseline, so git cannot tell the bundles apart —
+    the reset's provenance clear is what stops the replacement's prompt claiming it.
+    The same bundle re-dispatched keeps its pointer.
+
+    Ablation: delete `task.preserve_from_attempt = False` from
+    `_reset_superseded_bundle_state` and the replacement case reddens."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    repo = project.project
+    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.DEV_RUNNING)
+    task.baseline_commit = verify.rev_parse_head(repo)
+    task.baseline_untracked = []
+    task.attempt = 1
+    task.record_session(
+        SessionRecord(
+            task_id=_session_task_id(task.story_key, "dev", task.attempt, task.generation),
+            role="dev",
+            status="timeout",
+        )
+    )
+    (repo / "src.txt").write_text("bundle DW-1 attempt\n")
+    engine._rollback_or_pause(task)
+    ref = task.preserve_ref
+    assert ref and ref.startswith("refs/attempt-preserve-dirty/")
+    assert f"preserved at `{ref}`" in engine._generic_bundle_prompt(task, None)
+    _stub_run_story(engine, monkeypatch)
+
+    engine._run_bundle(Bundle(name="fix", dw_ids=tuple(adopted), intent="next"), 1)
+
+    prompt = engine._generic_bundle_prompt(task, None)
+    assert task.preserve_ref == ref  # the ref itself is never cleared...
+    assert verify.ref_exists(repo, ref)  # ...nor deleted
+    if adopted == ["DW-1"]:
+        assert f"preserved at `{ref}`" in prompt
+    else:
+        assert "earlier attempt" not in prompt and ref not in prompt
 
 
 @pytest.mark.parametrize(
