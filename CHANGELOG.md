@@ -54,6 +54,9 @@ breaking changes may land in a minor release.
 - Refuse `init` when `.bmad-loop`, its `policy.toml` or `.gitignore` resolves outside the
   project, before any setup write (#771).
 
+- Parse plugin manifests in `validate` (`plugins.manifests`) without importing
+  plugin code; a malformed `plugin.toml` fails validate instead of engine start (#765).
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`

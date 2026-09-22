@@ -77,6 +77,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "host.process",
         "host.win32-on-wsl-path",
         "notify.desktop-unavailable",
+        "plugins.manifests",
         "skills.base",
         "skills.base-missing",
         "skills.base-incomplete",

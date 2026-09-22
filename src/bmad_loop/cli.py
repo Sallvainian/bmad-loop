@@ -490,6 +490,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"repo_root": str(paths.repo_root), "project": str(paths.project)},
             )
 
+    _validate_plugin_manifests(project, report)
+
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
     # in profiles]`: that carries triage's tree, and every skills check below asks a
@@ -1515,6 +1517,45 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
     except (OSError, UnicodeDecodeError):
         return (), None
     return deferredwork.parse_declaration(raw)
+
+
+def _validate_plugin_manifests(project: Path, report: ValidationReport) -> None:
+    """Parse every discovered plugin manifest the way a run will (#765).
+
+    Without this the first reader of a malformed project `plugin.toml` was
+    `PluginRegistry.build` inside `Engine.__init__` — after the run's directory,
+    state and journal were already published. `load_plugins` is manifest-only
+    discovery: it never imports a `[python]` module, which matters here because
+    validate is the command a user runs to decide whether a checkout is safe to
+    run at all. `PluginRegistry.build` would exec every allowlisted module.
+
+    A PluginError is the whole message: every manifest fault names its source
+    (the manifest path, for a project plugin). `load_plugins` stops at the first
+    bad manifest, so one fault is reported per pass. A third-party manifest on an
+    unsupported api_version is skipped with `warnings.warn`, which a run keeps;
+    here it is captured and reported as a warning finding instead, so it neither
+    leaks to stderr nor breaks the `--json` stream contract.
+    """
+    import warnings
+
+    from .plugins import PluginError, load_plugins
+
+    with warnings.catch_warnings(record=True) as skipped:
+        warnings.simplefilter("always")  # the once-per-location default would drop a repeat
+        try:
+            manifests = load_plugins(project)
+        except PluginError as e:
+            manifests = None
+            report.fail("plugins.manifests", str(e))
+    for w in skipped:
+        report.warn("plugins.manifests", f"{w.message} — skipped; a run will not load it")
+    if manifests is not None:
+        names = sorted(manifests)
+        report.ok(
+            "plugins.manifests",
+            f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
+            {"plugins": names},
+        )
 
 
 def _validate_operator_registry(

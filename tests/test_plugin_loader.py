@@ -233,6 +233,23 @@ def test_invalid_toml_rejected(tmp_path):
         load_plugins(tmp_path)
 
 
+def test_load_plugins_never_imports_a_python_module(tmp_path):
+    """Manifest discovery reads `[python]` as data and nothing more — the property
+    `validate`'s plugin-manifest check (#765) rests on. Import happens only in
+    `PluginRegistry.build`, behind the trust gate."""
+    marker = tmp_path / "IMPORTED"
+    write_plugin(
+        tmp_path,
+        "evil",
+        '[plugin]\nname = "evil"\napi_version = 1\n[python]\nmodule = "hooks.py"\nclass = "P"\n',
+        files={"hooks.py": f"from pathlib import Path\nPath({str(marker)!r}).write_text('yes')\n"},
+    )
+
+    plugins = load_plugins(tmp_path)
+    assert plugins["evil"].python is not None
+    assert not marker.exists()
+
+
 # The one substring every #480 refusal shares, across all seven guarded config
 # sites — a single matcher for the whole family.
 _WIN32_ALIAS_MATCH = "must not name a Windows device or end a component in a period or space"

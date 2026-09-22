@@ -10621,6 +10621,144 @@ def test_validate_without_a_json_attribute_still_renders_text(project, capsys):
     assert not out.lstrip().startswith("{")
 
 
+# ----------------------- #765: plugin manifests ------------------------------
+
+
+def _validate_with_plugin(project, monkeypatch, capsys, name, manifest, *, files=None, policy=None):
+    """A passing project plus one committed project-local plugin, so any verdict
+    change is the plugin's alone. Committed because an untracked plugin dir would
+    fail `git.worktree-clean` and make every rc assertion here meaningless."""
+    _make_validate_pass(project, monkeypatch, capsys, **({"policy": policy} if policy else {}))
+    pdir = project.project / ".bmad-loop" / "plugins" / name
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(manifest)
+    for rel, text in (files or {}).items():
+        (pdir / rel).write_text(text)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", f"plugin {name}")
+    return pdir / "plugin.toml"
+
+
+def _plugin_findings(doc):
+    return [f for f in doc["findings"] if f["check"] == "plugins.manifests"]
+
+
+def test_plugin_manifest_check_is_registered():
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    assert "plugins.manifests" in VALIDATE_CHECKS
+
+
+def test_validate_fails_a_malformed_toml_plugin_manifest(project, capsys, monkeypatch):
+    """#765: before this, the first reader of a broken project `plugin.toml` was
+    `PluginRegistry.build` in `Engine.__init__`, after the run was published. The
+    pass fixture makes the plugin the ONLY problem, so rc 1 is its verdict alone."""
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "broken", "[plugin]\nname = \n")
+
+    rc = cli.main(["validate", "--project", str(project.project)])
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert f"FAIL: plugin {toml}: invalid TOML" in err  # names the manifest path
+    assert "plugin manifests ok" not in out.lower()
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ("[other]\nx = 1\n", "missing [plugin] table"),
+        ('[plugin]\nname = "bad"\napi_version = "x"\n', "api_version must be an integer"),
+    ],
+    ids=["missing-plugin-table", "invalid-field"],
+)
+def test_validate_json_reports_an_invalid_plugin_manifest(
+    project, capsys, monkeypatch, body, match
+):
+    """The `--json` leg: one whole document at rc 1 with the FAIL inside it, and
+    nothing on stderr (`machine_json` parses ALL of stdout and asserts stderr empty)."""
+    toml = _validate_with_plugin(project, monkeypatch, capsys, "bad", body)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert doc["ok"] is False
+    assert doc["counts"]["problem"] == 1
+    [finding] = _plugin_findings(doc)
+    assert finding["severity"] == "problem"
+    assert str(toml) in finding["message"] and match in finding["message"]
+    # A failed manifest check must not cost the gates after it their findings.
+    checks = {f["check"] for f in doc["findings"]}
+    assert {"git.worktree-clean", "hooks.registered", "skills.base"} <= checks
+
+
+def test_validate_passes_a_valid_project_plugin(project, capsys, monkeypatch):
+    _validate_with_plugin(
+        project, monkeypatch, capsys, "fine", '[plugin]\nname = "fine"\napi_version = 1\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    [finding] = _plugin_findings(doc)
+    assert finding["severity"] == "ok"
+    assert "fine" in finding["detail"]["plugins"]
+
+
+def test_validate_warns_on_an_api_mismatched_plugin_without_leaking_the_warning(
+    project, capsys, monkeypatch
+):
+    """`load_plugins` skips a third-party manifest on an unsupported api_version via
+    `warnings.warn`. Validate reports it as a warning finding instead — rc stays 0 —
+    and the Python warning itself must not reach stderr, in either output mode."""
+    _validate_with_plugin(
+        project, monkeypatch, capsys, "future", '[plugin]\nname = "future"\napi_version = 999\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    warned = [f for f in _plugin_findings(doc) if f["severity"] == "warning"]
+    assert len(warned) == 1
+    assert "'future'" in warned[0]["message"] and "api_version 999" in warned[0]["message"]
+    assert (
+        "future"
+        not in next(f for f in _plugin_findings(doc) if f["severity"] == "ok")["detail"]["plugins"]
+    )
+
+    assert cli.main(["validate", "--project", str(project.project)]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "warning: plugin 'future' declares api_version 999" in out
+
+
+def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypatch, tmp_path):
+    """Validate is the command a user runs to decide whether a checkout is safe to
+    run, so it reads manifests only. The plugin is even allowlisted in `[plugins]
+    enabled`, the one state in which `PluginRegistry.build` WOULD exec it — so a
+    regression to building the registry here writes the marker.
+
+    The marker is the observable, and it is checked before the verdict: an import
+    also drops `__pycache__` into the plugin dir, so the rc would redden too, but
+    on `git.worktree-clean` — a symptom, not the cause. The `sys.modules` check
+    is a backstop only: the registry execs through `module_from_spec` without
+    registering the module there, so that line alone cannot see a regression."""
+    marker = tmp_path / "IMPORTED"
+    module = (
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('yes')\n"
+        "raise RuntimeError('imported')\n"
+    )
+    _validate_with_plugin(
+        project,
+        monkeypatch,
+        capsys,
+        "evil",
+        '[plugin]\nname = "evil"\napi_version = 1\n[python]\nmodule = "hooks.py"\nclass = "P"\n',
+        files={"hooks.py": module},
+        policy=CLAUDE_ONLY_POLICY + '[plugins]\nenabled = ["evil"]\n',
+    )
+
+    rc = cli.main(["validate", "--project", str(project.project), "--json"])
+    out, err = capsys.readouterr()
+    assert not marker.exists()
+    assert "bmad_loop_plugin_evil" not in sys.modules and "hooks" not in sys.modules
+    assert (rc, err) == (0, "")
+    [finding] = _plugin_findings(json.loads(out))
+    assert "evil" in finding["detail"]["plugins"]
+
+
 def test_validation_report_renders_each_severity_verbatim(capsys):
     """The exact bytes of all three severities.
 
