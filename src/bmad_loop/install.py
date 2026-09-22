@@ -2948,6 +2948,22 @@ def install_into(
         return 1
 
     bmad_loop_dir = project / ".bmad-loop"
+    policy_path = bmad_loop_dir / "policy.toml"
+    gitignore = project / ".gitignore"
+    # 0. confinement, before the FIRST write (#771). `_register_hooks` and
+    # `_copy_skills` guard their own destinations, but these three were written
+    # through whatever link sat at the name — a `.bmad-loop` or `.gitignore`
+    # symlink (a junction on Windows) out of the tree, or a dangling `policy.toml`
+    # link that fails `is_file()` below and is then written through. Checked up
+    # front, not at each write, so a refusal leaves no hook config or skills behind
+    # either. Strictly-below is right for all three: none may BE the project root —
+    # a `.bmad-loop` resolving to the root would drop policy.toml at top level, and
+    # the other two are files, which the root never is. An in-project link still
+    # passes and is written through, as before.
+    for target in (bmad_loop_dir, policy_path, gitignore):
+        if not _confined_to(target, project):
+            print(f"FAIL: init target escapes the project: {target}")
+            return 1
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. per-CLI hook registration
@@ -2967,10 +2983,15 @@ def install_into(
             return 1
 
     # 4. policy template
-    policy_path = bmad_loop_dir / "policy.toml"
     if policy_path.is_file():
         print("  policy exists, leaving untouched")
     else:
+        # write_text, not atomic_write_text: #379 is about a truncating REWRITE of
+        # contents someone owns, and this branch only runs when no regular file is
+        # there — a short write loses nothing but our own template, and the torn
+        # TOML fails loudly at the next policy load. atomic_write_text would also
+        # mint the new file mkstemp's 0600 instead of the umask default, a mode
+        # change nothing asked for.
         policy_path.write_text(POLICY_TEMPLATE, encoding="utf-8")
         print(f"  policy written: {policy_path}")
 
@@ -2979,7 +3000,6 @@ def install_into(
     # Library (.bmad-loop/cache/), and the policy file itself — policy.toml is
     # per-machine-per-repo (it carries this machine's [mux] backend choice, and
     # the TUI settings editor rewrites it), so it must never travel to teammates.
-    gitignore = project / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
     have = set(existing.splitlines())
     to_add = [
@@ -2993,7 +3013,9 @@ def install_into(
         if line not in have
     ]
     if to_add:
-        with gitignore.open("a", encoding="utf-8") as f:
+        # An append, never a replace: it keeps the operator's file mode and an
+        # in-project link a link. Opened by its resolved name, the one step 0 confined.
+        with gitignore.resolve().open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(to_add) + "\n")

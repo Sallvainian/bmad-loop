@@ -51,6 +51,9 @@ breaking changes may land in a minor release.
   orchestrator resolved (`BMAD_LOOP_LEDGER`) rather than re-deriving it from the YAML
   (#154, #769).
 
+- Refuse `init` when `.bmad-loop`, its `policy.toml` or `.gitignore` resolves outside the
+  project, before any setup write (#771).
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
