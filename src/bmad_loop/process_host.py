@@ -67,9 +67,8 @@ class ProcessHost(ABC):
     def hook_interpreter(self) -> str:
         """The command prefix that runs a bmad-loop python hook script on this
         host, interpolated into the hook registrations `install`/`probe` write
-        (the script path + canonical event are appended by the caller). POSIX runs
-        the ``python3`` on PATH; a Windows host overrides it (no ``python3`` there)
-        so hook registration never branches on ``sys.platform`` at the call site."""
+        (the script path + canonical event are appended by the caller). The
+        prefix is an absolute interpreter path, quoted for the host shell."""
 
     def alive_and_ours(self, pid: int, identity: float | None) -> bool:
         """Identity-aware liveness: True only when ``pid`` is alive **and** still the
@@ -184,7 +183,7 @@ class PosixProcessHost(ProcessHost):
         return super().descendants(pid)  # macOS: psutil, guarded by the seam's never-raise
 
     def hook_interpreter(self) -> str:
-        return "python3"
+        return self.shell_quote(str(Path(sys.executable).absolute()))
 
 
 class WindowsProcessHost(ProcessHost):
@@ -221,9 +220,7 @@ class WindowsProcessHost(ProcessHost):
             return None
 
     def hook_interpreter(self) -> str:
-        # Windows ships no `python3` launcher; `uv run --no-project python` resolves
-        # an interpreter without activating a project venv (hooks fire detached).
-        return "uv run --no-project python"
+        return self.shell_quote(str(Path(sys.executable).absolute()))
 
     def shell_quote(self, arg: str) -> str:
         # POSIX single-quoting breaks Windows paths; list2cmdline is the stdlib's

@@ -481,7 +481,7 @@ def _check_hook_trust(
         return
     from .codex_trust import project_hook_trust
 
-    marker = PROBE_HOOK_NAME if live else "bmad_loop_hook.py"
+    marker = PROBE_HOOK_NAME if live else "bmad-loop"
     trust = project_hook_trust(project, profile, binary=binary, marker=marker)
     finding.hook_trust = trust.status
     if trust.status != "trusted":

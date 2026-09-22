@@ -105,8 +105,7 @@ partial — the tail after the last `-` (e.g. `a1b2`), shortened to any prefix t
 > One subcommand is deliberately left out of the table: `bmad-loop relay <Event>` writes a single
 > session event file from a coding-CLI hook payload on stdin. Its own help calls it "a hook target
 > for machines, not a command to run by hand" — it takes no `--project`, and `bmad-loop init`
-> currently registers the copied workspace relay (`.bmad-loop/bmad_loop_hook.py`) instead, so no
-> installed hook reaches the console script today. Never invoke it yourself.
+> registers this installed command with an absolute path. Never invoke it yourself.
 
 ## The TUI
 

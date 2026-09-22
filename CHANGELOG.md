@@ -22,9 +22,15 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Register hooks through the installed `bmad-loop relay <Event>` command. Upgrading
+  invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
+  do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
+  managed registrations. `validate` warns when a hook still points to another installation.
 - Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
 
 ### Fixed
+
+- Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
   before a live probe launches; check both relay events against Codex's read-only

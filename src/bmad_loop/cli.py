@@ -679,7 +679,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"binary": tool, "path": resolved, "returncode": rc},
         )
 
-    any_hooks_registered = False
+    registered_relay_paths: set[Path] = set()
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -714,20 +714,40 @@ def cmd_validate(args: argparse.Namespace) -> int:
             continue
         hook_config = project / profile.hooks.config_path
         hooks_ok = False
+        parsed: dict = {}
         if hook_config.is_file():
             try:
                 parsed = json.loads(hook_config.read_text(encoding="utf-8"))
                 hooks_ok = isinstance(parsed, dict) and relay_registered(
                     parsed, profile.hooks.dialect, profile.hooks.events
                 )
+                if isinstance(parsed, dict):
+                    container = install.hook_event_container(parsed, profile.hooks.dialect)
+                    malformed = [
+                        event
+                        for event in profile.hooks.events
+                        if event in container and not isinstance(container[event], list)
+                    ]
+                    if malformed:
+                        hooks_ok = False
+                        report.fail(
+                            "hooks.config-parse",
+                            f"{hook_config} has malformed handlers for {', '.join(malformed)}",
+                            {"profile": profile.name, "config_path": str(hook_config)},
+                        )
             except json.JSONDecodeError:
                 report.fail(
                     "hooks.config-parse",
                     f"{hook_config} is not valid JSON",
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
+        if isinstance(parsed, dict):
+            registered_relay_paths.update(
+                install.registered_relay_paths(
+                    parsed, profile.hooks.dialect, profile.hooks.events, project
+                )
+            )
         if hooks_ok:
-            any_hooks_registered = True
             report.ok(
                 "hooks.registered",
                 f"bmad-loop hooks registered for {profile.name}",
@@ -784,91 +804,50 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"profile": profile.name, "project": str(project), "binary": profile.binary},
                 )
 
-    # #461: `hooks.registered` above is a substring match on the config JSON — it
-    # never touches the artifact the registered command points AT. A branch switch
-    # (or a deleted .bmad-loop/) leaves the registration green while every hook
-    # event is a silent no-op and the run stalls to session_timeout_min, so stat
-    # the relay itself. Outside the per-profile loop on purpose: the relay is one
-    # shared artifact, and per-profile reporting would print the same line N times.
-    # A distinct id, not a repurposed `hooks.registered` — the two answer different
-    # questions and an operator needs to see which one failed.
-    #
-    # COUPLING (#461 Phase 2): Phase 2 moves the relay to the installed console
-    # script — `bmad-loop relay <Event>` (cmd_relay / events.py), NOT the
-    # `<abs-python> -m bmad_loop.hookrelay` spelling this once anticipated — and
-    # retires HOOK_SCRIPT_REL. It must RETARGET this check to stat what the
-    # registration actually points at (the resolved `bmad-loop` executable), not
-    # drop it — the stall it guards against survives the move: an entry point that
-    # is gone or unreadable strands every hook event exactly like a missing script.
-    if any_hooks_registered:
-        relay = project / install.HOOK_SCRIPT_REL
-        # Existence is not enough: `is_file()` stays True for a mode-000 file, and
-        # the registered command is `<interpreter> <relay> <Event>`, which has to
-        # READ the script — an unreadable relay exits 2 ("can't open file") and the
-        # run stalls exactly as if the relay were gone, which is the blind spot
-        # this whole check exists to remove. `os.access` uses the REAL uid/gid,
-        # which is what the operator's own `bmad-loop` invocation runs as, and it
-        # stays correct under root (who can read a 000 file) where a mode-bit test
-        # would false-fail. On Windows `chmod` can only toggle the read-only flag,
-        # so this arm is POSIX-effective and never makes the Windows path stricter.
+    # Inspect the executable each managed registration actually names. A new
+    # installation in this process cannot repair an older path in a hook config.
+    # Compare with the command init would write now: an old executable can remain
+    # usable after switching installations, while still running an outdated relay.
+    expected_relay = None
+    if registered_relay_paths:
+        hook_profile = next(profile for profile in profiles if not profile.hookless)
+        try:
+            expected_relay = install.relay_executable(
+                install._hook_command(project, hook_profile, "Stop")
+            )
+        except ProfileError:
+            # No current executable to compare. The registered path still gets
+            # its own presence check below; do not call it stale by inference.
+            pass
+    for relay in sorted(registered_relay_paths):
         if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
-                f"hooks are registered but the relay script {relay} is missing — "
-                f"run `bmad-loop init`",
+                f"registered hook executable {relay} is missing — re-run `bmad-loop init`",
                 {"path": str(relay)},
             )
-        elif not os.access(relay, os.R_OK):
-            # Deliberately NOT "run `bmad-loop init`": install_into writes this path
-            # with write_text(), which needs write access to the same file, so init
-            # raises PermissionError instead of repairing it. Sending the operator
-            # to a command that also fails is worse than saying nothing.
+        elif not os.access(
+            relay, os.R_OK if relay.name == "bmad_loop_hook.py" else os.R_OK | os.X_OK
+        ):
             report.fail(
                 "hooks.relay-present",
-                f"hooks are registered but the relay script {relay} is not readable — "
-                f"the registered hook command cannot run it, so every hook event "
-                f"no-ops. Restore read permission (`chmod u+r`) or delete it and "
-                f"re-run `bmad-loop init`",
+                f"registered hook executable {relay} is not usable — repair its permissions or re-run `bmad-loop init`",
                 {"path": str(relay)},
             )
         else:
             report.ok(
                 "hooks.relay-present",
-                f"hook relay script present: {relay}",
+                f"registered hook executable available: {relay}",
                 {"path": str(relay)},
             )
-
-        # #494 Phase 4: present-and-readable is not current. The relay is COPIED
-        # into the project by `init`, so an upgraded orchestrator routinely drives
-        # sessions through a relay written by an older wheel — and the #494 move
-        # is exactly the kind of change that skew hides: a pre-move relay writes
-        # its events to the in-tree `<run-dir>/events` while the operator believes
-        # the channel left the project tree, so a branch switch can still take the
-        # control plane away mid-run.
-        #
-        # A WARNING, never a problem, and validate's exit code must not move:
-        # Phase 3's fallback pair keeps a stale relay FUNCTIONAL (it writes the
-        # legacy directory, which SignalWatcher still polls), so the run completes
-        # — the operator is losing the property, not the loop. `passed` counts
-        # only problems, so `warn` is what says "degraded but working".
-        stale = install.hook_script_current(project)
-        if stale is False:
-            report.warn(
-                "hooks.relay-stale",
-                f"the installed hook relay {relay} differs from this bmad-loop's "
-                f"— it is from another version, or was edited. Events may still be "
-                f"written inside the project tree; run `bmad-loop init` to refresh it",
-                {"path": str(relay)},
-            )
-        elif stale is True:
-            report.ok(
-                "hooks.relay-stale",
-                f"hook relay script up to date: {relay}",
-                {"path": str(relay)},
-            )
-        # `None` (unreadable/undecodable on either side) reports nothing: the
-        # relay-present block above already spoke for the cases an operator can
-        # act on, and "I could not compare" is not a finding about their project.
+            if expected_relay is not None and relay != expected_relay:
+                report.warn(
+                    "hooks.relay-stale",
+                    f"registered hook executable {relay} differs from this "
+                    f"installation's {expected_relay} — re-run `bmad-loop init` "
+                    "to update the hook registration",
+                    {"path": str(relay), "expected_path": str(expected_relay)},
+                )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error
@@ -5312,14 +5291,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_relay(args: argparse.Namespace) -> int:
     """``bmad-loop relay <Event>`` — the hook relay as an installed console script.
 
-    **Nothing points at it yet.** ``init`` still registers the copied workspace
-    relay (``install._hook_command`` emits ``<interpreter> <project>/.bmad-loop/
-    bmad_loop_hook.py <Event>``), so no installed hook reaches this handler today;
-    it is the target #461 Phase 2 retargets those registrations to, and that move
-    carries its own obligation — see the COUPLING note on ``hooks.relay-present``,
-    which must be retargeted rather than dropped in the same change. Said here
-    because a console script that exists and is documented reads as the live path,
-    and an operator debugging a lost Stop needs to know which relay actually ran.
+    ``init`` registers the absolute entry point belonging to this installation.
+    ``hooks.relay-present`` checks the path each registration actually names.
 
     Total by contract, unlike every other handler: a coding CLI runs this INSIDE
     the session whose completion it reports, and several of them surface a
