@@ -34,6 +34,9 @@ breaking changes may land in a minor release.
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed (#783).
 
+- Run a declarative `post_story` hook from the repo root once the unit's worktree
+  is torn down, instead of failing on the removed cwd (#779).
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
