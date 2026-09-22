@@ -360,8 +360,8 @@ what each command touches. Make sure no run is still live (Editor open, session 
 
 ### 2. Remove the orchestrator state
 
-Delete the `.bmad-loop/` directory. This removes the hook relay script
-(`.bmad-loop/bmad_loop_hook.py`), the `policy.toml` template, and all per-run state
+Delete the `.bmad-loop/` directory. This removes the `policy.toml` template,
+legacy relay copies from older installs, and all per-run state
 (`runs/`, `cache/`, `archive/`) in one step:
 
 ```bash
@@ -400,14 +400,18 @@ that also cleans up a pre-0.7.0 install.)
 
 `init` **merged** its Stop-hook registration into each CLI's existing hook config, so these
 files must be **edited, not deleted** (they hold your own settings too). In each config below,
-remove the hook entry whose `command` contains `bmad_loop_hook.py`:
+remove the hook entry whose `command` ends in `bmad-loop relay <Event>` (or
+contains `bmad_loop_hook.py` on older installs):
 
 - **claude** — `.claude/settings.json`
 - **codex** — `.codex/hooks.json`
 - **gemini** — `.gemini/settings.json`
+- **copilot** — `.github/copilot/settings.json`
+- **antigravity** — `.agents/hooks.json` (the `bmad-loop` hook group)
 
-Edit only the registered CLIs. The `bmad_loop_hook.py` substring uniquely identifies the
-entries to strip; leave every other hook in place.
+Edit only the registered CLIs. Match the full relay command and event; leave every
+other hook in place. The installed `bmad-loop` executable is shared with other projects,
+so remove it only when uninstalling the package itself.
 
 ### 5. Drop the gitignore lines
 

@@ -9674,190 +9674,131 @@ def test_validate_stories_mode_reports_missing_manifest(project, capsys):
     assert "sprint status" not in text
 
 
-def test_validate_flags_registered_hooks_with_missing_relay_script(project, capsys):
-    """#461 papercut: `hooks.registered` is a substring match on the hook config —
-    it stays green after the relay script itself is gone (branch switch, deleted
-    `.bmad-loop/`), while every hook event silently no-ops and the run stalls to
-    session_timeout_min. A distinct finding stats the artifact.
+def _validate_json(project_dir, capsys):
+    rc = cli.main(["validate", "--project", str(project_dir), "--json"])
+    out, err = capsys.readouterr()
+    assert err == ""
+    return rc, json.loads(out)
 
-    Ablation guard: deleting the `hooks.relay-present` block in cmd_validate makes
-    this FAIL on the first assertion."""
-    from bmad_loop import install as install_mod
+
+def test_validate_flags_registered_hooks_with_missing_relay_executable(project, capsys):
+    from bmad_loop.install import install_into
 
     install_bmad_config(project)
     _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    args = argparse.Namespace(project=str(project.project), spec=None)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    missing = project.project / "missing" / "bmad-loop"
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{missing} relay Stop"
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
 
-    cli.cmd_validate(args)
-    assert "hook relay script present" in _validate_output(capsys)
+    _rc, doc = _validate_json(project.project, capsys)
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.relay-present"]
+    assert any(
+        f["severity"] == "problem" and str(missing) in f["message"] and "is missing" in f["message"]
+        for f in findings
+    )
+    assert any(f["check"] == "hooks.registered" and f["severity"] == "ok" for f in doc["findings"])
 
-    (project.project / install_mod.HOOK_SCRIPT_REL).unlink()
 
-    cli.cmd_validate(args)
-    text = _validate_output(capsys)
-    # The registration check is untouched — it still reads green, which is exactly
-    # the blind spot the new finding covers.
-    assert "hooks registered" in text
-    assert "relay script" in text and "missing" in text
-    assert "bmad-loop init" in text
+def test_validate_json_reports_null_hook_handlers_without_crashing(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["Stop"] = None
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        finding["check"] == "hooks.config-parse"
+        and finding["severity"] == "problem"
+        and "Stop" in finding["message"]
+        for finding in doc["findings"]
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
 @pytest.mark.skipif(
-    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root reads a 000 file"
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False, reason="root executes mode-000 files"
 )
-def test_validate_flags_registered_hooks_with_an_unreadable_relay_script(project, capsys):
-    """A relay that exists but cannot be READ is the same stall as a missing one:
-    the registered command is `<interpreter> <relay> <Event>`, which exits 2
-    ("can't open file") and never writes the event, so the run waits out
-    session_timeout_min. `Path.is_file()` is True for a mode-000 file, so
-    existence alone left that green — the blind spot this check exists to remove.
-
-    The remediation differs from the missing case and is asserted here: `init`
-    writes the relay with `write_text()`, which needs write access to the same
-    file, so it raises PermissionError rather than repairing it.
-
-    Ablation guard: dropping the `os.access` branch makes this FAIL — validate
-    reports the relay present."""
-    from bmad_loop import install as install_mod
+def test_validate_flags_registered_hooks_with_unusable_relay_executable(project, capsys):
+    from bmad_loop.install import install_into
 
     install_bmad_config(project)
     _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    args = argparse.Namespace(project=str(project.project), spec=None)
-
-    relay = project.project / install_mod.HOOK_SCRIPT_REL
-    cli.cmd_validate(args)
-    assert "hook relay script present" in _validate_output(capsys)
-
-    relay.chmod(0o000)
-    # The premise, asserted rather than assumed: existence still reads True, which
-    # is the whole reason readability needs its own check.
-    assert relay.is_file() and not os.access(relay, os.R_OK)
-
-    cli.cmd_validate(args)
-    text = _validate_output(capsys)
-    assert "hooks registered" in text  # registration is untouched, still green
-    assert "relay script" in text and "not readable" in text
-    # It must NOT tell the operator to run a command that also fails.
-    assert "chmod" in text
-
-    relay.chmod(0o644)  # so the sandbox tears down cleanly
-
-
-def _validate_json(project_dir, capsys):
-    """`validate --json` as (rc, document). Not `machine_json`: that helper takes
-    the expected rc as an input, and these tests are ABOUT the rc — the sandbox's
-    baseline verdict comes from findings that have nothing to do with the relay,
-    so it must be observed, never asserted."""
-    rc = cli.main(["validate", "--project", str(project_dir), "--json"])
-    out, err = capsys.readouterr()
-    assert err == ""  # the machine.py purity contract still holds
-    return rc, json.loads(out)
-
-
-def test_validate_reports_a_fresh_relay_as_up_to_date(project, capsys):
-    """#494 Phase 4: a relay `init` just wrote matches the packaged source.
-
-    Pinned separately from the stale case because the two arms fail for opposite
-    reasons — a comparison wrong in the *other* direction (a raw byte compare
-    against a `write_text`-translated file, which on Windows calls every fresh
-    install stale) reddens here and nowhere else."""
-    install_bmad_config(project)
-    _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    args = argparse.Namespace(project=str(project.project), spec=None)
-
-    cli.cmd_validate(args)
-    text = _validate_output(capsys)
-    assert "hook relay script up to date" in text
-    assert "differs from this bmad-loop" not in text
-
-
-def test_validate_warns_when_the_installed_relay_is_stale(project, capsys):
-    """#494 Phase 4: the relay is COPIED into the project by `init`, so an
-    upgraded orchestrator drives sessions through whatever version the project
-    happens to hold — and a pre-#494 relay still writes its events INSIDE the
-    project tree. `hooks.relay-present` cannot see that: the file is there and
-    readable, so it reads green.
-
-    The verdict must not move — the dual-poll fallback keeps a stale relay
-    working, so this reports a lost property, not a broken run. Asserted as
-    "unchanged from the same project one edit earlier" rather than a literal 0:
-    the sandbox's baseline comes from unrelated findings, and hardcoding it would
-    pin this test to those instead of to the relay.
-
-    Ablation guard: deleting the `hook_script_current` block in cmd_validate (or
-    forcing it to `True`) makes this FAIL on the `hooks.relay-stale` lookup."""
-    from bmad_loop import install as install_mod
-
-    install_bmad_config(project)
-    _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-    capsys.readouterr()  # drop init's chatter; _validate_json parses the WHOLE stream
-
-    baseline_rc, baseline = _validate_json(project.project, capsys)
-
-    relay = project.project / install_mod.HOOK_SCRIPT_REL
-    relay.write_text(
-        relay.read_text(encoding="utf-8") + "\n# an older wheel wrote this\n", encoding="utf-8"
-    )
-    rc, doc = _validate_json(project.project, capsys)
-
-    # The id is the matchable identity (checks.py) — match on it, not the prose.
-    stale = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
-    assert len(stale) == 1
-    assert stale[0]["severity"] == "warning"
-    assert stale[0]["detail"]["path"] == str(relay)
-    assert "bmad-loop init" in stale[0]["message"]
-
-    # The verdict and exit code are untouched by a warning.
-    assert (rc, doc["ok"]) == (baseline_rc, baseline["ok"])
-    # And the two checks it must not be confused with still read exactly as before.
-    by_id = {f["check"]: f["severity"] for f in doc["findings"]}
-    assert by_id["hooks.registered"] == "ok"
-    assert by_id["hooks.relay-present"] == "ok"
-
-
-def test_validate_is_silent_about_relay_staleness_when_hooks_are_unregistered(project, capsys):
-    """The check hangs off `any_hooks_registered`, like `hooks.relay-present`: a
-    project not routing events through any relay is not owed a note about which
-    version of one it holds — it is owed the registration FAIL, and nothing on
-    top of it.
-
-    The relay is left INSTALLED and STALE on purpose. A test that simply skips
-    `init` proves nothing: with no relay on disk the comparison degrades to
-    "unknowable" and emits no finding whether it is gated or not, so the gate
-    could be deleted outright and such a test would stay green (it was, and it
-    did). This shape is the one that separates them.
-
-    Ablation guard: hoisting the `hooks.relay-stale` block out of the
-    `if any_hooks_registered:` block makes this FAIL."""
-    from bmad_loop import install as install_mod
-    from bmad_loop.adapters.profile import load_profiles
-
-    install_bmad_config(project)
-    _write_policy(project.project)
-    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
-
-    # Unregister: keep the relay, drop every registration that points at it.
-    for profile in load_profiles(project.project).values():
-        config = project.project / profile.hooks.config_path
-        if config.is_file():
-            config.write_text("{}\n", encoding="utf-8")
-    relay = project.project / install_mod.HOOK_SCRIPT_REL
-    relay.write_text(relay.read_text(encoding="utf-8") + "\n# stale\n", encoding="utf-8")
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    unusable = project.project / "bmad-loop"
+    unusable.write_text("#!/bin/sh\nexit 0\n")
+    unusable.chmod(0o000)
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{unusable} relay Stop"
+    config.write_text(json.dumps(data))
     capsys.readouterr()
 
     _rc, doc = _validate_json(project.project, capsys)
-    # The premise, asserted rather than assumed — a still-registered project would
-    # make the absence below prove nothing.
     assert any(
-        f["check"] == "hooks.registered" and f["severity"] == "problem" for f in doc["findings"]
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "problem"
+        and str(unusable) in f["message"]
+        for f in doc["findings"]
     )
-    assert relay.is_file()  # and the stale artifact really is still there
+    unusable.chmod(0o644)
+
+
+def test_validate_inspects_old_registered_script_before_migration(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    config.write_text(json.dumps(data))
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    legacy = str(project.project / ".bmad-loop/bmad_loop_hook.py")
+    assert any(
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "problem"
+        and legacy in f["message"]
+        for f in doc["findings"]
+    )
+    legacy_path = Path(legacy)
+    legacy_path.write_text("# readable legacy script\n")
+    _rc, doc = _validate_json(project.project, capsys)
+    assert any(
+        f["check"] == "hooks.relay-present" and f["severity"] == "ok" and legacy in f["message"]
+        for f in doc["findings"]
+    )
+
+
+def test_validate_ignores_unused_legacy_copy(project, capsys):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    legacy = project.project / ".bmad-loop/bmad_loop_hook.py"
+    legacy.write_text("stale")
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
     assert not [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert any(
+        f["check"] == "hooks.relay-present" and f["severity"] == "ok" for f in doc["findings"]
+    )
 
 
 def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):

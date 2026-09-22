@@ -10,7 +10,7 @@ import pytest
 from conftest import install_bmad_config, write_script_launcher
 
 from bmad_loop import cli, codex_trust, probe
-from bmad_loop.adapters.profile import get_profile
+from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import _hook_command, merge_hooks
 
 
@@ -40,6 +40,53 @@ def _rpc(root: Path, data: dict, status: str = "trusted") -> dict:
         for event in ("SessionStart", "Stop")
     ]
     return {"data": [{"cwd": str(root.resolve()), "errors": [], "warnings": [], "hooks": hooks}]}
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "Stop"])
+def test_trust_rejects_old_script_command_for_each_required_event(tmp_path, monkeypatch, event):
+    data = _config(tmp_path)
+    data["hooks"][event][0]["hooks"][0][
+        "command"
+    ] = f"python3 {tmp_path / '.bmad-loop/bmad_loop_hook.py'} {event}"
+    (tmp_path / ".codex/hooks.json").write_text(json.dumps(data))
+    monkeypatch.setattr(
+        codex_trust,
+        "_hooks_list",
+        lambda *_: pytest.fail("an old command must not be queried as current trust"),
+    )
+    result = codex_trust.project_hook_trust(tmp_path, get_profile("codex"))
+    assert result.status == "untrusted" and "relay" in result.reason
+
+
+def test_trust_ignores_unrelated_command_containing_bmad_loop(tmp_path, monkeypatch):
+    data = _config(tmp_path)
+    data["hooks"]["Stop"][0]["hooks"].append(
+        {"type": "command", "command": "echo /tools/bmad-loop/notice"}
+    )
+    (tmp_path / ".codex/hooks.json").write_text(json.dumps(data))
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
+    assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "trusted"
+
+
+def test_trust_rejects_installed_relay_at_wrong_path(tmp_path, monkeypatch):
+    data = _config(tmp_path)
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = "/old/bin/bmad-loop relay Stop"
+    (tmp_path / ".codex/hooks.json").write_text(json.dumps(data))
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: pytest.fail("wrong relay path"))
+    assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
+
+
+def test_trust_degrades_when_installed_relay_disappears(tmp_path, monkeypatch):
+    _config(tmp_path)
+
+    def missing(*_args):
+        raise ProfileError("installed bmad-loop command is unavailable")
+
+    monkeypatch.setattr(codex_trust, "_hook_command", missing)
+    result = codex_trust.project_hook_trust(tmp_path, get_profile("codex"))
+    assert result.status == "unverifiable"
+    assert "installed relay unavailable" in result.reason
 
 
 def test_scripted_app_server_executes_request_sequence_and_reads_environment(tmp_path):
@@ -145,9 +192,9 @@ def test_trust_refuses_relay_for_old_checkout_and_startup_excluding_matcher(tmp_
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
     data["hooks"]["SessionStart"][0].pop("matcher")
-    data["hooks"]["Stop"][0]["hooks"][0]["command"] = _hook_command(
-        tmp_path / "old-checkout", get_profile("codex"), "Stop"
-    )
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = f"python3 {tmp_path / 'old-checkout/.bmad-loop/bmad_loop_hook.py'} Stop"
     (tmp_path / ".codex/hooks.json").write_text(json.dumps(data), encoding="utf-8")
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
@@ -312,6 +359,7 @@ def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, mon
         cli="codex", profile=profile, project=tmp_path, hints=probe.Hints(binary="chosen")
     )
     assert scanned.hook_trust == "untrusted" and calls[-1][:2] == (tmp_path, "chosen")
+    assert calls[-1][2] == "bmad-loop"
 
     class Mux:
         def available(self):

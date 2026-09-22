@@ -17,12 +17,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .adapters.profile import CLIProfile
-from .install import _hook_command
+from .adapters.profile import CLIProfile, ProfileError
+from .install import _hook_command, _relay_command
 from .process_host import ProcessHostError, get_process_host
 
 _EVENTS = {"SessionStart": "sessionStart", "Stop": "stop"}
-_RELAY_MARKER = "bmad_loop_hook.py"
+_RELAY_MARKER = "bmad-loop"
 _PROBE_MARKER = "bmad_loop_probe_hook.py"
 _TIMEOUT_S = 5.0
 _SAFE_BYPASS_ARG = "--dangerously-bypass-approvals-and-sandbox"
@@ -74,7 +74,10 @@ def _commands(
                 if not isinstance(hook, dict):
                     raise ValueError("malformed Codex hook entry")
                 command = hook.get("command")
-                if isinstance(command, str) and marker in command:
+                if not isinstance(command, str):
+                    continue
+                is_relay = _relay_command(command) if marker == _RELAY_MARKER else marker in command
+                if is_relay:
                     # A SessionStart matcher can exclude startup even when
                     # Codex reports the command trusted and enabled. The
                     # installed relay has none; refuse customized matchers.
@@ -200,6 +203,8 @@ def project_hook_trust(
         return TrustResult("unverifiable", "hook trust config is unreadable")
     try:
         commands = _commands(config, profile, project, marker)
+    except ProfileError as e:
+        return TrustResult("unverifiable", f"hook trust installed relay unavailable: {e}")
     except ValueError:
         return TrustResult("unverifiable", "hook trust config has malformed fields")
     if commands is None:

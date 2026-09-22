@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -364,16 +365,20 @@ def test_shell_quote_windows_uses_list2cmdline():
     assert quoted == '"C:\\a b\\c.py"'
 
 
-def test_hook_interpreter_is_python3_on_posix(host):
-    # Hook registrations (install/probe) interpolate this prefix; POSIX keeps the
-    # historical `python3` byte-for-byte so existing configs stay valid.
-    assert PosixProcessHost().hook_interpreter() == "python3"
+def test_hook_interpreter_is_absolute_on_posix(host):
+    import sys
+
+    assert PosixProcessHost().hook_interpreter() == PosixProcessHost().shell_quote(
+        str(Path(sys.executable).absolute())
+    )
 
 
-def test_hook_interpreter_windows_resolves_without_project_venv():
-    # Windows has no `python3` launcher — `uv run` resolves an interpreter, and
-    # `--no-project` keeps it from activating a project venv for a detached hook.
-    assert WindowsProcessHost().hook_interpreter() == "uv run --no-project python"
+def test_hook_interpreter_windows_uses_absolute_path():
+    import sys
+
+    assert WindowsProcessHost().hook_interpreter() == WindowsProcessHost().shell_quote(
+        str(Path(sys.executable).absolute())
+    )
 
 
 def test_hook_interpreter_routed_through_selected_host(monkeypatch):
@@ -381,4 +386,8 @@ def test_hook_interpreter_routed_through_selected_host(monkeypatch):
     # registered hook command with no `sys.platform` branch at the call site.
     monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
     get_process_host.cache_clear()
-    assert get_process_host().hook_interpreter() == "uv run --no-project python"
+    import sys
+
+    assert get_process_host().hook_interpreter() == WindowsProcessHost().shell_quote(
+        str(Path(sys.executable).absolute())
+    )
