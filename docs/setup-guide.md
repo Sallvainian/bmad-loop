@@ -400,8 +400,10 @@ that also cleans up a pre-0.7.0 install.)
 
 `init` **merged** its Stop-hook registration into each CLI's existing hook config, so these
 files must be **edited, not deleted** (they hold your own settings too). In each config below,
-remove the hook entry whose `command` ends in `bmad-loop relay <Event>` (or
-contains `bmad_loop_hook.py` on older installs):
+remove the hook entry whose `command` ends in `bmad-loop relay <Event>` (or, on
+older installs, is a Python or `uv run --no-project python` command whose script
+path ends in `.bmad-loop/bmad_loop_hook.py` and whose event argument matches
+that hook event):
 
 - **claude** — `.claude/settings.json`
 - **codex** — `.codex/hooks.json`
