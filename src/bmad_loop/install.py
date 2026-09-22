@@ -28,7 +28,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
@@ -1022,21 +1022,28 @@ def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> s
 
 
 def relay_executable(command: str) -> Path | None:
-    """Return the absolute executable named by an installed relay registration."""
-    try:
-        parts = shlex.split(command, posix=os.name != "nt")
-    except ValueError:
-        return None
-    if (
-        len(parts) != 3
-        or parts[1] != "relay"
-        or parts[2] not in {"SessionStart", "Stop", "SessionEnd", "Notification", "PreCompact"}
-    ):
-        return None
-    executable = Path(parts[0].strip('"'))
-    if executable.name not in {"bmad-loop", "bmad-loop.exe"} or not executable.is_absolute():
-        return None
-    return executable
+    """Return the executable in an absolute POSIX or Windows relay command.
+
+    A foreign path remains unusable on this host, but must still be recognized
+    as managed so init and worktree provisioning replace its stale hook.
+    """
+    for posix in (os.name != "nt", os.name == "nt"):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if (
+            len(parts) != 3
+            or parts[1] != "relay"
+            or parts[2] not in {"SessionStart", "Stop", "SessionEnd", "Notification", "PreCompact"}
+        ):
+            continue
+        raw = parts[0].strip('"')
+        for flavor in (PurePosixPath, PureWindowsPath):
+            executable = flavor(raw)
+            if executable.name in {"bmad-loop", "bmad-loop.exe"} and executable.is_absolute():
+                return Path(raw)
+    return None
 
 
 def _legacy_relay_script(command: str) -> str | None:

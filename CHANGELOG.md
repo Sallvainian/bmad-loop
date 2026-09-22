@@ -30,6 +30,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Replace stale installed relay hooks when a project moves between Windows and POSIX.
+
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
   before a live probe launches; check both relay events against Codex's read-only
   hook discovery for the operation's directory and executable (#461).

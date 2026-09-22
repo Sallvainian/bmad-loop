@@ -56,6 +56,7 @@ from bmad_loop.install import (
     missing_base_skills,
     missing_stories_support,
     provision_worktree,
+    registered_relay_paths,
     relay_executable,
     renderer_stub_resolved,
     resolve_dev_primitive,
@@ -257,6 +258,72 @@ def test_init_migrates_windows_legacy_relay_on_posix(tmp_path, old_command):
     ]
     assert old_command not in commands
     assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+
+
+@pytest.mark.parametrize(
+    "stale_command",
+    [
+        r"C:\old\bin\bmad-loop.exe relay Stop",
+        "/old/bin/bmad-loop relay Stop",
+        r'"C:\Program Files\bmad-loop\bmad-loop.exe" relay Stop',
+        "'/opt/bmad loop/bin/bmad-loop' relay Stop",
+    ],
+    ids=["windows", "posix", "windows-quoted", "posix-quoted"],
+)
+def test_init_replaces_installed_relay_from_either_os(tmp_path, stale_command):
+    profile = get_profile("claude")
+    config = tmp_path / profile.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": stale_command},
+                                {"type": "command", "command": "make lint"},
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    assert install_into(tmp_path, skills=False) == 0
+    commands = [
+        hook["command"]
+        for group in json.loads(config.read_text())["hooks"]["Stop"]
+        for hook in group["hooks"]
+    ]
+    assert commands.count("make lint") == 1
+    assert stale_command not in commands
+    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+    assert len(commands) == 2
+
+
+@pytest.mark.parametrize(
+    "stale_command,expected_path",
+    [
+        (r"C:\old\bin\bmad-loop.exe relay Stop", r"C:\old\bin\bmad-loop.exe"),
+        ("/old/bin/bmad-loop relay Stop", "/old/bin/bmad-loop"),
+    ],
+    ids=["windows", "posix"],
+)
+def test_registered_relay_paths_reads_installed_relay_from_either_os(
+    tmp_path, stale_command, expected_path
+):
+    config = {
+        "hooks": {
+            "Stop": [
+                {"hooks": [{"type": "command", "command": stale_command}]},
+                {"hooks": [{"type": "command", "command": "make lint"}]},
+            ]
+        }
+    }
+    paths = registered_relay_paths(config, "claude-settings-json", ["Stop"], tmp_path)
+    assert [str(path).replace("\\", "/") for path in paths] == [expected_path.replace("\\", "/")]
 
 
 def test_init_preserves_different_script_with_same_basename(tmp_path):
@@ -796,6 +863,50 @@ def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
     assert "$CLAUDE_PROJECT_DIR" not in cmd
 
 
+@pytest.mark.parametrize(
+    "stale_command",
+    [
+        r"C:\old\bin\bmad-loop.exe relay Stop",
+        "/old/bin/bmad-loop relay Stop",
+    ],
+    ids=["windows", "posix"],
+)
+def test_provision_worktree_replaces_seeded_relay_from_either_os(tmp_path, stale_command):
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    profile = get_profile("claude")
+    config = repo / profile.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": stale_command},
+                                {"type": "command", "command": "make lint"},
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    provision_worktree(wt, [profile], repo, seed_files=[profile.hooks.config_path])
+
+    commands = [
+        hook["command"]
+        for group in json.loads((wt / profile.hooks.config_path).read_text())["hooks"]["Stop"]
+        for hook in group["hooks"]
+    ]
+    assert commands.count("make lint") == 1
+    assert stale_command not in commands
+    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+    assert len(commands) == 2
+
+
 def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project, tmp_path):
     """A project that TRACKS its hook config still gets the relay rewrite — the
     checkout carries the same stale $CLAUDE_PROJECT_DIR command a seeded copy
@@ -969,6 +1080,32 @@ def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
     assert "SessionStart" not in config["hooks"]
     # idempotent: nothing left to remove
     assert strip_relay_hooks(config, "claude-settings-json") is False
+
+
+@pytest.mark.parametrize(
+    "stale_command",
+    [
+        r"C:\old\bin\bmad-loop.exe relay Stop",
+        "/old/bin/bmad-loop relay Stop",
+    ],
+    ids=["windows", "posix"],
+)
+def test_strip_relay_hooks_removes_installed_relay_from_either_os(stale_command):
+    config = {
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": stale_command},
+                        {"type": "command", "command": "make lint"},
+                    ]
+                }
+            ]
+        }
+    }
+
+    assert strip_relay_hooks(config, "claude-settings-json") is True
+    assert config["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": "make lint"}]}]
 
 
 def test_provision_worktree_covers_multiple_profiles(tmp_path):
