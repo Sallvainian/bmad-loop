@@ -29,6 +29,7 @@ from conftest import (
     fault_read_text,
     git,
     ignore_before_commit,
+    install_bmad_central_config,
     install_bmad_config,
     install_build_auto_skill,
     install_dev_base_skills,
@@ -9992,7 +9993,15 @@ def test_validate_stories_folder_known_selector_ok(project):
 CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
-def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
+def _make_validate_pass(
+    project,
+    monkeypatch,
+    capsys,
+    *,
+    policy=CLAUDE_ONLY_POLICY,
+    skills=None,
+    bmad_config=install_bmad_config,
+):
     """Set a project up so every validate gate passes, and pin the gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
     binary is on PATH, whether it actually runs, and whether a multiplexer is
@@ -10010,8 +10019,9 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     tree) while keeping every other gate green — an rc-0 assertion about one check is
     worthless if some unrelated gate is what is actually failing. ``skills`` is called
     with the project root BEFORE the commit, so whatever it lays down is committed and
-    the worktree-clean gate still passes."""
-    install_bmad_config(project)
+    the worktree-clean gate still passes. ``bmad_config`` lays down the BMAD config
+    source — the legacy YAML by default, or the central TOML layout (#769)."""
+    bmad_config(project)
     _write_policy(project.project, policy)
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     if skills is None:
@@ -10123,6 +10133,38 @@ def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project
     finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
     assert finding["severity"] == "problem"
     assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_passes_bmad_config_on_a_toml_only_project(project, capsys, monkeypatch):
+    """#769: a v6.12 install with only the central `_bmad/config.toml` layers (no
+    `_bmad/bmm/config.yaml`) used to FAIL `bmad-config` and block every run."""
+    _make_validate_pass(project, monkeypatch, capsys, bmad_config=install_bmad_central_config)
+    assert not (project.project / "_bmad" / "bmm" / "config.yaml").exists()
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
+    assert finding["severity"] == "ok"
+    expected = project.project.resolve() / "_bmad-output" / "implementation-artifacts"
+    assert finding["detail"]["implementation_artifacts"] == str(expected)
+    assert doc["ok"] is True
+
+
+def test_validate_fails_bmad_config_on_an_ambiguous_toml_key(project, capsys):
+    """The renderer's refusal, surfaced where validate reports config faults: the
+    same short key under two tables is a `bmad-config` problem naming both, not a
+    silent pick of either."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    install_bmad_central_config(project)
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        '[core]\nimplementation_artifacts = "{project-root}/elsewhere"\n', encoding="utf-8"
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
+    assert finding["severity"] == "problem"
+    assert "ambiguous config value `implementation_artifacts`" in finding["message"]
+    assert "modules.bmm.implementation_artifacts" in finding["message"]
+    assert "core.implementation_artifacts" in finding["message"]
 
 
 def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(project, capsys):

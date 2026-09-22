@@ -1247,6 +1247,53 @@ def install_bmad_config(paths: ProjectPaths) -> None:
     cfg.write_text(_ARTIFACT_PATH_KEYS)
 
 
+# The #769 layout: what BMAD-METHOD v6.12.0's installer writes with no legacy
+# `_bmad/bmm/config.yaml` beside it. Derived from the source at tag v6.12.0 —
+# `tools/installer/core/manifest-generator.js` `writeCentralConfig` (team-scope
+# answers to `[core]` / `[modules.<code>]` in config.toml, user-scope ones to
+# config.user.toml, `[agents.<code>]` always team) and `ensureCustomConfigStubs`
+# (comment-only custom layers); keys and `{project-root}/{value}` results from
+# `src/core-skills/module.yaml` and `src/bmm-skills/module.yaml` at their defaults.
+# Not captured from a live `bmad setup` — none can run here.
+CENTRAL_TEAM_CONFIG = """\
+[core]
+project_name = "sandbox"
+document_output_language = "English"
+output_folder = "{project-root}/_bmad-output"
+
+[modules.bmm]
+planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"
+implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"
+project_knowledge = "{project-root}/docs"
+
+[agents.bmad-agent-dev]
+module = "bmm"
+team = "software-development"
+name = "Amelia"
+title = "Senior Software Engineer"
+"""
+CENTRAL_USER_CONFIG = """\
+[core]
+user_name = "BMad"
+communication_language = "English"
+
+[modules.bmm]
+user_skill_level = "intermediate"
+"""
+CENTRAL_CUSTOM_STUB = "# Team / enterprise overrides for _bmad/config.toml.\n"
+CENTRAL_CUSTOM_USER_STUB = "# Personal overrides for _bmad/config.toml.\n"
+
+
+def install_bmad_central_config(paths: ProjectPaths) -> None:
+    """Write the TOML-only four-layer layout (#769) and no `_bmad/bmm/config.yaml`."""
+    bmad = paths.project / "_bmad"
+    (bmad / "custom").mkdir(parents=True, exist_ok=True)
+    (bmad / "config.toml").write_text(CENTRAL_TEAM_CONFIG, encoding="utf-8")
+    (bmad / "config.user.toml").write_text(CENTRAL_USER_CONFIG, encoding="utf-8")
+    (bmad / "custom" / "config.toml").write_text(CENTRAL_CUSTOM_STUB, encoding="utf-8")
+    (bmad / "custom" / "config.user.toml").write_text(CENTRAL_CUSTOM_USER_STUB, encoding="utf-8")
+
+
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:
     """Stub every skill in `catalog` (an install.py {skill: marker_files} map) under
     `skills`. Reading the catalog instead of restating it means a newly required
