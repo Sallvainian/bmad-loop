@@ -135,6 +135,12 @@ def _is_unset(args):
     return any(a.startswith("--unset") for a in args)
 
 
+def _installed_relay_suffix(event: str) -> str:
+    """Expected installed entry point and canonical relay event on this host."""
+    name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
+    return f"{name} relay {event}"
+
+
 def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
     return {
         native: command.format(event=canonical)
@@ -205,7 +211,7 @@ def test_init_migrates_legacy_relay_and_preserves_user_hook(tmp_path):
         for hook in group["hooks"]
     ]
     assert commands.count("make lint") == 1
-    assert sum(command.endswith("bmad-loop relay Stop") for command in commands) == 1
+    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
     assert all("bmad_loop_hook.py" not in command for command in commands)
     assert install_into(tmp_path, skills=False) == 0
     assert config.read_bytes() == migrated
@@ -226,7 +232,7 @@ def test_init_does_not_treat_mention_of_old_script_as_managed(tmp_path):
         for hook in group["hooks"]
     ]
     assert user_command in commands
-    assert any(command.endswith("bmad-loop relay Stop") for command in commands)
+    assert any(command.endswith(_installed_relay_suffix("Stop")) for command in commands)
 
 
 @pytest.mark.parametrize(
@@ -250,7 +256,7 @@ def test_init_migrates_windows_legacy_relay_on_posix(tmp_path, old_command):
         for hook in group["hooks"]
     ]
     assert old_command not in commands
-    assert sum(command.endswith("bmad-loop relay Stop") for command in commands) == 1
+    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
 
 
 def test_init_preserves_different_script_with_same_basename(tmp_path):
@@ -268,7 +274,7 @@ def test_init_preserves_different_script_with_same_basename(tmp_path):
         for hook in group["hooks"]
     ]
     assert user_command in commands
-    assert any(command.endswith("bmad-loop relay Stop") for command in commands)
+    assert any(command.endswith(_installed_relay_suffix("Stop")) for command in commands)
 
 
 @pytest.mark.parametrize("name,container", [("copilot", "hooks"), ("antigravity", "bmad-loop")])
@@ -285,7 +291,7 @@ def test_init_migrates_flat_legacy_hook_and_preserves_user(tmp_path, name, conta
     commands = [item["command"] for item in current]
     assert commands.count("echo mine") == 1
     assert old["command"] not in commands
-    assert sum(command.endswith("bmad-loop relay Stop") for command in commands) == 1
+    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
 
 
 def test_init_removes_stale_relay_beside_current_relay(tmp_path):
@@ -307,7 +313,7 @@ def test_init_removes_stale_relay_beside_current_relay(tmp_path):
         for group in json.loads(config.read_text())["hooks"]["Stop"]
         for hook in group["hooks"]
     ]
-    assert len(commands) == 1 and commands[0].endswith("bmad-loop relay Stop")
+    assert len(commands) == 1 and commands[0].endswith(_installed_relay_suffix("Stop"))
 
 
 def test_init_refuses_missing_installed_command(tmp_path, monkeypatch, capsys):
@@ -521,7 +527,7 @@ def test_install_into_copilot(tmp_path):
     assert set(settings["hooks"]) == {"agentStop", "sessionStart", "sessionEnd"}
     cmd = settings["hooks"]["agentStop"][0]["command"]
     # absolute path baked in (no $CLAUDE_PROJECT_DIR equivalent in copilot)
-    assert "bmad-loop relay Stop" in cmd and str(tmp_path.resolve()) not in cmd
+    assert _installed_relay_suffix("Stop") in cmd and str(tmp_path.resolve()) not in cmd
     # skills land in the shared .agents/skills tree
     for skill in MODULE_SKILLS:
         assert (tmp_path / ".agents" / "skills" / skill / "SKILL.md").is_file()
@@ -577,7 +583,7 @@ def test_fresh_init_registers_installed_command_for_each_dialect(tmp_path, name)
             if profile.hooks.dialect in {"copilot-settings-json", "antigravity-hooks-json"}
             else handlers[0]["hooks"][0]["command"]
         )
-        assert command.endswith(f"bmad-loop relay {canonical}")
+        assert command.endswith(_installed_relay_suffix(canonical))
         executable = relay_executable(command)
         assert executable is not None and executable.is_absolute()
         assert str(tmp_path) not in command
@@ -652,7 +658,7 @@ def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
         assert install_into(tmp_path) == 0
         settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
         cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert cmd.endswith("bmad-loop relay Stop")
+        assert cmd.endswith(_installed_relay_suffix("Stop"))
     finally:
         monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST", raising=False)
         get_process_host.cache_clear()
@@ -665,7 +671,7 @@ def test_install_into_multiple_clis(tmp_path):
     assert set(codex_hooks["hooks"]) == {"SessionStart", "Stop"}
     cmd = codex_hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
     # absolute path (no $CLAUDE_PROJECT_DIR equivalent in codex/gemini)
-    assert "bmad-loop relay Stop" in cmd and str(tmp_path.resolve()) not in cmd
+    assert _installed_relay_suffix("Stop") in cmd and str(tmp_path.resolve()) not in cmd
 
     gemini_settings = json.loads((tmp_path / ".gemini" / "settings.json").read_text())
     assert set(gemini_settings["hooks"]) == {"SessionStart", "AfterAgent", "SessionEnd"}
@@ -736,13 +742,22 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     settings = json.loads((wt / claude.hooks.config_path).read_text())
     assert set(claude.hooks.events) <= set(settings["hooks"])
     cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-    assert cmd.endswith("bmad-loop relay Stop")
+    assert cmd.endswith(_installed_relay_suffix("Stop"))
     assert not (wt / ".bmad-loop").exists()
+    env = {"PATH": "", "BMAD_LOOP_RUN_DIR": str(wt), "BMAD_LOOP_TASK_ID": "t1"}
+    if os.name == "nt":
+        env.update(
+            {
+                key: os.environ[key]
+                for key in ("SystemRoot", "WINDIR", "COMSPEC")
+                if key in os.environ
+            }
+        )
     delivered = subprocess.run(
         cmd,
         shell=True,
         cwd=wt,
-        env={"PATH": "/usr/bin:/bin", "BMAD_LOOP_RUN_DIR": str(wt), "BMAD_LOOP_TASK_ID": "t1"},
+        env=env,
         input=json.dumps({"session_id": "worktree-1"}),
         text=True,
         capture_output=True,
@@ -777,7 +792,7 @@ def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
     stop = json.loads((wt / claude.hooks.config_path).read_text())["hooks"]["Stop"]
     assert len(stop) == 1  # replaced, not appended alongside
     cmd = stop[0]["hooks"][0]["command"]
-    assert cmd.endswith("bmad-loop relay Stop")
+    assert cmd.endswith(_installed_relay_suffix("Stop"))
     assert "$CLAUDE_PROJECT_DIR" not in cmd
 
 
@@ -810,7 +825,7 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     cmd = json.loads((wt / hook_rel).read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
         "command"
     ]
-    assert cmd.endswith("bmad-loop relay Stop")
+    assert cmd.endswith(_installed_relay_suffix("Stop"))
     assert "$CLAUDE_PROJECT_DIR" not in cmd
     git(wt, "add", "-A")
     assert hook_rel not in git(wt, "diff", "--cached", "--name-only").splitlines()
@@ -865,9 +880,10 @@ def test_provision_worktree_shared_config_path_keeps_first_profiles_events(tmp_p
     hooks = json.loads((wt / claude.hooks.config_path).read_text(encoding="utf-8"))["hooks"]
     assert "Stop" in hooks  # claude's completion event survived the alias pass
     assert "Notification" in hooks  # and the alias still merged its own event in
-    relay = "bmad-loop relay"
-    assert relay in hooks["Stop"][0]["hooks"][0]["command"]
-    assert relay in hooks["Notification"][0]["hooks"][0]["command"]
+    assert hooks["Stop"][0]["hooks"][0]["command"].endswith(_installed_relay_suffix("Stop"))
+    assert hooks["Notification"][0]["hooks"][0]["command"].endswith(
+        _installed_relay_suffix("Notification")
+    )
 
 
 def test_provision_worktree_tracked_pin_failure_raises(project, tmp_path):
@@ -1129,7 +1145,7 @@ def test_register_hooks_merge_preserves_the_operators_own_settings(tmp_path):
     assert set(claude.hooks.events) <= set(hooks)
     # names the relay marker the write-failure row asserts ABSENT, so that row's
     # negative is graded against a string this path provably produces
-    assert "bmad-loop relay Stop" in hooks["Stop"][0]["hooks"][0]["command"]
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
 
 
 def test_a_truncated_hook_config_makes_the_next_init_refuse(tmp_path, capsys):
@@ -1349,7 +1365,7 @@ def test_provision_worktree_merge_preserves_the_operators_own_settings(tmp_path)
     assert _operator_keys(config) == before
     hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
     assert set(claude.hooks.events) <= set(hooks)
-    assert "bmad-loop relay Stop" in hooks["Stop"][0]["hooks"][0]["command"]
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
 
 
 def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
