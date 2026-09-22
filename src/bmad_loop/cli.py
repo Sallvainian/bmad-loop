@@ -806,6 +806,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     # Inspect the executable each managed registration actually names. A new
     # installation in this process cannot repair an older path in a hook config.
+    # Compare with the command init would write now: an old executable can remain
+    # usable after switching installations, while still running an outdated relay.
+    expected_relay = None
+    if registered_relay_paths:
+        hook_profile = next(profile for profile in profiles if not profile.hookless)
+        try:
+            expected_relay = install.relay_executable(
+                install._hook_command(project, hook_profile, "Stop")
+            )
+        except ProfileError:
+            # No current executable to compare. The registered path still gets
+            # its own presence check below; do not call it stale by inference.
+            pass
     for relay in sorted(registered_relay_paths):
         if not relay.is_file():
             report.fail(
@@ -827,6 +840,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"registered hook executable available: {relay}",
                 {"path": str(relay)},
             )
+            if expected_relay is not None and relay != expected_relay:
+                report.warn(
+                    "hooks.relay-stale",
+                    f"registered hook executable {relay} differs from this "
+                    f"installation's {expected_relay} — re-run `bmad-loop init` "
+                    "to update the hook registration",
+                    {"path": str(relay), "expected_path": str(expected_relay)},
+                )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error

@@ -9703,6 +9703,51 @@ def test_validate_flags_registered_hooks_with_missing_relay_executable(project, 
     assert any(f["check"] == "hooks.registered" and f["severity"] == "ok" for f in doc["findings"])
 
 
+def test_validate_warns_when_registered_relay_uses_another_installation(
+    project, capsys, monkeypatch
+):
+    """An old but runnable console script must not make validation look current."""
+    from bmad_loop import install as install_mod
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    current_command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
+    current = install_mod.relay_executable(current_command)
+    assert current is not None
+
+    previous = project.project / "previous-install" / "bmad-loop"
+    previous.parent.mkdir()
+    previous.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    previous.chmod(0o755)
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = f"{previous} relay Stop"
+    config.write_text(json.dumps(data), encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "keep earlier hook registration")
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0  # stale registration is advisory while the relay remains usable
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert findings == [
+        {
+            "check": "hooks.relay-stale",
+            "severity": "warning",
+            "message": (
+                f"registered hook executable {previous} differs from this "
+                f"installation's {current} — re-run `bmad-loop init` "
+                "to update the hook registration"
+            ),
+            "detail": {"path": str(previous), "expected_path": str(current)},
+        }
+    ]
+    assert any(
+        f["check"] == "hooks.relay-present"
+        and f["severity"] == "ok"
+        and f["detail"]["path"] == str(previous)
+        for f in doc["findings"]
+    )
+
+
 def test_validate_json_reports_null_hook_handlers_without_crashing(project, capsys):
     from bmad_loop.install import install_into
 
@@ -9807,6 +9852,12 @@ def test_validate_inspects_old_registered_script_before_migration(project, capsy
     _rc, doc = _validate_json(project.project, capsys)
     assert any(
         f["check"] == "hooks.relay-present" and f["severity"] == "ok" and legacy in f["message"]
+        for f in doc["findings"]
+    )
+    assert any(
+        f["check"] == "hooks.relay-stale"
+        and f["severity"] == "warning"
+        and f["detail"]["path"] == legacy
         for f in doc["findings"]
     )
 
