@@ -65,6 +65,10 @@ breaking changes may land in a minor release.
   labelled launch override or policy snapshot, plus its selector; unreadable or
   tampered `sweep.json` reports `unverifiable` (#815).
 
+- Diagnose non-completed sweep triage and migration sessions: journal and escalate
+  whether `result.json` is missing, malformed or valid, and which of the attempt's
+  hook events arrived on either channel; routing is unchanged (#752).
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`

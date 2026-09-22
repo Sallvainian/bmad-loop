@@ -244,6 +244,35 @@ RESULT_FILE_ARTIFACTS: tuple[str, ...] = (
 )
 
 
+def _result_path(tasks_dir: Path, task_id: str) -> Path:
+    """Where THIS task's result.json lives under an adapter's ``tasks_dir``."""
+    return tasks_dir / task_id / "result.json"
+
+
+def load_result_document(tasks_dir: Path, task_id: str) -> dict | None:
+    """Read one task's skill-written result document exactly as the completion
+    read-back does: ``None`` when no regular file is there; ``OSError``,
+    ``ValueError`` (unparseable JSON, a non-object top level, an unencodable
+    string) or ``RecursionError`` for a present document the read-back refuses.
+    `_ResultFileMixin._read_result` folds every raise into ``None``; the sweep
+    session-failure diagnostic (#752) keeps "missing" and "malformed" apart."""
+    path = _result_path(tasks_dir, task_id)
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"result.json is not a JSON object: {type(data).__name__}")
+    # Plugin HookContext makes this same defensive copy before exposing
+    # result data, so reject a shape that would recurse there while the
+    # artifact is still inside the shared observation boundary.
+    copy.deepcopy(data)
+    # JSON accepts escaped lone surrogates, but the default ATTENTION
+    # sink writes reasons as UTF-8. Validate every parsed string without
+    # imposing stricter numeric semantics on completed session results.
+    json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return data
+
+
 class _ResultFileMixin:
     """Result-file read-back and verdict finalization: acquire the
     skill-written result dict and fold it into the session's final
@@ -549,7 +578,7 @@ class _ResultFileMixin:
         )
 
     def _result_path(self, task_id: str) -> Path:
-        return self.tasks_dir / task_id / "result.json"
+        return _result_path(self.tasks_dir, task_id)
 
     def _append_diag_jsonl(self, task_id: str, filename: str, payload: dict) -> None:
         """Append ``payload`` as one JSON line to ``tasks/<task_id>/<filename>``.
@@ -605,24 +634,10 @@ class _ResultFileMixin:
             pass
 
     def _read_result(self, task_id: str) -> dict | None:
-        path = self._result_path(task_id)
         try:
-            if not path.is_file():
-                return None
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return None
-            # Plugin HookContext makes this same defensive copy before exposing
-            # result data, so reject a shape that would recurse there while the
-            # artifact is still inside the shared observation boundary.
-            copy.deepcopy(data)
-            # JSON accepts escaped lone surrogates, but the default ATTENTION
-            # sink writes reasons as UTF-8. Validate every parsed string without
-            # imposing stricter numeric semantics on completed session results.
-            json.dumps(data, ensure_ascii=False).encode("utf-8")
+            return load_result_document(self.tasks_dir, task_id)
         except (OSError, ValueError, RecursionError):
             return None
-        return data
 
     def _await_result(self, task_id: str, grace_s: float = RESULT_GRACE_S) -> dict | None:
         deadline = time.monotonic() + grace_s
