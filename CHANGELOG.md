@@ -57,6 +57,10 @@ breaking changes may land in a minor release.
 - Parse plugin manifests in `validate` (`plugins.manifests`) without importing
   plugin code; a malformed `plugin.toml` fails validate instead of engine start (#765).
 
+- Scope the sweep skill's `open_ids` and partition validation rules to the session's
+  triage universe, so a `--only` or `--min-severity` triage no longer lists every open
+  entry and burns a retry (#824).
+
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
 - Report stale or unverifiable Codex hook trust in `validate` and `probe-adapter`
