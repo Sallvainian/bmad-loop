@@ -230,9 +230,15 @@ class _Leaf:
 
 def _load_layer(path: Path) -> dict[str, object] | None:
     """One central TOML layer, None when absent. Present-but-unusable raises: the
-    caller must never read an unparseable layer as "no TOML" and fall back."""
-    if not path.exists():
+    caller must never read an unparseable layer as "no TOML" and fall back. A link
+    counts as present even when `exists()` (which follows it) says otherwise: a
+    dangling or looping symlink is an entry the operator put there, not an absence."""
+    if not path.exists() and not path.is_symlink():
         return None
+    if path.is_symlink() and not path.exists():
+        raise BmadConfigError(
+            _diagnostic_text(f"BMAD config layer is a symlink that resolves to no file: {path}")
+        )
     if not path.is_file():
         raise BmadConfigError(_diagnostic_text(f"BMAD config layer is not a file: {path}"))
     try:

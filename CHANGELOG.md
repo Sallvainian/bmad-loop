@@ -44,7 +44,10 @@ breaking changes may land in a minor release.
   `validate` warns (`hooks.relay-stale`) while a backslash registration remains. Paths
   with spaces remain unsupported under the PowerShell fallback.
 
-- Resolve artifact paths from BMAD's four-layer central `_bmad/config.toml`, falling back to `_bmad/bmm/config.yaml` only for keys the TOML lacks, so a TOML-only BMAD 6.12 install passes `validate` and runs; refuse ambiguous, blank, non-string or malformed TOML values instead of falling back (#769, #154).
+- Resolve artifact paths from BMAD's four-layer central `_bmad/config.toml`, falling
+  back to `_bmad/bmm/config.yaml` only for keys the TOML lacks, so a TOML-only BMAD 6.12
+  install passes `validate` and runs; refuse ambiguous, blank, non-string or malformed
+  TOML values instead of falling back (#769, #154).
 
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 

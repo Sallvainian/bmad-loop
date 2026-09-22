@@ -3048,11 +3048,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
         # tree the run is in from here on; whether the new tree can honor those shas
         # is the operator's call, and this is the moment they can still make it.
         print(
-            f"warning: run {run_dir.name}: the code root in _bmad/bmm/config.yaml has"
+            f"warning: run {run_dir.name}: the code root in the BMAD config has"
             " changed since this run started — the resumed engine works in the tree"
             " configured now, while the baselines, preserve refs and branches this run"
             " already recorded name objects in the previous one. Restore the previous"
-            " `repo_root:` value if you did not intend the move.",
+            " `repo_root` value if you did not intend the move.",
             file=sys.stderr,
         )
     # Re-stamp: the snapshot must describe the policy THIS process enforces, for

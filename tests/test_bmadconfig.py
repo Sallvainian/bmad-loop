@@ -7,6 +7,7 @@ load_paths' two sources: the four-layer central TOML and the legacy YAML (#769).
 from __future__ import annotations
 
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -714,6 +715,40 @@ def test_a_layer_that_is_not_a_file_refuses(tmp_path: Path) -> None:
     (root / bmadconfig.CENTRAL_LAYERS_REL[2]).mkdir(parents=True)
     with pytest.raises(bmadconfig.BmadConfigError, match="not a file"):
         bmadconfig.load_paths(root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("target", ["missing.toml", "config.toml"], ids=["dangling", "loop"])
+def test_a_layer_symlink_that_resolves_to_no_file_refuses(tmp_path: Path, target: str) -> None:
+    """`exists()` follows the link and reads a dangling (or self-looping) one as
+    absent, which would let the YAML fill the key: present-but-unreadable must
+    refuse, like a directory at the layer path does.
+
+    Ablation: gate on `exists()` alone and the load succeeds off the YAML."""
+    root = _toml_only(tmp_path)
+    _write_config(root)  # a valid legacy YAML must not rescue the load
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[2]
+    layer.parent.mkdir(parents=True, exist_ok=True)
+    layer.symlink_to(target)  # relative to custom/: nothing there, or itself
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="resolves to no file") as excinfo:
+        bmadconfig.load_paths(root)
+    assert str(root.resolve() / _LAYERS[2]) in str(excinfo.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_a_layer_symlink_to_a_real_file_is_read(tmp_path: Path) -> None:
+    root = _toml_only(tmp_path)
+    shared = root / "shared-override.toml"
+    shared.write_text(
+        '[modules.bmm]\nimplementation_artifacts = "{project-root}/linked-impl"\n',
+        encoding="utf-8",
+    )
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
+    layer.parent.mkdir(parents=True, exist_ok=True)
+    layer.symlink_to(shared)
+
+    assert bmadconfig.load_paths(root).implementation_artifacts == root.resolve() / "linked-impl"
 
 
 def test_no_toml_and_no_yaml_names_both_expected_locations(tmp_path: Path) -> None:

@@ -4041,7 +4041,7 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
 
     assert seen == [moved.resolve()]
     err = capsys.readouterr().err
-    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert "the code root in the BMAD config has changed" in err
     assert str(moved) not in err  # the warning names neither tree, matching resume's
 
 
@@ -7036,7 +7036,7 @@ def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatc
     # unlanded `restamp_code_root` row, never for this resume's own re-stamp.
     assert _restamp_records(run_dir) == []
     err = capsys.readouterr().err
-    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert "the code root in the BMAD config has changed" in err
     # the warning names neither tree: a journalled scalar, an operator-facing sentence
     assert str(moved) not in err
 
@@ -7140,7 +7140,7 @@ def test_resume_discharges_the_owed_record_under_the_root_the_marker_names(
     assert [r["repo"] for r in _restamp_records(run_dir)] == [str(owed)]
     # The config really did move away from the mirror, so THIS resume is a move too.
     assert _resume_entry(run_dir)["code_root_changed"] is True
-    assert "the code root in _bmad/bmm/config.yaml has changed" in capsys.readouterr().err
+    assert "the code root in the BMAD config has changed" in capsys.readouterr().err
     persisted = load_state(run_dir)
     assert persisted.repo_root == str(again.resolve())
     assert persisted.code_root_restamp_pending is False

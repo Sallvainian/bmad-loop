@@ -4477,10 +4477,10 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     if not moved:
         return None
     return (
-        f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
+        f"run {run_dir.name}: the code root in the BMAD config has changed since "
         "this run started — the re-drive works in the tree configured now, while the "
         "baselines, preserve refs and branches this run already recorded name objects "
-        "in the previous one. Restore the previous `repo_root:` value if you did not "
+        "in the previous one. Restore the previous `repo_root` value if you did not "
         "intend the move."
     )
 
