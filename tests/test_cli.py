@@ -10759,6 +10759,43 @@ def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypa
     assert "evil" in finding["detail"]["plugins"]
 
 
+def test_validate_reads_plugin_manifests_from_the_configured_repo_root(
+    project, capsys, monkeypatch, tmp_path
+):
+    """The engine builds its registry from `paths.repo_root`, and a `repo_root:`
+    override under isolation = "none" points that at another checkout. Validate
+    must parse the manifests that tree holds, not the project dir's: a broken one
+    in the code root fails here, and a broken one only the project holds is not
+    what the run loads. Ablation: pass `project` back to `_validate_plugin_manifests`
+    and both legs flip."""
+    _validate_with_plugin(
+        project,
+        monkeypatch,
+        capsys,
+        "ignored",
+        "[plugin]\nname = \n",
+        policy=CLAUDE_ONLY_POLICY + '[scm]\nisolation = "none"\n',
+    )
+    code_root = tmp_path / "code"
+    pdir = code_root / ".bmad-loop" / "plugins" / "loaded"
+    pdir.mkdir(parents=True)
+    toml = pdir / "plugin.toml"
+    toml.write_text('[plugin]\nname = "loaded"\napi_version = 1\n')
+    _configure_repo_root(project, code_root)
+    argv = ["validate", "--project", str(project.project), "--json"]
+
+    cli.main(argv)  # rc is not this check's: the config.yaml edit dirties the tree
+    [finding] = _plugin_findings(json.loads(capsys.readouterr().out))
+    assert finding["severity"] == "ok", finding
+    assert "loaded" in finding["detail"]["plugins"]
+
+    toml.write_text("[plugin]\nname = \n")
+    cli.main(argv)
+    [finding] = _plugin_findings(json.loads(capsys.readouterr().out))
+    assert finding["severity"] == "problem"
+    assert str(toml) in finding["message"]
+
+
 def test_validation_report_renders_each_severity_verbatim(capsys):
     """The exact bytes of all three severities.
 

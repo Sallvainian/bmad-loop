@@ -490,7 +490,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"repo_root": str(paths.repo_root), "project": str(paths.project)},
             )
 
-    _validate_plugin_manifests(project, report)
+    # The engine builds its registry from `paths.repo_root` (a `repo_root:` override
+    # under isolation = "none" points it at another checkout), so read the manifests
+    # that run will load. A failed BMAD config already failed above; fall back to
+    # the project dir so the manifest check still reports something.
+    _validate_plugin_manifests(paths.repo_root if paths is not None else project, report)
 
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
@@ -1519,8 +1523,11 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
     return deferredwork.parse_declaration(raw)
 
 
-def _validate_plugin_manifests(project: Path, report: ValidationReport) -> None:
+def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
     """Parse every discovered plugin manifest the way a run will (#765).
+
+    `root` is the code root the engine hands `PluginRegistry.build` —
+    `paths.repo_root`, not necessarily the project dir.
 
     Without this the first reader of a malformed project `plugin.toml` was
     `PluginRegistry.build` inside `Engine.__init__` — after the run's directory,
@@ -1543,7 +1550,7 @@ def _validate_plugin_manifests(project: Path, report: ValidationReport) -> None:
     with warnings.catch_warnings(record=True) as skipped:
         warnings.simplefilter("always")  # the once-per-location default would drop a repeat
         try:
-            manifests = load_plugins(project)
+            manifests = load_plugins(root)
         except PluginError as e:
             manifests = None
             report.fail("plugins.manifests", str(e))
