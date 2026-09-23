@@ -29,6 +29,14 @@ def test_poll_skips_malformed(tmp_path):
     assert watcher.poll() == []
 
 
+def test_poll_carries_cwd_when_the_payload_names_one(tmp_path):
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "SessionStart", cwd="/work/tree")
+    write_event(watcher.events_dir, 2, "t1", "Stop", cwd="")
+    write_event(watcher.events_dir, 3, "t1", "SessionEnd", cwd=7)
+    assert [e.cwd for e in watcher.poll()] == ["/work/tree", None, None]
+
+
 def test_poll_carries_the_subagent_marker_when_the_payload_names_one(tmp_path):
     watcher = SignalWatcher(tmp_path / "events")
     write_event(watcher.events_dir, 1, "t1", "SessionEnd", subagent_type="general-purpose")
