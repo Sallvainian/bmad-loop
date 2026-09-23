@@ -1027,6 +1027,16 @@ def relay_executable(command: str) -> Path | None:
     A foreign path remains unusable on this host, but must still be recognized
     as managed so init and worktree provisioning replace its stale hook.
     """
+    text = relay_executable_text(command)
+    return Path(text) if text is not None else None
+
+
+def relay_executable_text(command: str) -> str | None:
+    """Return a relay command's executable exactly as registered.
+
+    `Path` normalizes the spelling (on Windows it treats `\\` and `/` alike), so
+    callers asking "would init write something different" compare this text.
+    """
     for posix in (os.name != "nt", os.name == "nt"):
         try:
             parts = shlex.split(command, posix=posix)
@@ -1042,7 +1052,7 @@ def relay_executable(command: str) -> Path | None:
         for flavor in (PurePosixPath, PureWindowsPath):
             executable = flavor(raw)
             if executable.name in {"bmad-loop", "bmad-loop.exe"} and executable.is_absolute():
-                return Path(raw)
+                return raw
     return None
 
 
@@ -1197,23 +1207,30 @@ def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
 
 def registered_relay_paths(
     config: dict, dialect: str, events: Iterable[str], project: Path
-) -> list[Path]:
-    """Paths invoked by the actual managed commands in a hook config."""
+) -> list[tuple[Path, str]]:
+    """Paths invoked by the actual managed commands in a hook config.
+
+    Each path is paired with its registered spelling: the console relay's
+    executable text as written in the command, or the legacy script path with
+    the project directory substituted. The `Path` answers presence questions;
+    the spelling answers whether init would now write something different.
+    """
     container = hook_event_container(config, dialect)
-    paths: list[Path] = []
+    paths: list[tuple[Path, str]] = []
     for event in events:
         handlers = container.get(event)
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
             for command in _commands_in_handler(handler):
-                executable = relay_executable(command)
+                executable = relay_executable_text(command)
                 if executable is not None:
-                    paths.append(executable)
+                    paths.append((Path(executable), executable))
                 else:
                     script = _legacy_relay_script(command)
                     if script is not None:
-                        paths.append(Path(script.replace("$CLAUDE_PROJECT_DIR", str(project))))
+                        path = Path(script.replace("$CLAUDE_PROJECT_DIR", str(project)))
+                        paths.append((path, str(path)))
     return paths
 
 

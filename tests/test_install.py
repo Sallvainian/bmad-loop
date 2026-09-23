@@ -325,7 +325,9 @@ def test_registered_relay_paths_reads_installed_relay_from_either_os(
         }
     }
     paths = registered_relay_paths(config, "claude-settings-json", ["Stop"], tmp_path)
-    assert [str(path).replace("\\", "/") for path in paths] == [expected_path.replace("\\", "/")]
+    assert [str(path).replace("\\", "/") for path, _ in paths] == [expected_path.replace("\\", "/")]
+    # The spelling is the registered text, which `Path` would normalize on Windows.
+    assert [spelling for _, spelling in paths] == [expected_path]
 
 
 def test_init_preserves_different_script_with_same_basename(tmp_path):

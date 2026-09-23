@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import types
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 import yaml
@@ -9713,7 +9713,8 @@ def test_validate_warns_when_registered_relay_uses_another_installation(
     config = project.project / ".claude/settings.json"
     data = json.loads(config.read_text())
     current_command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
-    current = install_mod.relay_executable(current_command)
+    # The registered text: on Windows str(Path) would respell init's forward slashes.
+    current = install_mod.relay_executable_text(current_command)
     assert current is not None
 
     previous = project.project / "previous-install" / "bmad-loop"
@@ -9737,7 +9738,7 @@ def test_validate_warns_when_registered_relay_uses_another_installation(
                 f"installation's {current} — re-run `bmad-loop init` "
                 "to update the hook registration"
             ),
-            "detail": {"path": str(previous), "expected_path": str(current)},
+            "detail": {"path": str(previous), "expected_path": current},
         }
     ]
     assert any(
@@ -9746,6 +9747,76 @@ def test_validate_warns_when_registered_relay_uses_another_installation(
         and f["detail"]["path"] == str(previous)
         for f in doc["findings"]
     )
+
+
+def _respell_registered_relay(project, respell) -> tuple[str, str]:
+    """Rewrite the committed Stop relay's executable text; return (old, new) spellings."""
+    from bmad_loop import install as install_mod
+
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text())
+    command = data["hooks"]["Stop"][0]["hooks"][0]["command"]
+    current = install_mod.relay_executable_text(command)
+    assert current is not None
+    respelled = respell(current)
+    assert respelled != current
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = command.replace(current, respelled, 1)
+    config.write_text(json.dumps(data), encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "respell hook registration")
+    return current, respelled
+
+
+def _single_relay_stale(doc) -> dict:
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert len(findings) == 1, findings
+    return findings[0]
+
+
+def test_validate_warns_when_relay_spelling_differs_but_path_is_equal(project, capsys, monkeypatch):
+    """`Path` equality normalizes the spelling; init's merge_hooks compares text and
+    would rewrite this registration, so validate must call it stale (#773)."""
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    def respell(current: str) -> str:
+        head, _, name = current.rpartition("/")
+        return f"{head}/./{name}"
+
+    current, respelled = _respell_registered_relay(project, respell)
+    assert Path(respelled) == Path(current)  # the premise: a Path comparison sees no change
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0  # advisory: the relay still runs
+    assert _single_relay_stale(doc) == {
+        "check": "hooks.relay-stale",
+        "severity": "warning",
+        "message": (
+            f"registered hook executable {respelled} differs from this "
+            f"installation's {current} — re-run `bmad-loop init` "
+            "to update the hook registration"
+        ),
+        "detail": {"path": respelled, "expected_path": current},
+    }
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Windows path spelling; runs on the Windows leg"
+)
+def test_validate_warns_on_backslash_windows_relay_registration(project, capsys, monkeypatch):
+    """A pre-#773 backslash registration stalls sessions under Git Bash; `Path` and
+    `str(Path)` both hide it on Windows, so only the registered text flags it."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    current, backslashed = _respell_registered_relay(
+        project, lambda current: str(PureWindowsPath(current))
+    )
+    assert "\\" in backslashed
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0
+    finding = _single_relay_stale(doc)
+    assert finding["severity"] == "warning"
+    assert finding["detail"] == {"path": backslashed, "expected_path": current}
+    assert backslashed in finding["message"] and current in finding["message"]
 
 
 def test_validate_json_reports_null_hook_handlers_without_crashing(project, capsys):

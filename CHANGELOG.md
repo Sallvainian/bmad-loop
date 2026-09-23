@@ -41,7 +41,8 @@ breaking changes may land in a minor release.
 
 - Register Windows hook commands with forward-slash paths so Git Bash no longer strips
   their separators and stalls every session (#773); re-run `bmad-loop init` to migrate.
-  Paths with spaces remain unsupported under the PowerShell fallback.
+  `validate` warns (`hooks.relay-stale`) while a backslash registration remains. Paths
+  with spaces remain unsupported under the PowerShell fallback.
 
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 

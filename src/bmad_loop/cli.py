@@ -679,7 +679,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"binary": tool, "path": resolved, "returncode": rc},
         )
 
-    registered_relay_paths: set[Path] = set()
+    registered_relays: set[tuple[Path, str]] = set()
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -742,7 +742,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
         if isinstance(parsed, dict):
-            registered_relay_paths.update(
+            registered_relays.update(
                 install.registered_relay_paths(
                     parsed, profile.hooks.dialect, profile.hooks.events, project
                 )
@@ -808,18 +808,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # installation in this process cannot repair an older path in a hook config.
     # Compare with the command init would write now: an old executable can remain
     # usable after switching installations, while still running an outdated relay.
-    expected_relay = None
-    if registered_relay_paths:
+    # The comparison is on the registered TEXT, the same test init's merge_hooks
+    # applies: on Windows both `Path` equality and `str(Path)` normalize
+    # separators, so a pre-#773 backslash registration (which Git Bash mangles,
+    # stalling every session) would otherwise never be flagged.
+    expected_text = None
+    if registered_relays:
         hook_profile = next(profile for profile in profiles if not profile.hookless)
         try:
-            expected_relay = install.relay_executable(
+            expected_text = install.relay_executable_text(
                 install._hook_command(project, hook_profile, "Stop")
             )
         except ProfileError:
             # No current executable to compare. The registered path still gets
             # its own presence check below; do not call it stale by inference.
             pass
-    for relay in sorted(registered_relay_paths):
+    for relay, spelling in sorted(registered_relays):
         if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
@@ -840,13 +844,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"registered hook executable available: {relay}",
                 {"path": str(relay)},
             )
-            if expected_relay is not None and relay != expected_relay:
+            if expected_text is not None and spelling != expected_text:
                 report.warn(
                     "hooks.relay-stale",
-                    f"registered hook executable {relay} differs from this "
-                    f"installation's {expected_relay} — re-run `bmad-loop init` "
+                    f"registered hook executable {spelling} differs from this "
+                    f"installation's {expected_text} — re-run `bmad-loop init` "
                     "to update the hook registration",
-                    {"path": str(relay), "expected_path": str(expected_relay)},
+                    {"path": spelling, "expected_path": expected_text},
                 )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
