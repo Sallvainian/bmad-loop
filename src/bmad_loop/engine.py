@@ -868,7 +868,7 @@ class Engine:
         # active workspace; `escalate` routes an intent-gap restore failure through
         # the engine's escalation; `escalation_pause` raises RunPaused for it
         # (injected so recovery_flow need not import engine — that would reintroduce
-        # a runtime<->engine cycle); `dev_attempt_recorded` is the preserve-ref
+        # a runtime<->engine cycle); `dev_attempt_dispatched` is the preserve-ref
         # provenance probe (#777).
         self._recovery_flow = RecoveryFlow(
             paths=self.paths,
@@ -881,7 +881,7 @@ class Engine:
             save=self._save,
             escalate=self._escalate,
             escalation_pause=self._escalation_pause,
-            dev_attempt_recorded=lambda task: self._current_dev_session_index(task) is not None,
+            dev_attempt_dispatched=self._dev_attempt_dispatched,
         )
 
     def _escalation_pause(
@@ -2176,6 +2176,18 @@ class Engine:
             if task.sessions[index].task_id == task_id:
                 return index
         return None
+
+    def _dev_attempt_dispatched(self, task: StoryTask) -> bool:
+        """Whether a dev session of the task's current attempt was dispatched —
+        the provenance a rollback stamps on the ref it parks (#777,
+        ``StoryTask.preserve_from_attempt``). A recorded session proves it, but a
+        session is recorded only once it returns: a hard stop or host death
+        mid-session leaves none, and the restart arm then parks that session's
+        tree. A durable ``DEV_RUNNING`` covers that case — it is saved after
+        ``attempt`` is bumped and before the launch, and a resolve re-drive's
+        reset runs from the ``PENDING`` that ``runs.rearm_escalation`` leaves
+        (under a bumped ``generation``, so no current-attempt record either)."""
+        return task.phase == Phase.DEV_RUNNING or self._current_dev_session_index(task) is not None
 
     def _current_review_session_index(self, task: StoryTask) -> int | None:
         """Index of the newest review record for the current cycle."""

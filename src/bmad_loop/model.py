@@ -438,13 +438,15 @@ class StoryTask:
     preserve_partial: bool = False
     # provenance of `preserve_ref`, the one input the retry dev prompt's pointer
     # at it cannot get from git (#777, `recovery_flow.retry_preserve_paragraph`):
-    # True when the auto-rollback that cleared the previous ref ran after a
-    # recorded dev session of the current attempt, so whatever it parks is that
-    # attempt's work. False when no such session exists — a resolve re-drive
-    # resets a tree no dispatched attempt produced, and a crash mid-session leaves
-    # no record — and set back to False by `SweepEngine._reset_superseded_bundle_
-    # state`, which keeps a superseded bundle's ref (clearing the name would orphan
-    # the work) that shares this task's run, key and baseline. Positive evidence
+    # True when the auto-rollback that cleared the previous ref ran after a dev
+    # session of the current attempt was dispatched — a recorded session, or a
+    # durable DEV_RUNNING that a hard stop or crash mid-session left without one
+    # (`Engine._dev_attempt_dispatched`) — so whatever it parks is that attempt's
+    # work. False when neither holds — a resolve re-drive resets a tree no
+    # dispatched attempt produced — and set back to False by `SweepEngine.
+    # _reset_superseded_bundle_state`, which keeps a superseded bundle's ref
+    # (clearing the name would orphan the work) that shares this task's run, key
+    # and baseline. Positive evidence
     # only: a state.json written before this field loads False, so an unproven ref
     # is never offered. Reset with `preserve_ref`. Survives the resume
     # serialization round-trip.

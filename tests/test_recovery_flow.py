@@ -1263,7 +1263,7 @@ def _make_flow(
     state=None,
     journal: _RecordingJournal | None = None,
     run_dir: Path | None = None,
-    dev_attempt_recorded: bool = True,
+    dev_attempt_dispatched: bool = True,
 ):
     """Build a RecoveryFlow wired to recording stubs. The returned flow carries a
     ``.calls`` namespace tallying the injected callbacks for assertions. ``paths``
@@ -1297,7 +1297,7 @@ def _make_flow(
         save=_save,
         escalate=_escalate,
         escalation_pause=_pause,
-        dev_attempt_recorded=lambda task: dev_attempt_recorded,
+        dev_attempt_dispatched=lambda task: dev_attempt_dispatched,
     )
     flow.calls = calls
     return flow
@@ -4464,10 +4464,10 @@ def test_retry_preserve_notice_follows_the_ref_a_later_rollback_parks(project):
 
 
 def test_retry_preserve_notice_withheld_when_no_dev_session_produced_the_ref(project):
-    """A rollback with no recorded dev session for the current attempt (a resolve
-    re-drive's reset, a crash mid-session) still parks the tree — but nothing
-    proves an attempt wrote it, so the notice must not claim one did. The rollback
-    replaces the earlier, attributable ref's provenance along with the ref."""
+    """A rollback with no dispatched dev session for the current attempt (a
+    resolve re-drive's reset) still parks the tree — but nothing proves an
+    attempt wrote it, so the notice must not claim one did. The rollback replaces
+    the earlier, attributable ref's provenance along with the ref."""
     repo = project.project
     task = _task(repo)
     task.attempt = 1
@@ -4480,7 +4480,7 @@ def test_retry_preserve_notice_withheld_when_no_dev_session_produced_the_ref(pro
     unattributed = _make_flow(
         workspace=Workspace.default(project),
         policy=_policy(rollback_on_failure=True),
-        dev_attempt_recorded=False,
+        dev_attempt_dispatched=False,
     )
     ref = _dirty_rollback(unattributed, task, repo, "re-drive residue\n")
 

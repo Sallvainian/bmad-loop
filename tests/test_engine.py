@@ -9363,6 +9363,38 @@ def test_retry_dev_prompt_names_the_earlier_attempts_parked_work(project):
     assert "half-built attempt 1" in git(project.project, "show", f"{ref}:src.txt")
 
 
+def test_retry_dev_prompt_names_work_parked_after_a_mid_session_crash(project):
+    """#777: a host death mid-session records no session, so the resume's restart
+    arm parks the dirty tree with only the durable DEV_RUNNING to attribute it.
+    The re-dispatched attempt's prompt still names that work.
+
+    Ablation: drop the DEV_RUNNING arm of `Engine._dev_attempt_dispatched` and
+    the paragraph disappears from the resumed prompt."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def crash_mid_session(spec):
+        (project.project / "src.txt").write_text("half-built before the crash\n")
+        raise RuntimeError("host died mid-session")
+
+    engine, _ = make_engine(project, [crash_mid_session])
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DEV_RUNNING and crashed.sessions == []
+
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+    assert resumed.run().done == 1
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" in kinds
+    (entry,) = [e for e in resumed.journal.entries() if e["kind"] == "attempt-worktree-preserved"]
+    ref = entry["ref"]
+    (prompt,) = [s.prompt for s in adapter.sessions if s.role == "dev"]
+    assert f"its work is preserved at `{ref}`" in prompt
+    assert "half-built before the crash" in git(project.project, "show", f"{ref}:src.txt")
+
+
 def test_retry_dev_prompt_has_no_preserve_paragraph_when_nothing_was_parked(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(

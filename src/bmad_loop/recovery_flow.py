@@ -169,9 +169,9 @@ class RecoveryFlow:
     ``escalation_pause`` raises the engine's ``RunPaused`` (injected so this
     module need not import ``engine`` — that would reintroduce a runtime<->engine
     import cycle). ``workspace_get`` reads the engine's live (worktree-swappable)
-    active workspace. ``dev_attempt_recorded`` answers whether a dev session of
-    the task's current attempt has been recorded — the provenance a rollback
-    stamps on the ref it parks (``StoryTask.preserve_from_attempt``)."""
+    active workspace. ``dev_attempt_dispatched`` answers whether a dev session of
+    the task's current attempt was dispatched — the provenance a rollback stamps
+    on the ref it parks (``StoryTask.preserve_from_attempt``)."""
 
     def __init__(
         self,
@@ -186,7 +186,7 @@ class RecoveryFlow:
         save: Callable[[], None],
         escalate: Callable[[StoryTask, str], None],
         escalation_pause: Callable[..., NoReturn],
-        dev_attempt_recorded: Callable[[StoryTask], bool],
+        dev_attempt_dispatched: Callable[[StoryTask], bool],
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -202,7 +202,7 @@ class RecoveryFlow:
         self._save = save
         self._escalate = escalate
         self._pause = escalation_pause
-        self._dev_attempt_recorded = dev_attempt_recorded
+        self._dev_attempt_dispatched = dev_attempt_dispatched
 
     def protected_relpaths(self) -> tuple[str, ...]:
         """Repo-relative posix paths of the BMAD artifact folders. These are
@@ -1293,7 +1293,7 @@ class RecoveryFlow:
             task.preserve_partial = False
             # Provenance for whatever this rollback parks (#777): the retry
             # prompt names the ref only when a dev session of this attempt ran.
-            task.preserve_from_attempt = self._dev_attempt_recorded(task)
+            task.preserve_from_attempt = self._dev_attempt_dispatched(task)
             self.journal.append(
                 "rollback-auto",
                 story_key=task.story_key,
