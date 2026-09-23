@@ -5778,7 +5778,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
 
     assert seen == [moved.resolve()]
-    assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+    assert any("the code root in the BMAD config has changed" in n for n in notes)
 
 
 def test_escalation_rearm_rechecks_liveness_inside_state_lock(project, monkeypatch):

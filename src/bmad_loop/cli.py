@@ -98,9 +98,11 @@ from .stories_engine import StoriesEngine
 from .sweep import (
     DW_ID_RE,
     SEVERITY_ORDER,
+    SWEEP_OVERRIDE_KEYS,
     SweepEngine,
     decimal_digits_key,
     increment_decimal_digits,
+    resolve_sweep_override,
     select_entries,
 )
 
@@ -490,6 +492,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"repo_root": str(paths.repo_root), "project": str(paths.project)},
             )
 
+    # The engine builds its registry from `paths.repo_root` (a `repo_root:` override
+    # under isolation = "none" points it at another checkout), so read the manifests
+    # that run will load. A failed BMAD config already failed above; fall back to
+    # the project dir so the manifest check still reports something.
+    _validate_plugin_manifests(paths.repo_root if paths is not None else project, report)
+
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
     # in profiles]`: that carries triage's tree, and every skills check below asks a
@@ -679,7 +687,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"binary": tool, "path": resolved, "returncode": rc},
         )
 
-    registered_relay_paths: set[Path] = set()
+    registered_relays: set[tuple[Path, str]] = set()
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -742,7 +750,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
         if isinstance(parsed, dict):
-            registered_relay_paths.update(
+            registered_relays.update(
                 install.registered_relay_paths(
                     parsed, profile.hooks.dialect, profile.hooks.events, project
                 )
@@ -808,18 +816,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # installation in this process cannot repair an older path in a hook config.
     # Compare with the command init would write now: an old executable can remain
     # usable after switching installations, while still running an outdated relay.
-    expected_relay = None
-    if registered_relay_paths:
+    # The comparison is on the registered TEXT, the same test init's merge_hooks
+    # applies: on Windows both `Path` equality and `str(Path)` normalize
+    # separators, so a pre-#773 backslash registration (which Git Bash mangles,
+    # stalling every session) would otherwise never be flagged.
+    expected_text = None
+    if registered_relays:
         hook_profile = next(profile for profile in profiles if not profile.hookless)
         try:
-            expected_relay = install.relay_executable(
+            expected_text = install.relay_executable_text(
                 install._hook_command(project, hook_profile, "Stop")
             )
         except ProfileError:
             # No current executable to compare. The registered path still gets
             # its own presence check below; do not call it stale by inference.
             pass
-    for relay in sorted(registered_relay_paths):
+    for relay, spelling in sorted(registered_relays):
         if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
@@ -840,13 +852,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"registered hook executable available: {relay}",
                 {"path": str(relay)},
             )
-            if expected_relay is not None and relay != expected_relay:
+            if expected_text is not None and spelling != expected_text:
                 report.warn(
                     "hooks.relay-stale",
-                    f"registered hook executable {relay} differs from this "
-                    f"installation's {expected_relay} — re-run `bmad-loop init` "
+                    f"registered hook executable {spelling} differs from this "
+                    f"installation's {expected_text} — re-run `bmad-loop init` "
                     "to update the hook registration",
-                    {"path": str(relay), "expected_path": str(expected_relay)},
+                    {"path": spelling, "expected_path": expected_text},
                 )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
@@ -1511,6 +1523,48 @@ def _spec_closes_deferred(path: Path) -> tuple[tuple[str, ...], str | None]:
     except (OSError, UnicodeDecodeError):
         return (), None
     return deferredwork.parse_declaration(raw)
+
+
+def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
+    """Parse every discovered plugin manifest the way a run will (#765).
+
+    `root` is the code root the engine hands `PluginRegistry.build` —
+    `paths.repo_root`, not necessarily the project dir.
+
+    Without this the first reader of a malformed project `plugin.toml` was
+    `PluginRegistry.build` inside `Engine.__init__` — after the run's directory,
+    state and journal were already published. `load_plugins` is manifest-only
+    discovery: it never imports a `[python]` module, which matters here because
+    validate is the command a user runs to decide whether a checkout is safe to
+    run at all. `PluginRegistry.build` would exec every allowlisted module.
+
+    A PluginError is the whole message: every manifest fault names its source
+    (the manifest path, for a project plugin). `load_plugins` stops at the first
+    bad manifest, so one fault is reported per pass. A third-party manifest on an
+    unsupported api_version is skipped with `warnings.warn`, which a run keeps;
+    here it is captured and reported as a warning finding instead, so it neither
+    leaks to stderr nor breaks the `--json` stream contract.
+    """
+    import warnings
+
+    from .plugins import PluginError, load_plugins
+
+    with warnings.catch_warnings(record=True) as skipped:
+        warnings.simplefilter("always")  # the once-per-location default would drop a repeat
+        try:
+            manifests = load_plugins(root)
+        except PluginError as e:
+            manifests = None
+            report.fail("plugins.manifests", str(e))
+    for w in skipped:
+        report.warn("plugins.manifests", f"{w.message} — skipped; a run will not load it")
+    if manifests is not None:
+        names = sorted(manifests)
+        report.ok(
+            "plugins.manifests",
+            f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
+            {"plugins": names},
+        )
 
 
 def _validate_operator_registry(
@@ -3044,11 +3098,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
         # tree the run is in from here on; whether the new tree can honor those shas
         # is the operator's call, and this is the moment they can still make it.
         print(
-            f"warning: run {run_dir.name}: the code root in _bmad/bmm/config.yaml has"
+            f"warning: run {run_dir.name}: the code root in the BMAD config has"
             " changed since this run started — the resumed engine works in the tree"
             " configured now, while the baselines, preserve refs and branches this run"
             " already recorded name objects in the previous one. Restore the previous"
-            " `repo_root:` value if you did not intend the move.",
+            " `repo_root` value if you did not intend the move.",
             file=sys.stderr,
         )
     # Re-stamp: the snapshot must describe the policy THIS process enforces, for
@@ -4323,6 +4377,57 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sweep_options_line(run_dir: Path, state: RunState) -> str:
+    """The text-status line naming a sweep run's effective options (#815).
+
+    `policy_snapshot` alone reads as the enforced cap, but a launch override in
+    `sweep.json` wins over it (`resolve_sweep_override`, as `SweepEngine.__init__`
+    applies it). The policy half comes from the run's snapshot, never live
+    policy.toml: the engine loads policy once, and resume re-stamps the snapshot
+    to the policy it reloads. `sweep.json` is read the way resume reads it —
+    bounded, version-checked and digest-bound — but status only observes, so a
+    refusal degrades to "unverifiable" rather than failing the command."""
+    version = state.sweep_options_version
+    try:
+        runsetup.validate_sweep_options_version(version)
+        current = version == runsetup.SWEEP_OPTIONS_VERSION
+        options = runsetup.load_sweep_resume_options(
+            run_dir,
+            required=version >= runsetup.SWEEP_OPTIONS_VERSION,
+            expected_digest=state.sweep_options_digest if current else None,
+        )
+        runsetup.validate_sweep_options_binding(version, state.sweep_options_digest, options)
+    except runsetup.SweepOptionsError as exc:
+        return f"sweep options: unverifiable — {exc}"
+    if options.digest is None:
+        # The legacy loader's tolerant empty shape: no readable sweep.json, so the
+        # launch overrides were never recorded (resume would run on policy alone).
+        return "sweep options: unknown — legacy run with no readable sweep.json"
+    raw_policy = state.policy_snapshot.get("sweep")
+    snapshot: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+    parts: list[str] = []
+    for key in SWEEP_OVERRIDE_KEYS:
+        override = options.values.get(key)
+        from_policy = snapshot.get(key)
+        if override is None and from_policy is None:
+            parts.append(f"{key} unknown (no override; not in the policy snapshot)")
+            continue
+        value = json.dumps(resolve_sweep_override(override, from_policy))
+        if override is None:
+            source = "policy"
+        elif from_policy is None:
+            source = "override"
+        else:
+            source = f"override; policy {json.dumps(from_policy)}"
+        parts.append(f"{key} {value} ({source})")
+    if options.only_ids is not None:
+        parts.append(f"only {','.join(options.only_ids)}")
+    if options.min_severity is not None:
+        parts.append(f"min_severity {options.min_severity}")
+    legacy = " [legacy options format]" if version == 0 else ""
+    return f"sweep options: {', '.join(parts)}{legacy}"
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project = _project(args)
     if args.run_id:
@@ -4362,6 +4467,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    if state.run_type == "sweep":
+        print(_sweep_options_line(run_dir, state))
     if state.sweeps_refused:
         detail = ", ".join(f"{trigger} ({why})" for trigger, why in state.sweeps_refused.items())
         print(f"auto-sweep not run: {detail} — deferred work is untouched")

@@ -259,19 +259,52 @@ def test_read_result_degrades_a_decoder_recursion_error(tmp_path):
     assert adapter._read_result("t1") is None
 
 
+def _refuse_result_metadata(monkeypatch, path):
+    """Refuse `stat()` on ``path`` and pin `Path.is_file` False for it — 3.14's
+    answer to that refusal — so a reader that went back to `is_file()` would see
+    "absent" on every runtime, not only on 3.14."""
+    real_stat, real_is_file = Path.stat, Path.is_file
+
+    def refused_stat(candidate, *args, **kwargs):
+        if candidate == path:
+            raise PermissionError(13, "task directory is not searchable", str(candidate))
+        return real_stat(candidate, *args, **kwargs)
+
+    def swallowed_is_file(candidate, *args, **kwargs):
+        return False if candidate == path else real_is_file(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refused_stat)
+    monkeypatch.setattr(Path, "is_file", swallowed_is_file)
+
+
 def test_read_result_degrades_an_unreadable_existence_probe(tmp_path, monkeypatch):
     adapter = make_adapter(tmp_path)
-    path = adapter._result_path("t1")
-    real_is_file = Path.is_file
-
-    def is_file_with_permission_error(candidate):
-        if candidate == path:
-            raise PermissionError("task directory is not searchable")
-        return real_is_file(candidate)
-
-    monkeypatch.setattr(Path, "is_file", is_file_with_permission_error)
+    _refuse_result_metadata(monkeypatch, adapter._result_path("t1"))
 
     assert adapter._read_result("t1") is None
+
+
+def test_load_result_document_raises_a_refused_probe_instead_of_reporting_absence(
+    tmp_path, monkeypatch
+):
+    """`None` is absence alone (#752): the sweep diagnostic reports it as `missing`,
+    so a metadata refusal must raise and read as `unreadable` on every runtime.
+
+    Ablation: restore `if not path.is_file(): return None` and this fails."""
+    adapter = make_adapter(tmp_path)
+    task_dir = adapter.tasks_dir / "t1"
+    task_dir.mkdir(parents=True)
+    assert generic.load_result_document(adapter.tasks_dir, "t1") is None  # absent
+    (task_dir / "result.json").mkdir()
+    assert generic.load_result_document(adapter.tasks_dir, "t1") is None  # not a regular file
+    (task_dir / "result.json").rmdir()
+    (tmp_path / "plain").write_text("x")
+    assert generic.load_result_document(tmp_path / "plain", "t1") is None  # non-dir component
+
+    (task_dir / "result.json").write_text('{"clean": true}')
+    _refuse_result_metadata(monkeypatch, adapter._result_path("t1"))
+    with pytest.raises(PermissionError):
+        generic.load_result_document(adapter.tasks_dir, "t1")
 
 
 def test_read_result_rejects_data_that_plugin_deepcopy_cannot_handle(tmp_path):

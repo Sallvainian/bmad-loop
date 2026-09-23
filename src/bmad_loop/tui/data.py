@@ -740,8 +740,8 @@ def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] |
 
 # --------------------------------------------- project-level artifact readers
 
-# project root -> (config.yaml sig, ProjectPaths)
-_paths_cache: dict[Path, tuple[_StatSig, bmadconfig.ProjectPaths]] = {}
+# project root -> (sigs of every BMAD config source, ProjectPaths)
+_paths_cache: dict[Path, tuple[tuple[object, ...], bmadconfig.ProjectPaths]] = {}
 # sprint-status.yaml path -> (sig or None for missing, parse or None)
 _sprint_cache: dict[Path, tuple[_StatSig | None, sprintstatus.SprintStatus | None]] = {}
 # deferred-work.md path -> (sig or None for missing, items or None)
@@ -751,26 +751,42 @@ _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] =
 _missed_cache: dict[Path, tuple[Any, list]] = {}
 
 
+def _config_source_sig(path: Path) -> object:
+    """A config source's cache signature, distinguishing what `_stat_sig` folds into
+    one `None`: absent, present but failing (an unreadable directory), and a link
+    whose target is gone or loops. `load_paths` refuses the last two where it reads
+    the first as "no layer", so appearing at an absent path must invalidate."""
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        return ("error", e.errno)
+    return ((st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode), _stat_sig(path))
+
+
 def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
-    """BMAD artifact paths, stat-gated on config.yaml; None when the project
-    is not initialized (or the config is unreadable)."""
+    """BMAD artifact paths, stat-gated on every config source `load_paths` reads
+    (the four central TOML layers and the legacy config.yaml), so an edit to any
+    of them is seen on the next call; None when the project is not initialized
+    (or the config is unreadable)."""
     project = resolve_or_lexical(project)
-    config_sig = _stat_sig(project / "_bmad" / "bmm" / "config.yaml")
+    sources = (*bmadconfig.CENTRAL_LAYERS_REL, bmadconfig.LEGACY_CONFIG_REL)
+    config_sigs = tuple(_config_source_sig(project / rel) for rel in sources)
     cached_paths = _paths_cache.get(project)
-    if config_sig is not None and cached_paths is not None and cached_paths[0] == config_sig:
+    if cached_paths is not None and cached_paths[0] == config_sigs:
         return cached_paths[1]
     try:
         paths = bmadconfig.load_paths(project)
     except (bmadconfig.BmadConfigError, OSError):
         return None
-    if config_sig is not None:
-        _paths_cache[project] = (config_sig, paths)
+    _paths_cache[project] = (config_sigs, paths)
     return paths
 
 
 def sprint_overview(project: Path) -> sprintstatus.SprintStatus | None:
     """Parsed sprint-status.yaml, or None when unavailable (uninitialized
-    project, missing file, bad YAML). Stat-gated on both config.yaml and the
+    project, missing file, bad YAML). Stat-gated on both the BMAD config and the
     sprint file; the same object is returned while the file is unchanged."""
     paths = _project_paths(project)
     if paths is None:

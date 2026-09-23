@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from conftest import (
@@ -22,9 +22,11 @@ from conftest import (
     install_build_auto_skill,
     install_dev_shim,
     refuse_to_resolve,
+    windows_relay_builder,
 )
 
 import bmad_loop.install as install_mod
+import bmad_loop.worktree_flow as worktree_flow_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import (
@@ -323,7 +325,9 @@ def test_registered_relay_paths_reads_installed_relay_from_either_os(
         }
     }
     paths = registered_relay_paths(config, "claude-settings-json", ["Stop"], tmp_path)
-    assert [str(path).replace("\\", "/") for path in paths] == [expected_path.replace("\\", "/")]
+    assert [str(path).replace("\\", "/") for path, _ in paths] == [expected_path.replace("\\", "/")]
+    # The spelling is the registered text, which `Path` would normalize on Windows.
+    assert [spelling for _, spelling in paths] == [expected_path]
 
 
 def test_init_preserves_different_script_with_same_basename(tmp_path):
@@ -397,7 +401,8 @@ def test_hook_command_uses_invoked_non_sibling_launcher(tmp_path, monkeypatch):
     launcher.chmod(0o755)
     monkeypatch.setattr(install_mod.sys, "argv", [str(launcher)])
     command = install_mod._hook_command(tmp_path, get_profile("claude"), "Stop")
-    assert shlex.split(command)[0] == str(launcher)
+    # Forward slashes on Windows, where Git Bash would eat backslashes (#773).
+    assert shlex.split(command)[0] == launcher.as_posix()
 
 
 def test_hook_command_refuses_unreadable_executable(tmp_path, monkeypatch):
@@ -415,6 +420,122 @@ def test_hook_command_refuses_unreadable_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(install_mod.os, "access", access)
     with pytest.raises(ProfileError, match="installed bmad-loop command is unavailable"):
         install_mod._hook_command(tmp_path, get_profile("claude"), "Stop")
+
+
+WINDOWS_RELAY = r"C:\Users\me\.local\bin\bmad-loop.exe"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="POSIX bash stands in for Git Bash; the win32 rows execute the real shells",
+)
+@pytest.mark.parametrize(
+    "windows_path", [WINDOWS_RELAY, r"C:\Program Files\x y\bmad-loop.exe"], ids=["plain", "spaces"]
+)
+def test_windows_relay_command_survives_bash(tmp_path, monkeypatch, windows_path):
+    """Claude Code runs hook commands under Git Bash on Windows (#773), where an
+    unquoted backslash is an escape: the registered executable must reach argv[0]
+    with every separator. `printf` echoes argv in place of the relay."""
+    build = windows_relay_builder(monkeypatch, tmp_path, windows_path)
+    command = build(tmp_path, get_profile("claude"), "Stop")
+    ran = subprocess.run(
+        ["bash", "-c", "printf '%s\\n' " + command], capture_output=True, text=True, check=True
+    )
+    argv = ran.stdout.splitlines()
+    assert argv[1:] == ["relay", "Stop"]
+    assert PureWindowsPath(argv[0]) == PureWindowsPath(windows_path)
+
+
+def test_relay_executable_recognizes_backslash_and_forward_slash_windows_forms(
+    tmp_path, monkeypatch
+):
+    build = windows_relay_builder(monkeypatch, tmp_path, WINDOWS_RELAY)
+    current = build(tmp_path, get_profile("claude"), "Stop")
+    assert current == "C:/Users/me/.local/bin/bmad-loop.exe relay Stop"
+    for command in (current, rf"{WINDOWS_RELAY} relay Stop"):
+        executable = relay_executable(command)
+        assert executable is not None
+        assert PureWindowsPath(str(executable)) == PureWindowsPath(WINDOWS_RELAY)
+
+
+def _stop_commands(config: dict) -> list[str]:
+    return [hook["command"] for group in config["hooks"]["Stop"] for hook in group["hooks"]]
+
+
+def test_merge_hooks_replaces_backslash_windows_relay_with_forward_slash_form(
+    tmp_path, monkeypatch
+):
+    """An install registered before #773 names the same executable with
+    backslashes: re-registration replaces it rather than adding a second relay,
+    and a second pass over the forward-slash form changes nothing."""
+    profile = get_profile("claude")
+    build = windows_relay_builder(monkeypatch, tmp_path, WINDOWS_RELAY)
+    registrations = {
+        native: build(tmp_path, profile, canonical)
+        for native, canonical in profile.hooks.events.items()
+    }
+    old = rf"{WINDOWS_RELAY} relay Stop"
+    config = {
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": old},
+                        {"type": "command", "command": "make lint"},
+                    ]
+                }
+            ]
+        }
+    }
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert sorted(_stop_commands(config)) == sorted([registrations["Stop"], "make lint"])
+    again, changed = merge_hooks(
+        json.loads(json.dumps(config)), registrations, profile.hooks.dialect
+    )
+    assert not changed and again == config
+
+
+def test_init_and_provision_replace_backslash_windows_relay(tmp_path, monkeypatch):
+    """Both writers — `init` and worktree provisioning — go through the Windows
+    builder here and replace the pre-#773 backslash registration exactly once."""
+    build = windows_relay_builder(monkeypatch, tmp_path, WINDOWS_RELAY)
+    monkeypatch.setattr(install_mod, "_hook_command", build)
+    monkeypatch.setattr(worktree_flow_mod, "_hook_command", build)
+    profile = get_profile("claude")
+    old = rf"{WINDOWS_RELAY} relay Stop"
+    current = "C:/Users/me/.local/bin/bmad-loop.exe relay Stop"
+    seeded = json.dumps(
+        {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": old},
+                            {"type": "command", "command": "make lint"},
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+
+    project = tmp_path / "project"
+    config = project / profile.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(seeded)
+    assert install_into(project, skills=False) == 0
+    migrated = config.read_bytes()
+    assert sorted(_stop_commands(json.loads(migrated))) == [current, "make lint"]
+    assert install_into(project, skills=False) == 0
+    assert config.read_bytes() == migrated
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / profile.hooks.config_path).parent.mkdir(parents=True)
+    (repo / profile.hooks.config_path).write_text(seeded)
+    provision_worktree(wt, [profile], repo, seed_files=[profile.hooks.config_path])
+    provisioned = json.loads((wt / profile.hooks.config_path).read_text())
+    assert sorted(_stop_commands(provisioned)) == [current, "make lint"]
 
 
 def test_provision_worktree_refuses_missing_installed_command(tmp_path, monkeypatch):
@@ -1221,6 +1342,142 @@ def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_p
 
     assert outside.read_bytes() == before  # the escape target is untouched
     assert "escapes the project" in capsys.readouterr().out
+
+
+def _worktree_snapshot(root: Path) -> str:
+    # every path git can see, ignored ones included: an init write anywhere in the
+    # sandbox — hook config, skills, a top-level policy.toml — changes this listing
+    return git(root, "status", "--porcelain", "--ignored", "--untracked-files=all")
+
+
+def _assert_init_left_no_state(root: Path, before: str, capsys) -> None:
+    # the #771 refusal runs before init's first write: the sandbox reads exactly as
+    # it did once the link was planted — and no `init complete` over a failed setup
+    out = capsys.readouterr().out
+    assert "FAIL: init target escapes the project" in out
+    assert "init complete" not in out
+    assert _worktree_snapshot(root) == before
+    claude = get_profile("claude")
+    assert not (root / claude.hooks.config_path).exists()
+    assert not (root / claude.skill_tree).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_refuses_a_bmad_loop_dir_symlinked_out_of_the_project(project, tmp_path, capsys):
+    root, outside = project.project, tmp_path / "outside"
+    outside.mkdir()
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    before = _worktree_snapshot(root)
+
+    assert install_into(root) == 1
+
+    assert list(outside.iterdir()) == []  # no policy.toml through the link
+    _assert_init_left_no_state(root, before, capsys)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_refuses_a_bmad_loop_dir_that_resolves_to_the_project_root(project, capsys):
+    # The row that grades the `.bmad-loop` check ALONE: an out-of-project link is
+    # also caught by the policy.toml check (it resolves through the same link), but
+    # a link back to the root leaves policy.toml strictly below the project — only
+    # the strictly-below test on the directory itself refuses the top-level write.
+    root = project.project
+    (root / ".bmad-loop").symlink_to(root, target_is_directory=True)
+    before = _worktree_snapshot(root)
+
+    assert install_into(root) == 1
+
+    assert not (root / "policy.toml").exists()
+    _assert_init_left_no_state(root, before, capsys)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions")
+def test_init_refuses_a_bmad_loop_dir_junctioned_out_of_the_project(project, tmp_path, capsys):
+    # the redirect an unprivileged Windows session can plant without elevation
+    import _winapi
+
+    root, outside = project.project, tmp_path / "outside"
+    outside.mkdir()
+    _winapi.CreateJunction(str(outside), str(root / ".bmad-loop"))
+    before = _worktree_snapshot(root)
+
+    assert install_into(root) == 1
+
+    assert list(outside.iterdir()) == []
+    _assert_init_left_no_state(root, before, capsys)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_refuses_a_dangling_policy_symlink_out_of_the_project(project, tmp_path, capsys):
+    # dangling: `is_file()` is False, so the unguarded path wrote THROUGH it
+    root, outside = project.project, tmp_path / "outside"
+    (root / ".bmad-loop").mkdir()
+    outside.mkdir()
+    (root / ".bmad-loop" / "policy.toml").symlink_to(outside / "policy.toml")
+    before = _worktree_snapshot(root)
+
+    assert install_into(root) == 1
+
+    assert not (outside / "policy.toml").exists()
+    _assert_init_left_no_state(root, before, capsys)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_refuses_a_gitignore_symlinked_out_of_the_project(project, tmp_path, capsys):
+    root, outside = project.project, tmp_path / "outside.gitignore"
+    outside.write_text("node_modules/", encoding="utf-8")
+    before_bytes = outside.read_bytes()
+    (root / ".gitignore").unlink()  # the sandbox's tracked one, swapped for the link
+    (root / ".gitignore").symlink_to(outside)
+    before = _worktree_snapshot(root)
+
+    assert install_into(root) == 1
+
+    assert outside.read_bytes() == before_bytes
+    _assert_init_left_no_state(root, before, capsys)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_init_appends_through_a_gitignore_symlinked_inside_the_project(project):
+    # an in-repo indirection the operator arranged: appended through, still a link,
+    # the target's content and mode intact — the ablation partner of the refusal
+    root = project.project
+    real = root / "config" / "ignore"
+    real.parent.mkdir()
+    real.write_text("node_modules/\n", encoding="utf-8")
+    real.chmod(0o640)
+    link = root / ".gitignore"
+    link.unlink()
+    link.symlink_to(real)
+
+    assert install_into(root, skills=False) == 0
+
+    assert link.is_symlink()
+    text = real.read_text(encoding="utf-8")
+    assert text.startswith("node_modules/\n")
+    assert ".bmad-loop/runs/" in text and ".bmad-loop/policy.toml" in text
+    assert stat.S_IMODE(real.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_init_gitignore_append_preserves_content_mode_and_is_idempotent(project):
+    # characterization of the ordinary-file path the #771 guard must not cost
+    gitignore = project.project / ".gitignore"
+    gitignore.write_bytes(b"node_modules/\n*.log")  # no trailing newline
+    gitignore.chmod(0o640)
+
+    assert install_into(project.project, skills=False) == 0
+
+    assert gitignore.read_bytes() == (
+        b"node_modules/\n*.log\n"
+        b".bmad-loop/runs/\n.bmad-loop/cache/\n.bmad-loop/policy.toml\n"
+        + f"{RENDER_DIR_REL}/\n".encode()
+    )
+    assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+    after_first = gitignore.read_bytes()
+
+    assert install_into(project.project, skills=False) == 0
+    assert gitignore.read_bytes() == after_first
 
 
 # ------------------------------------------------ atomic hook-config rewrite (#379)

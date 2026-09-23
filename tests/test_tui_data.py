@@ -10,7 +10,13 @@ import sys
 import time
 from pathlib import Path
 
-from conftest import install_bmad_config, refuse_to_resolve, write_sprint
+import pytest
+from conftest import (
+    install_bmad_central_config,
+    install_bmad_config,
+    refuse_to_resolve,
+    write_sprint,
+)
 
 from bmad_loop import bmadconfig, deferredwork, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
@@ -1107,6 +1113,55 @@ def test_project_paths_uses_one_canonical_cache_key(project):
     assert alternate_spelling not in data._paths_cache
 
 
+def _override_implementation_artifacts(project, rel: str) -> None:
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        f'[modules.bmm]\nimplementation_artifacts = "{{project-root}}/{rel}"\n',
+        encoding="utf-8",
+    )
+
+
+def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project):
+    """#769: the TOML layers outrank the legacy YAML the v6.12 installer still writes
+    beside them, so an override-layer edit must invalidate the cached snapshot.
+
+    Ablation: stat-gate on config.yaml alone and the second call serves the stale
+    artifact dir from cache.
+    """
+    install_bmad_config(project)
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    before = data._project_paths(root)
+    assert before is not None
+    assert data._project_paths(root) is before
+
+    _override_implementation_artifacts(project, "moved-impl")
+
+    after = data._project_paths(root)
+    assert after is not None
+    assert after.implementation_artifacts == root / "moved-impl"
+
+
+def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
+    """With no config.yaml there is still a source to stat-gate on: the snapshot is
+    cached (it used to be reloaded on every call) and a layer edit invalidates it."""
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    assert not (root / bmadconfig.LEGACY_CONFIG_REL).exists()
+
+    first = data._project_paths(root)
+    assert first is not None
+    assert data._paths_cache[root][1] is first
+    assert data._project_paths(root) is first
+
+    _override_implementation_artifacts(project, "moved-impl")
+
+    second = data._project_paths(root)
+    assert second is not None
+    assert second is not first
+    assert second.implementation_artifacts == root / "moved-impl"
+    assert data._paths_cache[root][1] is second
+
+
 def test_sprint_overview(project):
     install_bmad_config(project)
     write_sprint(
@@ -1412,3 +1467,22 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
     assert data._story_key_from_task_id("1-1-a-dev-1-g01", "dev") == "1-1-a-dev-1-g01"
     assert data._story_key_from_task_id("1-1-a-dev-1-g١", "dev") == "1-1-a-dev-1-g١"
     assert data._story_key_from_task_id("1-1-a-dev-1-g1-extra", "dev") == "1-1-a-dev-1-g1-extra"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project):
+    """`_stat_sig` follows links and folds every OSError into None, so a dangling
+    link created at a layer path that was absent signs exactly like the absence and
+    the cache served stale paths. `load_paths` refuses that link, so must the TUI.
+
+    Ablation: sign config sources with `_stat_sig` and the stale paths come back."""
+    install_bmad_config(project)
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
+    layer.unlink()  # an optional layer the operator never wrote
+    assert data._project_paths(root) is not None
+    assert root in data._paths_cache
+    layer.symlink_to("missing.toml")
+
+    assert data._project_paths(root) is None

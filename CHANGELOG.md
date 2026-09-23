@@ -26,9 +26,52 @@ breaking changes may land in a minor release.
   invalidates Codex hook trust: Codex re-prompts at the next launch, and hooks silently
   do not fire until the new commands are accepted. Re-run `bmad-loop init` to migrate
   managed registrations. `validate` warns when a hook still points to another installation.
+- Name an earlier attempt's parked work in the retry dev prompt (sprint, stories, sweep)
+  once Git confirms the ref still resolves on this task's baseline and a dev session
+  produced it; commits-only preservation is labelled, and nothing is replayed (#777).
 - Document the live-session removal guard's measured ceiling (#732): `delete`, `archive` and `clean` still remove a run directory when a listing omits a live session. Behavior unchanged; the psmux half is reported upstream (psmux/psmux#622), its retirement tracked in #754.
 
 ### Fixed
+
+- Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
+  and space-edged filenames; a resumed run's pre-fix baseline still protects the
+  files it listed; failed-unit diff capture includes them too (#783).
+
+- Run a declarative `post_story` hook from the repo root once the unit's worktree
+  is torn down, instead of failing on the removed cwd (#779).
+
+- Count `plugin-hook-error` entries in `diagnose`'s plugin-errors total (#779).
+
+- Register Windows hook commands with forward-slash paths so Git Bash no longer strips
+  their separators and stalls every session (#773); re-run `bmad-loop init` to migrate.
+  `validate` warns (`hooks.relay-stale`) while a backslash registration remains. Paths
+  with spaces remain unsupported under the PowerShell fallback.
+
+- Resolve artifact paths from BMAD's four-layer central `_bmad/config.toml`, falling
+  back to `_bmad/bmm/config.yaml` only for keys the TOML lacks, so a project whose paths
+  live only in the central TOML resolves them; refuse ambiguous, blank, non-string or
+  malformed TOML values instead of falling back; sweep triage reads the ledger the
+  orchestrator resolved (`BMAD_LOOP_LEDGER`) rather than re-deriving it from the YAML
+  (#154, #769).
+
+- Refuse `init` when `.bmad-loop`, its `policy.toml` or `.gitignore` resolves outside the
+  project, before any setup write (#771).
+
+- Parse plugin manifests in `validate` (`plugins.manifests`) without importing
+  plugin code; a malformed `plugin.toml` fails validate instead of engine start (#765).
+
+- Scope the sweep skill's `open_ids` and partition validation rules to the session's
+  triage universe, so a `--only` or `--min-severity` triage no longer lists every open
+  entry and burns a retry (#824).
+
+- Show a sweep run's effective `max_bundles`, `repeat` and `max_cycles` in text `status`,
+  labelled launch override or policy snapshot, plus its selector; unreadable or
+  tampered `sweep.json` reports `unverifiable` (#815).
+
+- Diagnose non-completed sweep triage and migration sessions: journal and escalate
+  whether `result.json` is missing, malformed or valid, and which of the attempt's
+  hook events arrived on either channel (not applicable for a hookless adapter
+  such as opencode-http); routing is unchanged (#752).
 
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 

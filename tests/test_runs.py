@@ -3084,7 +3084,7 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
     assert rewritten is (recorded != "unchanged")
     if recorded == "moved":
         assert message is not None
-        assert "the code root in _bmad/bmm/config.yaml has changed" in message
+        assert "the code root in the BMAD config has changed" in message
         # names NEITHER tree, like resume's: the fact is that the run changed
         # repositories, and the paths are the half that puts arbitrary text on a terminal
         assert str(now) not in message
@@ -3209,7 +3209,7 @@ def test_restamp_code_root_warns_for_this_calls_move_not_an_owed_record(tmp_path
     moved_message = runs.restamp_code_root(run.run_dir, now)
 
     assert moved_message is not None
-    assert "the code root in _bmad/bmm/config.yaml has changed" in moved_message
+    assert "the code root in the BMAD config has changed" in moved_message
     assert [(r["repo"], r["code_root_changed"], r["discharged_owed_move"]) for r in records()] == [
         (str(now), True, False)
     ]
