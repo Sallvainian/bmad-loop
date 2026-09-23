@@ -4593,6 +4593,19 @@ def test_safe_rollback_legacy_quoted_baseline_protects_preexisting(project):
     assert not verify.attempt_dirty(repo, baseline, legacy)  # the gate agrees
 
 
+@pytest.mark.parametrize("name", _VERBATIM_NAMES)
+def test_capture_diff_includes_verbatim_named_untracked(project, name):
+    """The failed-unit patch includes the file: `--no-index` is handed the real
+    name. The quoted spelling made it exit 1 with empty stdout, the code the loop
+    tolerates as "the files differ", so the file silently dropped out."""
+    repo = project.project
+    _quote_path_default(repo)
+    base = verify.rev_parse_head(repo)
+    (repo / name).write_text("verbatim content\n")
+
+    assert "+verbatim content" in verify.capture_diff(repo, base)
+
+
 def _touch_bytes_name(repo, raw):
     """Create an empty file whose name is the raw bytes ``raw`` (`Path` takes str only)."""
     with open(os.path.join(os.fsencode(repo), raw), "wb"):

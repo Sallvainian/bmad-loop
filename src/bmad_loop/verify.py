@@ -7625,13 +7625,15 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
 
     Unlike `_git`, the tracked diff is read from stdout alone and left verbatim
     (no strip, no stderr merge) so the patch stays applyable, as is the
-    `--no-index` spawn below it. The untracked leg now matches those two
-    (`_git_out`, #442): its `ls-files` exits 0 while still
-    warning on stderr, so against the merged stream the warning splits off as a
-    phantom rel. Measured, that phantom is inert here — `diff --no-index` cannot
-    access it and exits 1, exactly the code the loop below already tolerates as
-    "the files differ", with empty stdout — so this leg is converted for the same
-    reason its two neighbours read stdout alone, not on a demonstrated corruption.
+    `--no-index` spawn below it. The untracked names come from `untracked_files`,
+    which inherits the same stdout-alone read (#442) and returns each name
+    verbatim (#783). The line-based read it replaces got `core.quotePath`'s
+    C-quoted spelling of a non-ASCII name; `--no-index` cannot open that
+    spelling and exits 1 with empty stdout, the code the loop tolerates as "the
+    files differ", so the file silently dropped out of the patch. Residual: a
+    name the filesystem codec cannot decode still arrives as `untracked_files`'
+    quoted token, `--no-index` cannot open it, and it stays omitted — the same
+    residual #783 left.
 
     max_file_bytes caps the size of each *untracked* file included: a file larger
     than the cap is skipped and replaced with a one-line marker naming it and its
@@ -7643,13 +7645,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
         raise GitError(f"git diff {baseline} failed in {repo}: {proc.stderr.strip()}")
     parts = [proc.stdout]
 
-    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
-    if rc != 0:
-        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
-    for rel in out.splitlines():
-        rel = rel.strip()
-        if not rel:
-            continue
+    for rel in sorted(untracked_files(repo)):
         if max_file_bytes is not None:
             try:
                 size = (repo / rel).stat().st_size

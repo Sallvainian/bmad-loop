@@ -1110,7 +1110,7 @@ def summarize_journal(
         ),
         escalation_count=kinds.get("story-escalated", 0) + kinds.get("preference-escalation", 0),
         defer_count=kinds.get("story-deferred", 0),
-        plugin_error_count=kinds.get("plugin-error", 0),
+        plugin_error_count=kinds.get("plugin-error", 0) + kinds.get("plugin-hook-error", 0),
         per_alias_event_counts={a: dict(c) for a, c in per_alias.items()},
         entries=scrubbed,
     )

@@ -32,10 +32,12 @@ breaking changes may land in a minor release.
 
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
-  files it listed (#783).
+  files it listed; failed-unit diff capture includes them too (#783).
 
 - Run a declarative `post_story` hook from the repo root once the unit's worktree
   is torn down, instead of failing on the removed cwd (#779).
+
+- Count `plugin-hook-error` entries in `diagnose`'s plugin-errors total (#779).
 
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 
