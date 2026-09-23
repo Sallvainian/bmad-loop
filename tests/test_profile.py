@@ -72,6 +72,9 @@ def test_builtin_profiles_load():
         assert profiles[name].usage_grace_s == 0.0
         assert profiles[name].stop_without_result_nudges is None
         assert profiles[name].subagent_stop_without_transcript is False
+    # no shipped profile discards a SessionEnd from another session yet
+    for name in ("claude", "codex", "gemini", "copilot"):
+        assert profiles[name].ignore_foreign_session_end is False
     # claude forces its classic (inline/scrollback) renderer so a pane capture is
     # not collapsed to the final frame by the fullscreen alt-screen TUI, and
     # disables background tasks so a dev session cannot background its
@@ -121,6 +124,16 @@ def test_usage_grace_and_nudges_default_when_unset(tmp_path):
     assert prof.usage_grace_s == 0.0
     assert prof.stop_without_result_nudges is None
     assert prof.subagent_stop_without_transcript is False
+    assert prof.ignore_foreign_session_end is False
+
+
+def test_ignore_foreign_session_end_parses(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", "ignore_foreign_session_end = true\n\n[hooks]", 1)
+    )
+    assert load_profiles(tmp_path)["mycli"].ignore_foreign_session_end is True
 
 
 def test_seed_files_default_empty_when_unset(tmp_path):
