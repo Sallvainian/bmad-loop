@@ -1,0 +1,32 @@
+# xAI Grok CLI (>= 1.0.30). Grok reads project hooks from any JSON file in
+# .grok/hooks/, in the same `hooks` object shape as Claude Code's settings, and
+# its payload carries session_id and transcript_path. So the claude-settings-json
+# dialect applies unchanged, pointed at Grok's hook directory. Project hooks
+# run only in a trusted folder: until `/hooks-trust` has been run once in the
+# project, they silently never fire.
+#
+# Skills are discovered under .grok/skills (never .claude/skills). The prompt
+# uses the same "${skill} ... use subagents as needed" phrasing as codex. These
+# settings were live-verified on unattended dev and review runs on grok 1.0.30.
+#
+# Grok runs each subagent as its own session. SessionStart does not fire for a
+# subagent, but SessionEnd does, carrying the subagent's session id and its own
+# transcript (observed in 5 of 5 subagent teardowns on 1.0.30; described by the
+# 1.0.40 hook docs). ignore_foreign_session_end pins the main session from the
+# first SessionStart and ignores those, so a finished subagent is not read as the
+# CLI dying. Grok's SessionEnd is then mapped, so a real death is caught
+# immediately rather than by the window-death probe.
+name = "grok"
+binary = "grok"
+prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"
+bypass_args = ["--always-approve"]
+model_flag = "--model"
+usage_parser = "none"
+skill_tree = ".grok/skills"
+ignore_foreign_session_end = true
+first_run_note = "run `grok` once in the project and run /hooks-trust to trust project hooks (untrusted hooks never execute)"
+
+[hooks]
+dialect = "claude-settings-json"
+config_path = ".grok/hooks/bmad-loop.json"
+events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact" }

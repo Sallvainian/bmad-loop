@@ -1413,7 +1413,7 @@ source = "sprint-status"     # sprint-status | stories
 spec_folder = ""
 
 [adapter]
-name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
+name = "claude"              # claude | codex | gemini | copilot | antigravity | grok | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
 effort = ""                  # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
                              # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs ignore it

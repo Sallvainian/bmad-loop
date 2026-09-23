@@ -756,7 +756,7 @@ def test_install_into_full(tmp_path):
     assert final_gitignore.count(f"{RENDER_DIR_REL}/") == 1
 
 
-@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity", "grok"])
 def test_fresh_init_registers_installed_command_for_each_dialect(tmp_path, name):
     profile = get_profile(name)
     assert install_into(tmp_path, clis=(name,), skills=False) == 0

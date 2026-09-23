@@ -97,6 +97,9 @@ FAMILY_GLOBS = {
     "antigravity": (
         "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
     ),
+    # grok keeps one directory per session under a percent-encoded cwd, with the
+    # transcript (session/update stream) in updates.jsonl.
+    "grok": "~/.grok/sessions/*/*/updates.jsonl",
 }
 
 _TOKEN_KEY_RE = re.compile(

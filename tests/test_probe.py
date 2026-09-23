@@ -207,7 +207,9 @@ def test_discover_location_redacts_username(tmp_path, monkeypatch):
 # ----------------------------------------------------------- registration
 
 
-@pytest.mark.parametrize("dialect_cli", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize(
+    "dialect_cli", ["claude", "codex", "gemini", "copilot", "antigravity", "grok"]
+)
 def test_probe_hook_registers_under_native_events(dialect_cli):
     from bmad_loop.install import ANTIGRAVITY_HOOK_GROUP, merge_hooks
 
