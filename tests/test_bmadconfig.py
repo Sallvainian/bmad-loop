@@ -751,6 +751,29 @@ def test_a_layer_symlink_to_a_real_file_is_read(tmp_path: Path) -> None:
     assert bmadconfig.load_paths(root).implementation_artifacts == root.resolve() / "linked-impl"
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_a_layer_behind_an_unreadable_directory_refuses_typed(tmp_path: Path) -> None:
+    """An unreadable layer directory is neither absent nor an untyped crash: through
+    3.13 `exists()` raises PermissionError past every `except BmadConfigError`, and
+    on 3.14+ it reads the layer as absent so the YAML fills the key.
+
+    Ablation: probe with `exists()` again and this raises PermissionError (<=3.13) or
+    loads off the YAML (3.14+)."""
+    root = _toml_only(tmp_path)
+    _write_config(root)  # a valid legacy YAML must not rescue the load
+    custom = root / bmadconfig.CENTRAL_LAYERS_REL[2].parent
+    custom.mkdir(parents=True)
+    custom.chmod(0)
+    try:
+        with pytest.raises(bmadconfig.BmadConfigError, match="cannot read") as excinfo:
+            bmadconfig.load_paths(root)
+    finally:
+        custom.chmod(0o755)
+    assert str(root.resolve() / _LAYERS[2]) in str(excinfo.value)
+
+
 def test_no_toml_and_no_yaml_names_both_expected_locations(tmp_path: Path) -> None:
     root = tmp_path / "p"
     root.mkdir()

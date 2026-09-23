@@ -38,6 +38,8 @@ with the canonical root) by `_resolve`, for both sources."""
 
 from __future__ import annotations
 
+import errno
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -232,14 +234,29 @@ def _load_layer(path: Path) -> dict[str, object] | None:
     """One central TOML layer, None when absent. Present-but-unusable raises: the
     caller must never read an unparseable layer as "no TOML" and fall back. A link
     counts as present even when `exists()` (which follows it) says otherwise: a
-    dangling or looping symlink is an entry the operator put there, not an absence."""
-    if not path.exists() and not path.is_symlink():
+    dangling or looping symlink is an entry the operator put there, not an absence.
+    The probes are raw `lstat`/`stat`, not `exists()`: only a missing entry is
+    absent, and any other failure (an unreadable directory, a dead share) is this
+    layer's error — `exists()` raises it untyped through 3.13 and reads it as absent
+    on 3.14+, which would let the YAML fill the key."""
+    try:
+        entry = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
         return None
-    if path.is_symlink() and not path.exists():
-        raise BmadConfigError(
-            _diagnostic_text(f"BMAD config layer is a symlink that resolves to no file: {path}")
-        )
-    if not path.is_file():
+    except OSError as e:
+        raise BmadConfigError(_diagnostic_text(f"cannot read {path}: {e}")) from e
+    try:
+        target = path.stat()
+    except OSError as e:
+        # Dangling (ENOENT/ENOTDIR) or looping (ELOOP; WinError 1921) — anything else
+        # (EACCES on the target's directory) is a read failure, not a missing target.
+        unresolved = e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
+        if stat.S_ISLNK(entry.st_mode) and (unresolved or getattr(e, "winerror", None) == 1921):
+            raise BmadConfigError(
+                _diagnostic_text(f"BMAD config layer is a symlink that resolves to no file: {path}")
+            ) from e
+        raise BmadConfigError(_diagnostic_text(f"cannot read {path}: {e}")) from e
+    if not stat.S_ISREG(target.st_mode):
         raise BmadConfigError(_diagnostic_text(f"BMAD config layer is not a file: {path}"))
     try:
         # tomllib decodes as UTF-8 itself; a bad byte surfaces as UnicodeDecodeError
