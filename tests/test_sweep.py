@@ -5430,6 +5430,24 @@ def test_non_completed_triage_reports_hook_evidence_distinctly(project, primary,
     assert diag["hook_event_count"] == len(primary)
 
 
+def test_non_completed_triage_on_a_hookless_adapter_reports_hooks_not_applicable(project):
+    """opencode-http observes over SSE and never writes an event channel, so an
+    empty scan says nothing about its session: the diagnostic reports hooks as not
+    applicable instead of `none`, which would blame a relay it does not use.
+
+    Ablation guard: drop the observation gate and this fails on `hook_events`."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [failed_session_effect()] * 2)
+    adapter.observation = "sse"
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "n/a (sse observation)"
+    assert "hook_event_count" not in diag
+    assert diag["artifact"] == "missing"
+    assert "hook events: n/a (sse observation)]" in engine.state.paused_reason
+
+
 def test_failed_triage_after_a_healthy_attempt_reports_only_its_own_evidence(project):
     """Attempt 1 ran cleanly — SessionStart, Stop, a result.json on disk — but its
     plan failed validation; attempt 2 then timed out having left nothing. The

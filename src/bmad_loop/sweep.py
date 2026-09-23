@@ -3919,7 +3919,9 @@ class SweepEngine(Engine):
         document read-only.
 
         ``hook_events``: ``none`` | ``session-start-without-stop`` | ``stop`` |
-        ``no-session-start-or-stop`` | ``unreadable: <reason>``, counted over both
+        ``no-session-start-or-stop`` | ``unreadable: <reason>`` |
+        ``n/a (<observation> observation)`` for a triage adapter that does not
+        observe through hooks and so writes no events to count. Counted over both
         the out-of-tree channel and the legacy in-tree ``<run_dir>/events`` through
         ``signals.is_session_event`` — this attempt's session id and launch floor,
         so an earlier healthy attempt's events cannot mask this failure.
@@ -3955,6 +3957,13 @@ class SweepEngine(Engine):
                         diagnostic["artifact_error"] = _bounded("; ".join(errors))
                     else:
                         diagnostic["artifact"] = "valid"
+        # An adapter that does not observe through hooks (opencode-http's SSE)
+        # never writes either event channel, so an empty scan is no evidence about
+        # it; `none` would send its operator debugging a relay it does not use.
+        observation = self.adapters["triage"].observation
+        if observation != "hook-signal":
+            diagnostic["hook_events"] = f"n/a ({observation or 'unknown'} observation)"
+            return diagnostic
         try:
             events = session_events(
                 events_dir_for(self.paths.project, self.run_dir.name),
