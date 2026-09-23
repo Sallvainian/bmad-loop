@@ -33,6 +33,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Ignore a `SessionEnd` whose hook payload marks it as a subagent's own session (grok's
+  `subagentType`) instead of scoring it as a crash, and keep the subagent's id and
+  transcript from replacing the main session's. Event records now carry the field as
+  `subagent_type`; a `SessionEnd` without it still ends the session.
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).

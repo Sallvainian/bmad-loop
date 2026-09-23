@@ -33,6 +33,9 @@ class HookEvent:
     session_id: str | None
     transcript_path: str | None
     path: Path
+    # set when the CLI marks the event as a subagent's own session (grok's
+    # subagentType); the main session's events leave it None
+    subagent_type: str | None = None
 
 
 def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
@@ -61,6 +64,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         session_id=data.get("session_id"),
         transcript_path=data.get("transcript_path"),
         path=entry,
+        subagent_type=(sub if isinstance(sub := data.get("subagent_type"), str) and sub else None),
     )
 
 

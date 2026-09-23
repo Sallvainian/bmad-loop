@@ -1320,6 +1320,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # result-less completion -> false stall, and the main session's
                 # real transcript is preserved for usage tallying.
                 continue
+            if event.event == "SessionEnd" and event.subagent_type:
+                # Grok runs each subagent as its own session and fires SessionEnd
+                # when one finishes, marked with the subagent's type; the main
+                # session's own SessionEnd carries none. A finished subagent is not
+                # the CLI dying: ignore it (before adopting its id and transcript)
+                # so the main session keeps working.
+                continue
             session_id = event.session_id or session_id
             if event.transcript_path and event.transcript_path != transcript_path:
                 # Take the idle baseline as soon as a hook names a new transcript,

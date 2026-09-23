@@ -29,6 +29,15 @@ def test_poll_skips_malformed(tmp_path):
     assert watcher.poll() == []
 
 
+def test_poll_carries_the_subagent_marker_when_the_payload_names_one(tmp_path):
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "SessionEnd", subagent_type="general-purpose")
+    write_event(watcher.events_dir, 2, "t1", "SessionEnd", subagent_type="")
+    write_event(watcher.events_dir, 3, "t1", "SessionEnd", subagent_type=None)
+    write_event(watcher.events_dir, 4, "t1", "SessionEnd")
+    assert [e.subagent_type for e in watcher.poll()] == ["general-purpose", None, None, None]
+
+
 def test_wait_for_filters_task_and_kind(tmp_path):
     watcher = SignalWatcher(tmp_path / "events")
     write_event(watcher.events_dir, 1, "other-task", "Stop")

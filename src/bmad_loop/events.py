@@ -205,6 +205,9 @@ def shape_event(ts: int, event_name: str, task_id: str, payload: dict[str, Any])
         "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
+        # grok runs each subagent as its own session and names the subagent's type
+        # on that session's events; the main session's carry none.
+        "subagent_type": payload.get("subagentType"),
     }
 
 

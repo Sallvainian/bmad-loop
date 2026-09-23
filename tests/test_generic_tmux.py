@@ -1246,6 +1246,72 @@ def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_pa
     assert result.status == "stalled"
 
 
+def _hook_event(event, session_id, transcript_path=None, subagent_type=None):
+    return HookEvent(
+        ts=1,
+        event=event,
+        task_id="3-1-dev-1",
+        session_id=session_id,
+        transcript_path=transcript_path,
+        path=Path("x"),
+        subagent_type=subagent_type,
+    )
+
+
+def _write_done_spec_on_call(impl, n):
+    def flush(call_n):
+        if call_n == n:
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    return flush
+
+
+def test_wait_for_completion_ignores_subagent_session_end(tmp_path):
+    """Grok runs each subagent as its own session and fires SessionEnd when one
+    finishes, carrying the subagent's id and transcript and a subagentType the main
+    session's SessionEnd lacks. That is not the CLI dying: the session must keep
+    running, the main session's later Stop must drive completion, and the
+    subagent's id/transcript must never displace the main session's. Ablation:
+    with the subagent_type filter in wait_for_completion removed this test fails
+    ('crashed' == 'completed'). The marker, not the profile, decides, so the
+    default profile stands in for grok here."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", "main-sess"),
+            _hook_event(
+                "SessionEnd", "sub-sess", "/grok/sub-sess/updates.jsonl", "general-purpose"
+            ),
+            _hook_event("Stop", "main-sess", "/grok/main-sess/updates.jsonl"),
+        ],
+        on_call=_write_done_spec_on_call(impl, 3),
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert result.session_id == "main-sess"
+    assert result.transcript_path == "/grok/main-sess/updates.jsonl"
+
+
+@pytest.mark.parametrize(
+    "end_session", ["main-sess", "other-sess"], ids=["same-id", "different-id"]
+)
+def test_wait_for_completion_unmarked_session_end_still_crashes(tmp_path, end_session):
+    """Only the subagent marker excuses a SessionEnd. One without it is the CLI
+    dying, whatever session id it carries — a real death is never discarded on a
+    guess."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _hook_event("SessionStart", "main-sess"),
+            _hook_event("SessionEnd", end_session, "/t.jsonl"),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "crashed"
+
+
 def test_dev_stall_grace_defaults_from_policy(tmp_path):
     # dev sessions tolerate a result-less Stop (a turn ended awaiting a background
     # process) for the policy grace; the base/non-dev adapter never does (grace 0).

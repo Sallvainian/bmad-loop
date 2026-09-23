@@ -90,6 +90,18 @@ def test_antigravity_payload(tmp_path):
     assert event["cwd"] == "/ws"
 
 
+def test_grok_subagent_session_end_payload(tmp_path):
+    """grok marks a subagent's own SessionEnd with subagentType; the record keeps it
+    so the adapter can tell a finished subagent from the CLI dying."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    payload = {"sessionId": "sub-1", "subagentType": "general-purpose", "cwd": "/ws"}
+    proc = run_hook("SessionEnd", env, payload)
+    assert proc.returncode == 0
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text())
+    assert event["session_id"] == "sub-1"
+    assert event["subagent_type"] == "general-purpose"
+
+
 def test_workspace_paths_ignored_when_unusable(tmp_path):
     """An empty/odd workspacePaths must degrade to None, never IndexError."""
     env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
