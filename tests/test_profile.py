@@ -72,13 +72,9 @@ def test_builtin_profiles_load():
         assert profiles[name].usage_grace_s == 0.0
         assert profiles[name].stop_without_result_nudges is None
         assert profiles[name].subagent_stop_without_transcript is False
-    # grok runs each subagent as its own session and fires SessionEnd when one
-    # finishes, so only grok discards a SessionEnd from another session
-    assert profiles["grok"].ignore_foreign_session_end is True
-    for name in ("claude", "codex", "gemini", "copilot"):
-        assert profiles[name].ignore_foreign_session_end is False
     # grok: Claude-shaped hooks in its own hook dir, all four events mapped (its
-    # SessionEnd is safe to map because of the flag above), skills in .agents/skills
+    # SessionEnd is safe to map because the adapter ignores one marked as a
+    # subagent's), skills in .agents/skills
     assert profiles["grok"].hooks.dialect == "claude-settings-json"
     assert profiles["grok"].hooks.config_path == ".grok/hooks/bmad-loop.json"
     assert set(profiles["grok"].hooks.events.values()) == {
@@ -144,16 +140,6 @@ def test_usage_grace_and_nudges_default_when_unset(tmp_path):
     assert prof.usage_grace_s == 0.0
     assert prof.stop_without_result_nudges is None
     assert prof.subagent_stop_without_transcript is False
-    assert prof.ignore_foreign_session_end is False
-
-
-def test_ignore_foreign_session_end_parses(tmp_path):
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(
-        MINIMAL_PROFILE.replace("[hooks]", "ignore_foreign_session_end = true\n\n[hooks]", 1)
-    )
-    assert load_profiles(tmp_path)["mycli"].ignore_foreign_session_end is True
 
 
 def test_transcript_template_parses_and_defaults_empty(tmp_path):

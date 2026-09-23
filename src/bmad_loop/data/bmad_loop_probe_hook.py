@@ -74,6 +74,7 @@ def main() -> int:
             ),
             "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
             "cwd": payload.get("cwd") or _first_workspace(payload),
+            "subagent_type": payload.get("subagentType"),
         }
         _atomic_write(os.path.join(capture_dir, f"{ts}-{event_name}.signal.json"), signal)
         captured = dict(payload)

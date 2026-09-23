@@ -1246,7 +1246,7 @@ def test_wait_for_completion_transcriptless_stop_is_terminal_without_flag(tmp_pa
     assert result.status == "stalled"
 
 
-def _hook_event(event, session_id, transcript_path=None):
+def _hook_event(event, session_id, transcript_path=None, subagent_type=None):
     return HookEvent(
         ts=1,
         event=event,
@@ -1254,13 +1254,8 @@ def _hook_event(event, session_id, transcript_path=None):
         session_id=session_id,
         transcript_path=transcript_path,
         path=Path("x"),
+        subagent_type=subagent_type,
     )
-
-
-def _foreign_session_end_adapter(tmp_path, flag):
-    adapter, impl = make_dev_adapter(tmp_path)
-    adapter.profile = dataclasses.replace(adapter.profile, ignore_foreign_session_end=flag)
-    return adapter, impl
 
 
 def _write_done_spec_on_call(impl, n):
@@ -1273,18 +1268,21 @@ def _write_done_spec_on_call(impl, n):
     return flush
 
 
-def test_wait_for_completion_ignores_foreign_session_end(tmp_path):
-    """Grok (ignore_foreign_session_end) runs each subagent as its own session and
-    fires SessionEnd when one finishes, carrying the subagent's id and transcript.
-    That is not the CLI dying: the session must keep running, the main session's
-    later Stop must drive completion, and the subagent's id/transcript must never
-    displace the main session's. Ablation: with the filter in
-    wait_for_completion disabled this test fails ('crashed' == 'completed')."""
-    adapter, impl = _foreign_session_end_adapter(tmp_path, flag=True)
+def test_wait_for_completion_ignores_subagent_session_end(tmp_path):
+    """Grok runs each subagent as its own session and fires SessionEnd when one
+    finishes, carrying the subagent's id and transcript and a subagentType the main
+    session's SessionEnd lacks. That is not the CLI dying: the session must keep
+    running, the main session's later Stop must drive completion, and the
+    subagent's id/transcript must never displace the main session's. Ablation:
+    with the subagent_type filter in wait_for_completion removed this test fails
+    ('crashed' == 'completed')."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="grok")
     adapter.watcher = _ScriptedWatcher(
         [
             _hook_event("SessionStart", "main-sess"),
-            _hook_event("SessionEnd", "sub-sess", "/grok/sub-sess/updates.jsonl"),
+            _hook_event(
+                "SessionEnd", "sub-sess", "/grok/sub-sess/updates.jsonl", "general-purpose"
+            ),
             _hook_event("Stop", "main-sess", "/grok/main-sess/updates.jsonl"),
         ],
         on_call=_write_done_spec_on_call(impl, 3),
@@ -1295,53 +1293,23 @@ def test_wait_for_completion_ignores_foreign_session_end(tmp_path):
     assert result.transcript_path == "/grok/main-sess/updates.jsonl"
 
 
-def test_wait_for_completion_foreign_session_end_is_terminal_without_flag(tmp_path):
-    """Gating: a profile without ignore_foreign_session_end (claude) still reads
-    every SessionEnd as the CLI dying — the filter must not leak to other CLIs."""
-    adapter, impl = _foreign_session_end_adapter(tmp_path, flag=False)
+@pytest.mark.parametrize("profile_name", ["grok", "claude"])
+@pytest.mark.parametrize(
+    "end_session", ["main-sess", "other-sess"], ids=["same-id", "different-id"]
+)
+def test_wait_for_completion_unmarked_session_end_still_crashes(
+    tmp_path, profile_name, end_session
+):
+    """Only the subagent marker excuses a SessionEnd. One without it is the CLI
+    dying on every profile, whatever session id it carries — a real death is never
+    discarded on a guess."""
+    adapter, _ = make_dev_adapter(tmp_path, profile_name=profile_name)
     adapter.watcher = _ScriptedWatcher(
         [
             _hook_event("SessionStart", "main-sess"),
-            _hook_event("SessionEnd", "sub-sess", "/grok/sub-sess/updates.jsonl"),
-            _hook_event("Stop", "main-sess", "/grok/main-sess/updates.jsonl"),
-        ],
-        on_call=_write_done_spec_on_call(impl, 3),
-    )
-    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
-    assert result.status == "crashed"
-
-
-def test_wait_for_completion_main_session_end_still_crashes_with_flag(tmp_path):
-    """The flag only discards a SessionEnd from ANOTHER session: the main session's
-    own SessionEnd is still the CLI dying."""
-    adapter, _ = _foreign_session_end_adapter(tmp_path, flag=True)
-    adapter.watcher = _ScriptedWatcher(
-        [
-            _hook_event("SessionStart", "main-sess"),
-            _hook_event("SessionEnd", "main-sess", "/grok/main-sess/updates.jsonl"),
+            _hook_event("SessionEnd", end_session, "/t.jsonl"),
         ]
     )
-    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
-    assert result.status == "crashed"
-    assert result.session_id == "main-sess"
-
-
-@pytest.mark.parametrize(
-    "events",
-    [
-        # no SessionStart seen: nothing to compare against
-        [_hook_event("SessionEnd", "sub-sess")],
-        # SessionEnd carries no id: cannot be told apart from the main session's
-        [_hook_event("SessionStart", "main-sess"), _hook_event("SessionEnd", None)],
-    ],
-    ids=["no-anchor", "no-id"],
-)
-def test_wait_for_completion_unprovable_session_end_still_crashes_with_flag(tmp_path, events):
-    """Without a pinned main id, or without an id on the SessionEnd, the event
-    cannot be proven foreign, so it keeps today's meaning — a real death is never
-    discarded on a guess."""
-    adapter, _ = _foreign_session_end_adapter(tmp_path, flag=True)
-    adapter.watcher = _ScriptedWatcher(events)
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert result.status == "crashed"
 

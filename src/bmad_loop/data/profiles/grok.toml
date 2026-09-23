@@ -1,4 +1,4 @@
-# xAI Grok CLI (>= 1.0.30). Grok reads project hooks from any JSON file in
+# xAI Grok CLI (>= 1.0.41). Grok reads project hooks from any JSON file in
 # .grok/hooks/, in the same `hooks` object shape as Claude Code's settings, and
 # its payload carries session_id and transcript_path. So the claude-settings-json
 # dialect applies unchanged, pointed at Grok's hook directory. Project hooks
@@ -14,12 +14,13 @@
 # unattended dev and review runs on grok 1.0.30.
 #
 # Grok runs each subagent as its own session. SessionStart does not fire for a
-# subagent, but SessionEnd does, carrying the subagent's session id and its own
-# transcript (observed in 5 of 5 subagent teardowns on 1.0.30; described by the
-# 1.0.40 hook docs). ignore_foreign_session_end pins the main session from the
-# first SessionStart and ignores those, so a finished subagent is not read as the
-# CLI dying. Grok's SessionEnd is then mapped, so a real death is caught
-# immediately rather than by the window-death probe.
+# subagent, but SessionEnd does, carrying the subagent's session id, its own
+# transcript and a `subagentType` field the main session's SessionEnd lacks
+# (checked on 1.0.41, and grok's hook docs say the field exists so a host can tell
+# a child's teardown from its own). The generic adapter ignores a SessionEnd so
+# marked, so SessionEnd is mapped and a real death is caught immediately rather
+# than by the window-death probe. 1.0.41 is the floor because it is the oldest
+# release checked for that field.
 name = "grok"
 binary = "grok"
 prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"
@@ -37,7 +38,6 @@ usage_parser = "grok-updates"
 # lets the budget guard sample from the first heartbeat, not the first Stop.
 transcript_template = "~/.grok/sessions/{cwd_url}/{session_id}/updates.jsonl"
 skill_tree = ".agents/skills"
-ignore_foreign_session_end = true
 first_run_note = "run `grok` once in the project and run /hooks-trust to trust project hooks (untrusted hooks never execute)"
 
 [hooks]
