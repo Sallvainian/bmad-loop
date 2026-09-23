@@ -401,7 +401,8 @@ def test_hook_command_uses_invoked_non_sibling_launcher(tmp_path, monkeypatch):
     launcher.chmod(0o755)
     monkeypatch.setattr(install_mod.sys, "argv", [str(launcher)])
     command = install_mod._hook_command(tmp_path, get_profile("claude"), "Stop")
-    assert shlex.split(command)[0] == str(launcher)
+    # Forward slashes on Windows, where Git Bash would eat backslashes (#773).
+    assert shlex.split(command)[0] == launcher.as_posix()
 
 
 def test_hook_command_refuses_unreadable_executable(tmp_path, monkeypatch):
