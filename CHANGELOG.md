@@ -33,6 +33,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Add the `ignore_foreign_session_end` profile flag for CLIs that run each subagent as
+  its own session. When it is set, a `SessionEnd` whose id differs from the first
+  `SessionStart`'s is ignored instead of being scored as a crash, and the subagent's
+  id and transcript no longer replace the main session's. Without an id to compare,
+  a `SessionEnd` still ends the session. Default `false`, so no existing profile's
+  behaviour changes.
+
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).
