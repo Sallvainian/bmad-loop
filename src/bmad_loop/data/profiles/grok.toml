@@ -5,9 +5,13 @@
 # run only in a trusted folder: until `/hooks-trust` has been run once in the
 # project, they silently never fire.
 #
-# Skills are discovered under .grok/skills (never .claude/skills). The prompt
-# uses the same "${skill} ... use subagents as needed" phrasing as codex. These
-# settings were live-verified on unattended dev and review runs on grok 1.0.30.
+# Grok reads project skills from .grok/skills, .agents/skills and .claude/skills,
+# and .grok/skills wins a name clash (checked with `grok inspect` on 1.0.41). The
+# profile uses .agents/skills because that is where the BMad installer puts grok's
+# skills, so the run preflight and worktree seeding find bmad-build-auto beside the
+# bmad-loop-* skills `init` installs there. The prompt uses the same "${skill} ...
+# use subagents as needed" phrasing as codex. These settings were live-verified on
+# unattended dev and review runs on grok 1.0.30.
 #
 # Grok runs each subagent as its own session. SessionStart does not fire for a
 # subagent, but SessionEnd does, carrying the subagent's session id and its own
@@ -32,7 +36,7 @@ usage_parser = "grok-updates"
 # session folder grok 1.0.40 had written, 51 of 51). Deriving it at SessionStart
 # lets the budget guard sample from the first heartbeat, not the first Stop.
 transcript_template = "~/.grok/sessions/{cwd_url}/{session_id}/updates.jsonl"
-skill_tree = ".grok/skills"
+skill_tree = ".agents/skills"
 ignore_foreign_session_end = true
 first_run_note = "run `grok` once in the project and run /hooks-trust to trust project hooks (untrusted hooks never execute)"
 

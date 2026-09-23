@@ -315,8 +315,8 @@ them to whoever owns the machine:
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
-read from `.agents/skills/`; `grok` reads from `.grok/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
+`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, `antigravity`, and `grok`
+read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
 manage them yourself.

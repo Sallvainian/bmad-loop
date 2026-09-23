@@ -10,7 +10,7 @@ breaking changes may land in a minor release.
 ### Added
 
 - Ship a built-in `grok` profile (xAI Grok CLI ≥ 1.0.30, experimental). Hooks go in
-  `.grok/hooks/bmad-loop.json` in the Claude settings shape, skills in `.grok/skills/`,
+  `.grok/hooks/bmad-loop.json` in the Claude settings shape, skills in `.agents/skills/`,
   and `--always-approve` runs it unattended. `SessionEnd` is mapped, and
   `ignore_foreign_session_end` keeps a subagent's teardown from ending the session.
   `init` prints the `/hooks-trust` first-run step.
@@ -52,7 +52,6 @@ breaking changes may land in a minor release.
   id and transcript no longer replace the main session's. Without an id to compare,
   a `SessionEnd` still ends the session. Default `false`, so no existing profile's
   behaviour changes.
-
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).
