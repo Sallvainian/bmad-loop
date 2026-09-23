@@ -96,7 +96,14 @@ def _discover_project(project: Path) -> Iterator[PluginManifest]:
     user_dir = project / USER_PLUGINS_REL
     if not user_dir.is_dir():
         return
-    for entry in sorted(user_dir.iterdir()):
+    try:
+        entries = sorted(user_dir.iterdir())
+    except OSError as e:
+        # A plugins dir that exists but cannot be listed — permissions, an I/O
+        # error. Same conversion as `_read_manifest_text`: every consumer keys
+        # on PluginError, and validate --json must report it as a finding.
+        raise PluginError(f"plugin dir {user_dir}: unreadable: {e}") from e
+    for entry in entries:
         toml = entry / PLUGIN_FILE
         if entry.is_dir() and toml.is_file():
             yield load_manifest(

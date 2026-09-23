@@ -386,6 +386,30 @@ def test_unreadable_builtin_plugin_manifest_raises_plugin_error(monkeypatch):
     assert f"{names[0]}/{PLUGIN_FILE}" in str(excinfo.value)
 
 
+def test_unlistable_project_plugins_dir_raises_plugin_error(tmp_path, monkeypatch):
+    """A `.bmad-loop/plugins` that `is_dir()` but cannot be enumerated escaped
+    `_discover_project` as a bare OSError, which validate's `plugins.manifests`
+    boundary (and every other consumer) does not catch. The fault is targeted at
+    the project dir only: packaged built-ins are a real `Path` in a source
+    install, so a blanket `Path.iterdir` patch would fire in the builtin loop.
+
+    ABLATION: drop the try around `user_dir.iterdir()` and this raises
+    PermissionError instead."""
+    write_plugin(tmp_path, "proj", MINIMAL.format(name="proj"))
+    user_dir = tmp_path / USER_PLUGINS_REL
+    real_iterdir = Path.iterdir
+
+    def iterdir(self):
+        if self == user_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    with pytest.raises(PluginError, match="unreadable") as excinfo:
+        load_plugins(tmp_path)
+    assert str(user_dir) in str(excinfo.value)
+
+
 # ----------------------------------------------------- discovery / overlay
 
 

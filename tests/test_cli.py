@@ -10759,6 +10759,28 @@ def test_validate_never_imports_a_plugin_python_module(project, capsys, monkeypa
     assert "evil" in finding["detail"]["plugins"]
 
 
+def test_validate_json_reports_an_unlistable_plugins_dir(project, capsys, monkeypatch):
+    """A plugins dir that cannot be enumerated is a `plugins.manifests` problem
+    inside the one `--json` document, not an escaped OSError that empties stdout
+    and prints prose to stderr (`machine_json` asserts both)."""
+    _validate_with_plugin(
+        project, monkeypatch, capsys, "fine", '[plugin]\nname = "fine"\napi_version = 1\n'
+    )
+    user_dir = project.project / ".bmad-loop" / "plugins"
+    real_iterdir = Path.iterdir
+
+    def iterdir(self):
+        if self == user_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    [finding] = _plugin_findings(doc)
+    assert finding["severity"] == "problem"
+    assert str(user_dir) in finding["message"] and "unreadable" in finding["message"]
+
+
 def test_validate_reads_plugin_manifests_from_the_configured_repo_root(
     project, capsys, monkeypatch, tmp_path
 ):
