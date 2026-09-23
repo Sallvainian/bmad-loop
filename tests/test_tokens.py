@@ -7,6 +7,7 @@ from bmad_loop.tokens import (
     tally_codex_rollout,
     tally_copilot_events,
     tally_gemini_chat,
+    tally_grok_updates,
 )
 
 
@@ -240,3 +241,96 @@ def test_read_usage_dispatch(tmp_path):
         json.dumps({"data": {"modelMetrics": {"m": {"usage": {"inputTokens": 7}}}}}) + "\n"
     )
     assert read_usage("copilot-events", cop).input_tokens == 7
+
+
+def _grok_turn(input_tokens, output_tokens, cached=0, reasoning=0):
+    return {
+        "method": "_x.ai/session/update",
+        "params": {
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": "turn_completed",
+                "usage": {
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "cachedReadTokens": cached,
+                    "cacheCreationTokens": 0,
+                    "reasoningTokens": reasoning,
+                },
+            },
+        },
+    }
+
+
+def _grok_session(sessions, session_id, turns, children=(), noise=True):
+    session_dir = sessions / session_id
+    session_dir.mkdir(parents=True)
+    lines = [json.dumps(turn) for turn in turns]
+    if noise:
+        lines.insert(
+            0, json.dumps({"params": {"update": {"sessionUpdate": "agent_message_chunk"}}})
+        )
+        lines.append("not json")
+    (session_dir / "updates.jsonl").write_text("\n".join(lines) + "\n")
+    for n, child in enumerate(children):
+        # grok names the meta dir by subagent id; a fixed safe name keeps the
+        # child id under test confined to meta.json's contents
+        meta_dir = session_dir / "subagents" / f"sub-{n}"
+        meta_dir.mkdir(parents=True)
+        (meta_dir / "meta.json").write_text(json.dumps({"child_session_id": child}))
+    return session_dir / "updates.jsonl"
+
+
+def test_grok_updates_sums_own_turns(tmp_path):
+    path = _grok_session(
+        tmp_path,
+        "main",
+        [_grok_turn(1000, 50, cached=800, reasoning=20), _grok_turn(300, 10, cached=100)],
+    )
+    usage = tally_grok_updates(path)
+    assert usage.input_tokens == 400  # (1000 - 800) + (300 - 100): cached split out
+    assert usage.output_tokens == 60  # reasoning is already inside outputTokens
+    assert usage.cache_read_tokens == 900
+    assert usage.cache_creation_tokens == 0
+
+
+def test_grok_updates_adds_subagent_sessions(tmp_path):
+    path = _grok_session(tmp_path, "main", [_grok_turn(100, 10)], children=("kid-a", "kid-b"))
+    _grok_session(tmp_path, "kid-a", [_grok_turn(20, 2)])
+    _grok_session(tmp_path, "kid-b", [_grok_turn(30, 3), _grok_turn(40, 4)])
+    # grok's own usage.json can already hold a finished subagent's tokens; it must
+    # not be read, or those tokens would count twice
+    (tmp_path / "main" / "usage.json").write_text(
+        json.dumps({"session": {"inputTokens": 999999, "outputTokens": 999999}})
+    )
+    usage = tally_grok_updates(path)
+    assert usage.input_tokens == 190
+    assert usage.output_tokens == 19
+
+
+def test_grok_updates_skips_missing_escaping_and_cyclic_children(tmp_path):
+    """Ablation: without the bare-name check on child_session_id this fails
+    (7105 == 105, the outside session is read); without the seen-set the parent
+    and child re-queue each other and the tally never returns."""
+    sessions = tmp_path / "sessions"
+    path = _grok_session(
+        sessions, "main", [_grok_turn(100, 10)], children=("gone", "kid", "../outside")
+    )
+    # a child listing its parent must not loop or count the parent twice
+    _grok_session(sessions, "kid", [_grok_turn(5, 1)], children=("main",))
+    # a meta file naming a path outside the sessions folder is never followed
+    _grok_session(tmp_path, "outside", [_grok_turn(7000, 700)])
+    usage = tally_grok_updates(path)
+    assert usage.input_tokens == 105
+    assert usage.output_tokens == 11
+
+
+def test_grok_updates_without_turns_is_none(tmp_path):
+    path = _grok_session(tmp_path, "main", [])
+    assert tally_grok_updates(path) is None
+    assert tally_grok_updates(tmp_path / "nope" / "updates.jsonl") is None
+
+
+def test_read_usage_dispatches_grok_updates(tmp_path):
+    path = _grok_session(tmp_path, "main", [_grok_turn(3, 4)], noise=False)
+    assert read_usage("grok-updates", path).total == 7
