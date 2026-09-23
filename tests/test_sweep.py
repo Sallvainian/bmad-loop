@@ -32167,3 +32167,22 @@ def test_migration_forwards_lexical_symlink_identity_to_bound_publisher(project,
     assert seen == [(target.resolve(), ledger)]
     assert ledger.is_symlink()
     assert target.read_text(encoding="utf-8") == migrated_ledger()
+
+
+def test_triage_session_reads_the_ledger_load_paths_resolved(project):
+    """#769: the central TOML can move `implementation_artifacts` away from what the
+    legacy YAML still names. Triage must read the ledger the orchestrator resolved,
+    so the engine exports it; a bundle (dev) session never reads the ledger and
+    stays byte-identical.
+
+    Ablation: drop `SweepEngine._extra_session_env` and the env key is absent."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "leave it"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)])
+
+    engine.run()
+
+    assert adapter.sessions[0].env["BMAD_LOOP_LEDGER"] == str(engine.workspace.paths.deferred_work)
+    task = next(iter(engine.state.tasks.values()))
+    assert engine._extra_session_env(task, "dev") == {}
+    assert engine._extra_session_env(task, "triage", label="wf") == {}

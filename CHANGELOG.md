@@ -47,7 +47,9 @@ breaking changes may land in a minor release.
 - Resolve artifact paths from BMAD's four-layer central `_bmad/config.toml`, falling
   back to `_bmad/bmm/config.yaml` only for keys the TOML lacks, so a project whose paths
   live only in the central TOML resolves them; refuse ambiguous, blank, non-string or
-  malformed TOML values instead of falling back (#154, #769).
+  malformed TOML values instead of falling back; sweep triage reads the ledger the
+  orchestrator resolved (`BMAD_LOOP_LEDGER`) rather than re-deriving it from the YAML
+  (#154, #769).
 
 - Replace stale installed relay hooks when a project moves between Windows and POSIX.
 

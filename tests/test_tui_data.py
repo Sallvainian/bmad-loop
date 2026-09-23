@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 from conftest import (
     install_bmad_central_config,
     install_bmad_config,
@@ -1466,3 +1467,22 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
     assert data._story_key_from_task_id("1-1-a-dev-1-g01", "dev") == "1-1-a-dev-1-g01"
     assert data._story_key_from_task_id("1-1-a-dev-1-g١", "dev") == "1-1-a-dev-1-g١"
     assert data._story_key_from_task_id("1-1-a-dev-1-g1-extra", "dev") == "1-1-a-dev-1-g1-extra"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project):
+    """`_stat_sig` follows links and folds every OSError into None, so a dangling
+    link created at a layer path that was absent signs exactly like the absence and
+    the cache served stale paths. `load_paths` refuses that link, so must the TUI.
+
+    Ablation: sign config sources with `_stat_sig` and the stale paths come back."""
+    install_bmad_config(project)
+    install_bmad_central_config(project)
+    root = project.project.resolve()
+    layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
+    layer.unlink()  # an optional layer the operator never wrote
+    assert data._project_paths(root) is not None
+    assert root in data._paths_cache
+    layer.symlink_to("missing.toml")
+
+    assert data._project_paths(root) is None

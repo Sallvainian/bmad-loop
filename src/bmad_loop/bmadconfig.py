@@ -271,6 +271,20 @@ def _load_layer(path: Path) -> dict[str, object] | None:
         raise BmadConfigError(_diagnostic_text(f"cannot read {path}: {e}")) from e
 
 
+def _legacy_is_file(path: Path) -> bool:
+    """`path.is_file()` for the legacy YAML, with its probe failures typed. A missing
+    entry (or a dangling/looping link) is not a file, as `is_file()` always said;
+    any other failure — an unreadable `_bmad/bmm`, a dead share — raises, where
+    `is_file()` raises it untyped through 3.13 and reads it as absent on 3.14+,
+    misreporting an unreadable fallback as a missing key."""
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            return False
+        raise BmadConfigError(_diagnostic_text(f"cannot read {path}: {e}")) from e
+
+
 class _Table(dict[str, object]):
     """A table in the merged central config, with every layer that contributed to it
     — a table has no single source the way a leaf does."""
@@ -407,7 +421,7 @@ def load_paths(project: Path) -> ProjectPaths:
     config_path = project / LEGACY_CONFIG_REL
     central = _load_central(project)
     if central is None:
-        if not config_path.is_file():
+        if not _legacy_is_file(config_path):
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
                 f"BMAD config not found: neither the central TOML ({layers}) nor "
@@ -425,7 +439,7 @@ def load_paths(project: Path) -> ProjectPaths:
         if hit is not None:
             return hit
         if legacy is None:
-            legacy = _load_legacy(config_path) if config_path.is_file() else {}
+            legacy = _load_legacy(config_path) if _legacy_is_file(config_path) else {}
         raw = legacy.get(key)
         return (str(raw), f"`{key}` in {config_path}") if raw else None
 

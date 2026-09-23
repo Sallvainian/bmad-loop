@@ -774,6 +774,32 @@ def test_a_layer_behind_an_unreadable_directory_refuses_typed(tmp_path: Path) ->
     assert str(root.resolve() / _LAYERS[2]) in str(excinfo.value)
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+@pytest.mark.parametrize("central", [True, False], ids=["mixed", "yaml-only"])
+def test_an_unreadable_legacy_directory_refuses_typed(tmp_path: Path, central: bool) -> None:
+    """The legacy YAML probe gets the layers' typing: through 3.13 `is_file()` raises
+    PermissionError past every `except BmadConfigError`, and on 3.14+ it reads the
+    YAML as absent, misreporting an unreadable fallback as a missing key.
+
+    Ablation: probe with `config_path.is_file()` again and this raises
+    PermissionError (<=3.13) or the wrong BmadConfigError (3.14+)."""
+    root = tmp_path / "p"
+    root.mkdir()
+    if central:  # a TOML that omits the path keys, so the lookup falls to the YAML
+        _write_layer(root, 0, b'[core]\nuser_name = "me"\n')
+    _write_config(root)
+    legacy_dir = root / bmadconfig.LEGACY_CONFIG_REL.parent
+    legacy_dir.chmod(0)
+    try:
+        with pytest.raises(bmadconfig.BmadConfigError, match="cannot read") as excinfo:
+            bmadconfig.load_paths(root)
+    finally:
+        legacy_dir.chmod(0o755)
+    assert str(root.resolve() / bmadconfig.LEGACY_CONFIG_REL) in str(excinfo.value)
+
+
 def test_no_toml_and_no_yaml_names_both_expected_locations(tmp_path: Path) -> None:
     root = tmp_path / "p"
     root.mkdir()

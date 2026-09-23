@@ -5402,7 +5402,8 @@ class Engine:
     ) -> dict[str, str]:
         """Engine-variant additions to a session's environment. Base: none.
         StoriesEngine overrides this to export BMAD_LOOP_SPEC_FOLDER for the
-        adapter's deterministic id-keyed read-back. ``label`` is None for the
+        adapter's deterministic id-keyed read-back; SweepEngine exports
+        BMAD_LOOP_LEDGER to its triage sessions. ``label`` is None for the
         primary dev/review session and set for an injected plugin-workflow session,
         so a variant can scope its env to primary sessions only."""
         return {}

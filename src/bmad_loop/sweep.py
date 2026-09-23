@@ -4022,6 +4022,18 @@ class SweepEngine(Engine):
                 "The triage result.json failed deterministic validation:\n- " + "\n- ".join(errors),
             )
 
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
+        # Triage and migration sessions read the ledger the orchestrator resolved,
+        # not one they re-derive: `load_paths` layers the central TOML over the
+        # legacy YAML, and a skill reading the YAML alone would triage a stale
+        # ledger — or find none on a TOML-only install (#769). Bundle sessions
+        # never read the ledger, so they stay byte-identical.
+        if role != "triage" or label is not None:
+            return {}
+        return {"BMAD_LOOP_LEDGER": str(self.workspace.paths.deferred_work)}
+
     def _triage_prompt(self, feedback: Path | None, open_now: set[str] | None = None) -> str:
         prompt = "/bmad-loop-sweep"
         if open_now is not None and (self.only_ids is not None or self.min_severity is not None):
