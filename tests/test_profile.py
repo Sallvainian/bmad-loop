@@ -72,9 +72,23 @@ def test_builtin_profiles_load():
         assert profiles[name].usage_grace_s == 0.0
         assert profiles[name].stop_without_result_nudges is None
         assert profiles[name].subagent_stop_without_transcript is False
-    # no shipped profile discards a SessionEnd from another session yet
+    # grok runs each subagent as its own session and fires SessionEnd when one
+    # finishes, so only grok discards a SessionEnd from another session
+    assert profiles["grok"].ignore_foreign_session_end is True
     for name in ("claude", "codex", "gemini", "copilot"):
         assert profiles[name].ignore_foreign_session_end is False
+    # grok: Claude-shaped hooks in its own hook dir, all four events mapped (its
+    # SessionEnd is safe to map because of the flag above), skills in .grok/skills
+    assert profiles["grok"].hooks.dialect == "claude-settings-json"
+    assert profiles["grok"].hooks.config_path == ".grok/hooks/bmad-loop.json"
+    assert set(profiles["grok"].hooks.events.values()) == {
+        "SessionStart",
+        "Stop",
+        "SessionEnd",
+        "PreCompact",
+    }
+    assert profiles["grok"].skill_tree == ".grok/skills"
+    assert profiles["grok"].bypass_args == ("--always-approve",)
     # claude forces its classic (inline/scrollback) renderer so a pane capture is
     # not collapsed to the final frame by the fullscreen alt-screen TUI, and
     # disables background tasks so a dev session cannot background its
@@ -91,14 +105,14 @@ def test_builtin_profiles_load():
     # sentences: the "Unable to connect to API" connection failure and the
     # provider 5xx pair; still no quota cause, since no captured Claude Code
     # usage-limit line exists) and opencode-http (the serve process's
-    # `error.error="AI_APICallError: …"` field). The other four stay inert on
+    # `error.error="AI_APICallError: …"` field). The other five stay inert on
     # purpose: patterns for them could only be written from strings scraped off
     # public issue trackers, and an unverified pattern that fires on a healthy
     # session pauses the whole run. Precision is asserted in
     # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
     for name in ("claude", "opencode-http"):
         assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
-    for name in ("codex", "gemini", "copilot", "antigravity"):
+    for name in ("codex", "gemini", "copilot", "antigravity", "grok"):
         assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)

@@ -4,7 +4,8 @@
 - idempotently merges hook registrations into each selected CLI's hook config
   (dialect + native->canonical event map come from the CLI profile)
 - installs the bundled bmad-loop-* skills into each selected CLI's skill tree
-  (.claude/skills for claude, .agents/skills for codex/gemini/copilot)
+  (.claude/skills for claude, .agents/skills for codex/gemini/copilot,
+  .grok/skills for grok)
 - writes .bmad-loop/policy.toml from the template (if missing)
 - gitignores generated dirs: .bmad-loop/runs/ (per-run state) and
   .bmad-loop/cache/ (engine plugins' rebuildable caches, e.g. the Unity Library)

@@ -305,7 +305,7 @@ Runs `<binary> --version` / `--help`, locates the newest **already-existing**
 session transcript by convention, reads the declared hook config, and infers the
 token schema from the transcript. Works whenever you've used the CLI before, with
 zero execution risk. This is the right first step for any CLI that already has a
-profile (claude/codex/gemini/copilot/antigravity) or that you've run by hand.
+profile (claude/codex/gemini/copilot/antigravity/grok) or that you've run by hand.
 
 ### PROBE (`--probe` — opt-in live capture)
 
