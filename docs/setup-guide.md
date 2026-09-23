@@ -299,7 +299,8 @@ them to whoever owns the machine:
 - **grok** — run `grok` once in the project and run `/hooks-trust`: project hooks in
   `.grok/hooks/` never execute in an untrusted folder, and nothing reports that they were
   skipped. Trust covers subdirectories, so worktree isolation works. Requires Grok CLI
-  ≥ 1.0.41. Token usage is not recorded yet (`usage_parser = "none"`).
+  ≥ 1.0.41. Token usage is counted per completed turn, including subagents' turns, so a
+  turn cut short by a timeout or kill records none.
 - **opencode** — install the HTTP client extra (`pip install 'bmad-loop[opencode]'`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as

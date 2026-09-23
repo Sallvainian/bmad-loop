@@ -80,6 +80,7 @@ TRANSCRIPT_GLOBS = {
     "codex-rollout": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
     "gemini-chat": "~/.gemini/tmp/*/chats/session-*.jsonl",
     "copilot-events": "~/.copilot/session-state/*/events.jsonl",
+    "grok-updates": "~/.grok/sessions/*/*/updates.jsonl",
 }
 # Fallback family glob keyed by the `cli` name, so a CLI whose usage_parser is
 # still "none" (e.g. antigravity, freshly added) still gets transcript discovery.

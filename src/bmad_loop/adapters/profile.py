@@ -50,7 +50,14 @@ from ..platform_util import (
 from ..policy import PROFILE_ALIASES
 from .entrypoints import record_load_error
 
-USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
+USAGE_PARSERS = {
+    "claude-jsonl",
+    "codex-rollout",
+    "gemini-chat",
+    "copilot-events",
+    "grok-updates",
+    "none",
+}
 HOOK_DIALECTS = {
     "claude-settings-json",
     "codex-hooks-json",

@@ -26,7 +26,11 @@ binary = "grok"
 prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"
 bypass_args = ["--always-approve"]
 model_flag = "--model"
-usage_parser = "none"
+# Token usage is written per turn (the `turn_completed` update), so a turn cut
+# short by a timeout or kill records none, and the mid-session budget guard sees
+# a long turn only once it ends. turn_completed lands a median 47ms (at most
+# 770ms observed) after the Stop hook, well inside the event watcher's 1s poll.
+usage_parser = "grok-updates"
 skill_tree = ".agents/skills"
 first_run_note = "run `grok` once in the project and run /hooks-trust to trust project hooks (untrusted hooks never execute)"
 

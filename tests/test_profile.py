@@ -85,6 +85,7 @@ def test_builtin_profiles_load():
     }
     assert profiles["grok"].skill_tree == ".agents/skills"
     assert profiles["grok"].bypass_args == ("--always-approve",)
+    assert profiles["grok"].usage_parser == "grok-updates"
     # claude forces its classic (inline/scrollback) renderer so a pane capture is
     # not collapsed to the final frame by the fullscreen alt-screen TUI, and
     # disables background tasks so a dev session cannot background its

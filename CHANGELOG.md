@@ -13,7 +13,10 @@ breaking changes may land in a minor release.
   `.grok/hooks/bmad-loop.json` in the Claude settings shape, skills in `.agents/skills/`,
   and `--always-approve` runs it unattended. `SessionEnd` is mapped; a subagent's
   teardown no longer ends the session (see Fixed). `init` prints the `/hooks-trust`
-  first-run step. No usage parser yet.
+  first-run step.
+- Add the `grok-updates` usage parser. It sums the `turn_completed` usage of a grok
+  session and of each subagent session it spawned; grok's own `usage.json` is not
+  read, because it counts finished subagents in some turns and not others.
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
