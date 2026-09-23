@@ -1344,105 +1344,113 @@ def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_p
     assert "escapes the project" in capsys.readouterr().out
 
 
-def _assert_init_left_no_state(project: Path, capsys) -> None:
-    # the #771 refusal runs before init's first write: no hook config, no skills,
-    # no policy, no gitignore lines — and no `init complete` over a failed setup
+def _worktree_snapshot(root: Path) -> str:
+    # every path git can see, ignored ones included: an init write anywhere in the
+    # sandbox — hook config, skills, a top-level policy.toml — changes this listing
+    return git(root, "status", "--porcelain", "--ignored", "--untracked-files=all")
+
+
+def _assert_init_left_no_state(root: Path, before: str, capsys) -> None:
+    # the #771 refusal runs before init's first write: the sandbox reads exactly as
+    # it did once the link was planted — and no `init complete` over a failed setup
     out = capsys.readouterr().out
     assert "FAIL: init target escapes the project" in out
     assert "init complete" not in out
+    assert _worktree_snapshot(root) == before
     claude = get_profile("claude")
-    assert not (project / claude.hooks.config_path).exists()
-    assert not (project / claude.skill_tree).exists()
-    assert not (project / "policy.toml").exists()
-    gitignore = project / ".gitignore"
-    assert not gitignore.exists() or ".bmad-loop/runs/" not in gitignore.read_text()
+    assert not (root / claude.hooks.config_path).exists()
+    assert not (root / claude.skill_tree).exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_init_refuses_a_bmad_loop_dir_symlinked_out_of_the_project(tmp_path, capsys):
-    project, outside = tmp_path / "proj", tmp_path / "outside"
-    project.mkdir()
+def test_init_refuses_a_bmad_loop_dir_symlinked_out_of_the_project(project, tmp_path, capsys):
+    root, outside = project.project, tmp_path / "outside"
     outside.mkdir()
-    (project / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    before = _worktree_snapshot(root)
 
-    assert install_into(project) == 1
+    assert install_into(root) == 1
 
     assert list(outside.iterdir()) == []  # no policy.toml through the link
-    _assert_init_left_no_state(project, capsys)
+    _assert_init_left_no_state(root, before, capsys)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_init_refuses_a_bmad_loop_dir_that_resolves_to_the_project_root(tmp_path, capsys):
+def test_init_refuses_a_bmad_loop_dir_that_resolves_to_the_project_root(project, capsys):
     # The row that grades the `.bmad-loop` check ALONE: an out-of-project link is
     # also caught by the policy.toml check (it resolves through the same link), but
     # a link back to the root leaves policy.toml strictly below the project — only
     # the strictly-below test on the directory itself refuses the top-level write.
-    project = tmp_path / "proj"
-    project.mkdir()
-    (project / ".bmad-loop").symlink_to(project, target_is_directory=True)
+    root = project.project
+    (root / ".bmad-loop").symlink_to(root, target_is_directory=True)
+    before = _worktree_snapshot(root)
 
-    assert install_into(project) == 1
+    assert install_into(root) == 1
 
-    _assert_init_left_no_state(project, capsys)
+    assert not (root / "policy.toml").exists()
+    _assert_init_left_no_state(root, before, capsys)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions")
-def test_init_refuses_a_bmad_loop_dir_junctioned_out_of_the_project(tmp_path, capsys):
+def test_init_refuses_a_bmad_loop_dir_junctioned_out_of_the_project(project, tmp_path, capsys):
     # the redirect an unprivileged Windows session can plant without elevation
     import _winapi
 
-    project, outside = tmp_path / "proj", tmp_path / "outside"
-    project.mkdir()
+    root, outside = project.project, tmp_path / "outside"
     outside.mkdir()
-    _winapi.CreateJunction(str(outside), str(project / ".bmad-loop"))
+    _winapi.CreateJunction(str(outside), str(root / ".bmad-loop"))
+    before = _worktree_snapshot(root)
 
-    assert install_into(project) == 1
+    assert install_into(root) == 1
 
     assert list(outside.iterdir()) == []
-    _assert_init_left_no_state(project, capsys)
+    _assert_init_left_no_state(root, before, capsys)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_init_refuses_a_dangling_policy_symlink_out_of_the_project(tmp_path, capsys):
+def test_init_refuses_a_dangling_policy_symlink_out_of_the_project(project, tmp_path, capsys):
     # dangling: `is_file()` is False, so the unguarded path wrote THROUGH it
-    project, outside = tmp_path / "proj", tmp_path / "outside"
-    (project / ".bmad-loop").mkdir(parents=True)
+    root, outside = project.project, tmp_path / "outside"
+    (root / ".bmad-loop").mkdir()
     outside.mkdir()
-    (project / ".bmad-loop" / "policy.toml").symlink_to(outside / "policy.toml")
+    (root / ".bmad-loop" / "policy.toml").symlink_to(outside / "policy.toml")
+    before = _worktree_snapshot(root)
 
-    assert install_into(project) == 1
+    assert install_into(root) == 1
 
     assert not (outside / "policy.toml").exists()
-    _assert_init_left_no_state(project, capsys)
+    _assert_init_left_no_state(root, before, capsys)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_init_refuses_a_gitignore_symlinked_out_of_the_project(tmp_path, capsys):
-    project, outside = tmp_path / "proj", tmp_path / "outside.gitignore"
-    project.mkdir()
+def test_init_refuses_a_gitignore_symlinked_out_of_the_project(project, tmp_path, capsys):
+    root, outside = project.project, tmp_path / "outside.gitignore"
     outside.write_text("node_modules/", encoding="utf-8")
-    before = outside.read_bytes()
-    (project / ".gitignore").symlink_to(outside)
+    before_bytes = outside.read_bytes()
+    (root / ".gitignore").unlink()  # the sandbox's tracked one, swapped for the link
+    (root / ".gitignore").symlink_to(outside)
+    before = _worktree_snapshot(root)
 
-    assert install_into(project) == 1
+    assert install_into(root) == 1
 
-    assert outside.read_bytes() == before
-    _assert_init_left_no_state(project, capsys)
+    assert outside.read_bytes() == before_bytes
+    _assert_init_left_no_state(root, before, capsys)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_init_appends_through_a_gitignore_symlinked_inside_the_project(tmp_path):
+def test_init_appends_through_a_gitignore_symlinked_inside_the_project(project):
     # an in-repo indirection the operator arranged: appended through, still a link,
     # the target's content and mode intact — the ablation partner of the refusal
-    project = tmp_path / "proj"
-    real = project / "config" / "ignore"
-    real.parent.mkdir(parents=True)
+    root = project.project
+    real = root / "config" / "ignore"
+    real.parent.mkdir()
     real.write_text("node_modules/\n", encoding="utf-8")
     real.chmod(0o640)
-    link = project / ".gitignore"
+    link = root / ".gitignore"
+    link.unlink()
     link.symlink_to(real)
 
-    assert install_into(project, skills=False) == 0
+    assert install_into(root, skills=False) == 0
 
     assert link.is_symlink()
     text = real.read_text(encoding="utf-8")
@@ -1452,13 +1460,13 @@ def test_init_appends_through_a_gitignore_symlinked_inside_the_project(tmp_path)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
-def test_init_gitignore_append_preserves_content_mode_and_is_idempotent(tmp_path):
+def test_init_gitignore_append_preserves_content_mode_and_is_idempotent(project):
     # characterization of the ordinary-file path the #771 guard must not cost
-    gitignore = tmp_path / ".gitignore"
+    gitignore = project.project / ".gitignore"
     gitignore.write_bytes(b"node_modules/\n*.log")  # no trailing newline
     gitignore.chmod(0o640)
 
-    assert install_into(tmp_path, skills=False) == 0
+    assert install_into(project.project, skills=False) == 0
 
     assert gitignore.read_bytes() == (
         b"node_modules/\n*.log\n"
@@ -1468,7 +1476,7 @@ def test_init_gitignore_append_preserves_content_mode_and_is_idempotent(tmp_path
     assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
     after_first = gitignore.read_bytes()
 
-    assert install_into(tmp_path, skills=False) == 0
+    assert install_into(project.project, skills=False) == 0
     assert gitignore.read_bytes() == after_first
 
 
