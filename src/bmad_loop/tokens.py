@@ -22,6 +22,16 @@ transcript that yields nothing reads as None (untracked), not zero.
                  reasoningTokens} that is CUMULATIVE per model, so the last
                  entry bearing modelMetrics holds the session totals (summed
                  across models). reasoningTokens fold into output.
+- grok-updates:  ~/.grok/sessions/<encoded-cwd>/<session-id>/updates.jsonl; each
+                 `turn_completed` session update carries that turn's `usage`
+                 {inputTokens, outputTokens, cachedReadTokens,
+                 cacheCreationTokens, reasoningTokens} for the session's OWN
+                 model calls, summed. `inputTokens` includes the cached portion
+                 and reasoning is already inside `outputTokens` (totalTokens ==
+                 input + output). Each subagent is its own session in a sibling
+                 dir, listed by `subagents/<id>/meta.json` `child_session_id`,
+                 and is added the same way. The sibling usage.json is not read:
+                 it folds finished subagents into some turns and not others.
 """
 
 from __future__ import annotations
@@ -42,6 +52,8 @@ def read_usage(parser: str, transcript_path: Path) -> TokenUsage | None:
         return tally_gemini_chat(transcript_path)
     if parser == "copilot-events":
         return tally_copilot_events(transcript_path)
+    if parser == "grok-updates":
+        return tally_grok_updates(transcript_path)
     return None
 
 
@@ -193,4 +205,67 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
                 cache_creation_tokens=_int(usage.get("cacheWriteTokens")),
             )
         )
+    return total
+
+
+# ----------------------------------------------------------- grok-updates
+
+
+def _grok_own_turns(transcript_path: Path) -> TokenUsage | None:
+    total: TokenUsage | None = None
+    for entry in _jsonl_entries(transcript_path):
+        params = entry.get("params")
+        update = params.get("update") if isinstance(params, dict) else None
+        if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
+            continue
+        usage = update.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        cached = _int(usage.get("cachedReadTokens"))
+        if total is None:
+            total = TokenUsage()
+        total.add(
+            TokenUsage(
+                input_tokens=max(0, _int(usage.get("inputTokens")) - cached),
+                output_tokens=_int(usage.get("outputTokens")),
+                cache_read_tokens=cached,
+                cache_creation_tokens=_int(usage.get("cacheCreationTokens")),
+            )
+        )
+    return total
+
+
+def _grok_child_ids(session_dir: Path) -> list[str]:
+    ids: list[str] = []
+    subagents = session_dir / "subagents"
+    if not subagents.is_dir():
+        return ids
+    for meta_path in sorted(subagents.glob("*/meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        child = meta.get("child_session_id") if isinstance(meta, dict) else None
+        # a bare directory name only: never let a meta file steer the read
+        # outside the sessions folder
+        if isinstance(child, str) and child and Path(child).name == child:
+            ids.append(child)
+    return ids
+
+
+def tally_grok_updates(transcript_path: Path) -> TokenUsage | None:
+    total: TokenUsage | None = None
+    seen: set[str] = set()
+    pending = [transcript_path.parent]
+    while pending:
+        session_dir = pending.pop()
+        if session_dir.name in seen:
+            continue
+        seen.add(session_dir.name)
+        own = _grok_own_turns(session_dir / transcript_path.name)
+        if own is not None:
+            if total is None:
+                total = TokenUsage()
+            total.add(own)
+        pending.extend(session_dir.parent / child for child in _grok_child_ids(session_dir))
     return total
