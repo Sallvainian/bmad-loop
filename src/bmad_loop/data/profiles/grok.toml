@@ -23,9 +23,15 @@ bypass_args = ["--always-approve"]
 model_flag = "--model"
 # Token usage is written per turn (the `turn_completed` update), so a turn cut
 # short by a timeout or kill records none, and the mid-session budget guard sees
-# a long turn only once it ends. turn_completed lands a median 47ms (at most
-# 770ms observed) after the Stop hook, well inside the event watcher's 1s poll.
+# the main session's spend at each turn end and a subagent's when it finishes.
+# turn_completed lands a median 47ms (at most 770ms observed) after the Stop
+# hook, well inside the event watcher's 1s poll.
 usage_parser = "grok-updates"
+# Grok's SessionStart payload carries session_id and cwd but no transcript_path;
+# the transcript lives under the percent-encoded cwd (checked against every
+# session folder grok 1.0.40 had written, 51 of 51). Deriving it at SessionStart
+# lets the budget guard sample from the first heartbeat, not the first Stop.
+transcript_template = "~/.grok/sessions/{cwd_url}/{session_id}/updates.jsonl"
 skill_tree = ".grok/skills"
 ignore_foreign_session_end = true
 first_run_note = "run `grok` once in the project and run /hooks-trust to trust project hooks (untrusted hooks never execute)"

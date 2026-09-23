@@ -31,6 +31,7 @@ import json
 import shlex
 import stat
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +43,7 @@ from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from ..signals import SignalWatcher
+from ..signals import HookEvent, SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter, status_of
 from .base import (
@@ -1341,13 +1342,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # SessionEnd still ends the session below.
                     continue
             session_id = event.session_id or session_id
-            if event.transcript_path and event.transcript_path != transcript_path:
+            named_transcript = event.transcript_path
+            if not named_transcript and transcript_path is None:
+                # A CLI whose SessionStart names no transcript (Grok) would leave
+                # the budget guard and idle tracking blind until the first Stop;
+                # the profile's transcript_template fills the gap. A later event
+                # naming the real path still re-points it below.
+                named_transcript = self._derived_transcript(event)
+            if named_transcript and named_transcript != transcript_path:
                 # Take the idle baseline as soon as a hook names a new transcript,
                 # including a later re-point (#680). A write before the next
                 # heartbeat is then a change for the #727 work check rather than
                 # being absorbed into the baseline at exit.
-                sample_transcript(event.transcript_path, time.monotonic())
-            transcript_path = event.transcript_path or transcript_path
+                sample_transcript(named_transcript, time.monotonic())
+            transcript_path = named_transcript or transcript_path
 
             if event.event == "SessionStart":
                 continue
@@ -1735,6 +1743,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if usage is None:
             return None
         return usage.weighted_total(spec.cache_read_weight)
+
+    def _derived_transcript(self, event: HookEvent) -> str | None:
+        """The profile's transcript_template filled from a hook event, or None
+        when the profile has no template or the event lacks what it needs."""
+        template = self.profile.transcript_template
+        if not template or not event.session_id:
+            return None
+        if "{cwd_url}" in template and not event.cwd:
+            return None
+        rendered = template.format(
+            session_id=event.session_id,
+            cwd_url=urllib.parse.quote(event.cwd or "", safe=""),
+        )
+        return str(Path(rendered).expanduser())
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         if not result.transcript_path:

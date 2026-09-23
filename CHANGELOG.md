@@ -14,6 +14,11 @@ breaking changes may land in a minor release.
   and `--always-approve` runs it unattended. `SessionEnd` is mapped, and
   `ignore_foreign_session_end` keeps a subagent's teardown from ending the session.
   `init` prints the `/hooks-trust` first-run step.
+- Add the `transcript_template` profile key for CLIs whose `SessionStart` names no
+  transcript. The adapter derives the path from the event's session id and cwd, so the
+  mid-session token budget guard samples from the first heartbeat instead of waiting
+  for the first `Stop`. Hook events now carry the payload's `cwd`. The `grok` profile
+  sets it.
 - Add the `grok-updates` usage parser. It sums the `turn_completed` usage of a grok
   session and of each subagent session it spawned; grok's own `usage.json` is not
   read, because it counts finished subagents in some turns and not others.
