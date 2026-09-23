@@ -78,7 +78,7 @@ def test_builtin_profiles_load():
     for name in ("claude", "codex", "gemini", "copilot"):
         assert profiles[name].ignore_foreign_session_end is False
     # grok: Claude-shaped hooks in its own hook dir, all four events mapped (its
-    # SessionEnd is safe to map because of the flag above), skills in .grok/skills
+    # SessionEnd is safe to map because of the flag above), skills in .agents/skills
     assert profiles["grok"].hooks.dialect == "claude-settings-json"
     assert profiles["grok"].hooks.config_path == ".grok/hooks/bmad-loop.json"
     assert set(profiles["grok"].hooks.events.values()) == {
@@ -87,7 +87,7 @@ def test_builtin_profiles_load():
         "SessionEnd",
         "PreCompact",
     }
-    assert profiles["grok"].skill_tree == ".grok/skills"
+    assert profiles["grok"].skill_tree == ".agents/skills"
     assert profiles["grok"].bypass_args == ("--always-approve",)
     assert profiles["grok"].usage_parser == "grok-updates"
     assert profiles["grok"].transcript_template == (
