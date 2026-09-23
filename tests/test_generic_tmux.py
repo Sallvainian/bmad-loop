@@ -2630,6 +2630,82 @@ def test_budget_parser_none_is_inert(tmp_path, monkeypatch):
     assert not (adapter.run_dir / "ATTENTION").exists()
 
 
+def _grok_budget_adapter(tmp_path, monkeypatch, template):
+    adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch, usage_parser="grok-updates")
+    adapter.profile = dataclasses.replace(adapter.profile, transcript_template=template)
+    transcript = tmp_path / "sessions" / "%2Fwork%2Ftree" / "main-sess" / "updates.jsonl"
+    transcript.parent.mkdir(parents=True)
+    turn = {
+        "params": {"update": {"sessionUpdate": "turn_completed", "usage": {"inputTokens": 5000}}}
+    }
+    transcript.write_text(json.dumps(turn) + "\n")
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
+    grok_start = HookEvent(
+        ts=1,
+        event="SessionStart",
+        task_id="b-1",
+        session_id="main-sess",
+        transcript_path=None,  # grok's SessionStart names no transcript
+        path=Path("x"),
+        cwd="/work/tree",
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [grok_start, None, None, _stop_event("b-1", "main-sess", str(transcript))],
+        on_call=_advance_31(clock),
+    )
+    return adapter, transcript
+
+
+def test_budget_samples_a_derived_transcript_before_the_first_stop(tmp_path, monkeypatch):
+    """A CLI whose SessionStart names no transcript (grok) gets it from the
+    profile's transcript_template, so the budget guard trips on the heartbeats
+    BEFORE the first Stop instead of staying blind until it. Ablation: with the
+    derivation in wait_for_completion removed this fails (budget_weighted None:
+    the Stop arrives last, so nothing is sampled)."""
+    template = str(tmp_path / "sessions" / "{cwd_url}" / "{session_id}" / "updates.jsonl")
+    adapter, transcript = _grok_budget_adapter(tmp_path, monkeypatch, template)
+    result = adapter.wait_for_completion(_budget_handle(), _budget_spec(tmp_path, mode="warn"))
+
+    assert result.status == "completed"
+    assert result.budget_weighted == 5000
+    assert result.transcript_path == str(transcript)
+
+
+def test_budget_without_transcript_template_stays_blind_until_stop(tmp_path, monkeypatch):
+    """Gating: without a transcript_template the same grok-shaped session gives
+    the guard no transcript until the Stop, so nothing is sampled — every other
+    shipped profile keeps exactly this behaviour."""
+    adapter, transcript = _grok_budget_adapter(tmp_path, monkeypatch, template="")
+    result = adapter.wait_for_completion(_budget_handle(), _budget_spec(tmp_path, mode="warn"))
+
+    assert result.status == "completed"
+    assert result.budget_weighted is None
+    assert result.transcript_path == str(transcript)
+
+
+def test_derived_transcript_needs_a_session_id_and_the_cwd_it_names(tmp_path):
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter.profile = dataclasses.replace(
+        adapter.profile, transcript_template="~/s/{cwd_url}/{session_id}.jsonl"
+    )
+
+    def start(session_id, cwd):
+        return HookEvent(
+            ts=1,
+            event="SessionStart",
+            task_id="t",
+            session_id=session_id,
+            transcript_path=None,
+            path=Path("x"),
+            cwd=cwd,
+        )
+
+    derived = adapter._derived_transcript(start("sid", "/a b/c"))
+    assert derived == str(Path("~/s/%2Fa%20b%2Fc/sid.jsonl").expanduser())
+    assert adapter._derived_transcript(start(None, "/a")) is None
+    assert adapter._derived_transcript(start("sid", None)) is None
+
+
 def test_budget_mode_off_never_samples(tmp_path, monkeypatch):
     """Mode off: zero sampling — the transcript is never read despite huge
     usage, and behavior is byte-identical to today."""

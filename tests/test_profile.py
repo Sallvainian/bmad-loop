@@ -90,6 +90,11 @@ def test_builtin_profiles_load():
     assert profiles["grok"].skill_tree == ".grok/skills"
     assert profiles["grok"].bypass_args == ("--always-approve",)
     assert profiles["grok"].usage_parser == "grok-updates"
+    assert profiles["grok"].transcript_template == (
+        "~/.grok/sessions/{cwd_url}/{session_id}/updates.jsonl"
+    )
+    for name in ("claude", "codex", "gemini", "copilot"):
+        assert profiles[name].transcript_template == ""
     # claude forces its classic (inline/scrollback) renderer so a pane capture is
     # not collapsed to the final frame by the fullscreen alt-screen TUI, and
     # disables background tasks so a dev session cannot background its
@@ -149,6 +154,40 @@ def test_ignore_foreign_session_end_parses(tmp_path):
         MINIMAL_PROFILE.replace("[hooks]", "ignore_foreign_session_end = true\n\n[hooks]", 1)
     )
     assert load_profiles(tmp_path)["mycli"].ignore_foreign_session_end is True
+
+
+def test_transcript_template_parses_and_defaults_empty(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    assert load_profiles(tmp_path)["mycli"].transcript_template == ""
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", 'transcript_template = "~/s/{cwd_url}/{session_id}.jsonl"\n\n[hooks]', 1
+        )
+    )
+    assert (
+        load_profiles(tmp_path)["mycli"].transcript_template == "~/s/{cwd_url}/{session_id}.jsonl"
+    )
+
+
+@pytest.mark.parametrize(
+    "template,message",
+    [
+        ("~/s/{cwd_url}.jsonl", "must contain"),
+        ("~/s/{session_id}/{home}.jsonl", "placeholders must be among"),
+        ("~/s/{}/{session_id}.jsonl", "placeholders must be among"),
+        ("~/s/{session_id", "not a valid template"),
+    ],
+)
+def test_transcript_template_rejects_bad_placeholders(tmp_path, template, message):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f'transcript_template = "{template}"\n\n[hooks]', 1)
+    )
+    with pytest.raises(ProfileError, match=message):
+        load_profiles(tmp_path)
 
 
 def test_seed_files_default_empty_when_unset(tmp_path):

@@ -33,6 +33,9 @@ class HookEvent:
     session_id: str | None
     transcript_path: str | None
     path: Path
+    # the session's working directory as the CLI reported it; lets a profile
+    # derive a transcript path the payload itself does not carry
+    cwd: str | None = None
 
 
 def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
@@ -61,6 +64,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         session_id=data.get("session_id"),
         transcript_path=data.get("transcript_path"),
         path=entry,
+        cwd=cwd if isinstance(cwd := data.get("cwd"), str) and cwd else None,
     )
 
 

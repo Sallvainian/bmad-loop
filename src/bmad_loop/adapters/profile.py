@@ -33,6 +33,7 @@ profile state a TOML author would have been refused.
 from __future__ import annotations
 
 import importlib.metadata
+import string
 import tomllib
 from dataclasses import dataclass, field, replace
 from importlib import resources
@@ -68,6 +69,7 @@ HOOK_DIALECTS = {
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
 }
+TRANSCRIPT_TEMPLATE_FIELDS = {"session_id", "cwd_url"}
 CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
@@ -160,6 +162,15 @@ class CLIProfile:
     # id/transcript never displace the main session's. A SessionEnd with no id,
     # or one seen before any SessionStart, still ends the session as before.
     ignore_foreign_session_end: bool = False
+    # Where the CLI keeps a session's transcript, for CLIs whose SessionStart
+    # payload carries a session id and cwd but no transcript path (Grok). The
+    # adapter fills it in on the first hook event that names none, so the
+    # mid-session token budget guard and idle tracking see the transcript from
+    # the start instead of from the first Stop. Placeholders: {session_id} and
+    # {cwd_url} (the cwd percent-encoded, "/" included); a leading "~" expands.
+    # Empty = rely on the payload (every other shipped profile). A wrong guess
+    # is harmless: the file is simply absent until a Stop names the real path.
+    transcript_template: str = ""
     first_run_note: str = ""
     # project-relative gitignored configs (MCP/CLI settings) this CLI needs but
     # that a `git worktree add` checkout omits; provision_worktree copies them in
@@ -353,6 +364,24 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
         )
 
+    if profile.transcript_template:
+        try:
+            fields = {
+                name
+                for _, name, _, _ in string.Formatter().parse(profile.transcript_template)
+                if name is not None
+            }
+        except ValueError as e:
+            raise fail(f"transcript_template is not a valid template: {e}") from e
+        unknown = fields - TRANSCRIPT_TEMPLATE_FIELDS
+        if unknown:
+            raise fail(
+                f"transcript_template placeholders must be among "
+                f"{sorted(TRANSCRIPT_TEMPLATE_FIELDS)}: got {sorted(unknown)}"
+            )
+        if "session_id" not in fields:
+            raise fail("transcript_template must contain {session_id}")
+
     if profile.usage_grace_s < 0:
         raise fail(f"usage_grace_s must be >= 0: got {profile.usage_grace_s}")
 
@@ -481,6 +510,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         ),
         subagent_stop_without_transcript=bool(doc.get("subagent_stop_without_transcript", False)),
         ignore_foreign_session_end=bool(doc.get("ignore_foreign_session_end", False)),
+        transcript_template=str(doc.get("transcript_template", "")),
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
