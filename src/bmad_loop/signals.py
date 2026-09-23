@@ -36,6 +36,9 @@ class HookEvent:
     # the session's working directory as the CLI reported it; lets a profile
     # derive a transcript path the payload itself does not carry
     cwd: str | None = None
+    # set when the CLI marks the event as a subagent's own session (grok's
+    # subagentType); the main session's events leave it None
+    subagent_type: str | None = None
 
 
 def _event_dirs(events_dir: Path, legacy_dir: Path | None) -> list[Path]:
@@ -65,6 +68,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         transcript_path=data.get("transcript_path"),
         path=entry,
         cwd=cwd if isinstance(cwd := data.get("cwd"), str) and cwd else None,
+        subagent_type=(sub if isinstance(sub := data.get("subagent_type"), str) and sub else None),
     )
 
 

@@ -154,14 +154,6 @@ class CLIProfile:
     # completion (and supplies the transcript for usage tallying). Without this a
     # subagent's premature Stop reads as a result-less completion -> false stall.
     subagent_stop_without_transcript: bool = False
-    # Some CLIs (Grok) run each subagent as its own session and fire SessionEnd
-    # when the SUBAGENT finishes, carrying the subagent's session id and its own
-    # transcript. When true, the first SessionStart's session id is pinned as the
-    # main session and a SessionEnd carrying a different id is ignored, so a
-    # finished subagent is not read as the CLI dying (-> false "crashed") and its
-    # id/transcript never displace the main session's. A SessionEnd with no id,
-    # or one seen before any SessionStart, still ends the session as before.
-    ignore_foreign_session_end: bool = False
     # Where the CLI keeps a session's transcript, for CLIs whose SessionStart
     # payload carries a session id and cwd but no transcript path (Grok). The
     # adapter fills it in on the first hook event that names none, so the
@@ -509,7 +501,6 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             None if (raw := doc.get("stop_without_result_nudges")) is None else int(raw)
         ),
         subagent_stop_without_transcript=bool(doc.get("subagent_stop_without_transcript", False)),
-        ignore_foreign_session_end=bool(doc.get("ignore_foreign_session_end", False)),
         transcript_template=str(doc.get("transcript_template", "")),
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=str_list("seed_files"),

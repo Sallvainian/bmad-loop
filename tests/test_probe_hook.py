@@ -47,6 +47,7 @@ def test_writes_signal_and_payload(tmp_path):
     assert signal["task_id"] == "probe"
     assert signal["session_id"] == "abc-123"
     assert signal["transcript_path"].endswith("events.jsonl")
+    assert signal["subagent_type"] is None
 
     captured = json.loads(payloads[0].read_text())
     # the ENTIRE raw payload survives (un-sanitized; the command scrubs later)

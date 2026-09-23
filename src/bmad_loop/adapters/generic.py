@@ -845,10 +845,6 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         wall_deadline = time.time() + spec.timeout_s
         session_id: str | None = None
         transcript_path: str | None = None
-        # the first SessionStart's id, pinned only for profiles that set
-        # ignore_foreign_session_end: the anchor that tells the main session's
-        # SessionEnd from a subagent's (see the filter in the event branch).
-        main_session_id: str | None = None
         nudges_left = self._stop_nudges
         # Positive grace arms at launch for dev/review sessions, so a CLI that
         # goes silent before its first Stop cannot burn the full wall timeout. A
@@ -1325,22 +1321,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # result-less completion -> false stall, and the main session's
                 # real transcript is preserved for usage tallying.
                 continue
-            if self.profile.ignore_foreign_session_end:
-                if event.event == "SessionStart" and main_session_id is None:
-                    main_session_id = event.session_id or None
-                elif (
-                    event.event == "SessionEnd"
-                    and main_session_id
-                    and event.session_id
-                    and event.session_id != main_session_id
-                ):
-                    # Grok runs each subagent as its own session and fires
-                    # SessionEnd when it finishes, carrying the subagent's id. That
-                    # is not the CLI dying: ignore it (before adopting its id and
-                    # transcript) so the main session keeps working. Without an
-                    # anchor or an id there is nothing to compare, so the
-                    # SessionEnd still ends the session below.
-                    continue
+            if event.event == "SessionEnd" and event.subagent_type:
+                # Grok runs each subagent as its own session and fires SessionEnd
+                # when one finishes, marked with the subagent's type; the main
+                # session's own SessionEnd carries none. A finished subagent is not
+                # the CLI dying: ignore it (before adopting its id and transcript)
+                # so the main session keeps working.
+                continue
             session_id = event.session_id or session_id
             named_transcript = event.transcript_path
             if not named_transcript and transcript_path is None:

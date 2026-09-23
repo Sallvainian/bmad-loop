@@ -9,11 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- Ship a built-in `grok` profile (xAI Grok CLI ≥ 1.0.30, experimental). Hooks go in
+- Ship a built-in `grok` profile (xAI Grok CLI ≥ 1.0.41, experimental). Hooks go in
   `.grok/hooks/bmad-loop.json` in the Claude settings shape, skills in `.agents/skills/`,
-  and `--always-approve` runs it unattended. `SessionEnd` is mapped, and
-  `ignore_foreign_session_end` keeps a subagent's teardown from ending the session.
-  `init` prints the `/hooks-trust` first-run step.
+  and `--always-approve` runs it unattended. `SessionEnd` is mapped; a subagent's
+  teardown no longer ends the session (see Fixed). `init` prints the `/hooks-trust`
+  first-run step.
 - Add the `transcript_template` profile key for CLIs whose `SessionStart` names no
   transcript. The adapter derives the path from the event's session id and cwd, so the
   mid-session token budget guard samples from the first heartbeat instead of waiting
@@ -46,12 +46,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Add the `ignore_foreign_session_end` profile flag for CLIs that run each subagent as
-  its own session. When it is set, a `SessionEnd` whose id differs from the first
-  `SessionStart`'s is ignored instead of being scored as a crash, and the subagent's
-  id and transcript no longer replace the main session's. Without an id to compare,
-  a `SessionEnd` still ends the session. Default `false`, so no existing profile's
-  behaviour changes.
+- Ignore a `SessionEnd` whose hook payload marks it as a subagent's own session (grok's
+  `subagentType`) instead of scoring it as a crash, and keep the subagent's id and
+  transcript from replacing the main session's. Event records now carry the field as
+  `subagent_type`; a `SessionEnd` without it still ends the session.
 - Read untracked paths verbatim so rollback snapshots and cleanup handle non-ASCII
   and space-edged filenames; a resumed run's pre-fix baseline still protects the
   files it listed; failed-unit diff capture includes them too (#783).

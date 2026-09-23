@@ -126,6 +126,7 @@ def test_relay_and_the_hook_shape_the_same_event(tmp_path, monkeypatch):
         "conversationId": "agy-3",
         "transcriptPath": "/ws/transcript.jsonl",
         "workspacePaths": ["/ws"],
+        "subagentType": "general-purpose",
     }
     hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
 
@@ -438,6 +439,7 @@ def test_relay_writes_the_event_and_says_nothing(tmp_path, monkeypatch, capsys):
     assert event["task_id"] == "1-1-a-dev-1"
     assert event["session_id"] == "abc-123"
     assert event["transcript_path"].endswith("abc-123.jsonl")
+    assert event["subagent_type"] is None  # a main-session event carries no marker
     assert not list((tmp_path / "events").glob("*.tmp"))
 
 
