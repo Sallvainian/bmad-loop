@@ -180,7 +180,8 @@ would not carry.
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
-`antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
+`antigravity` (Google's `agy`, experimental — `isolation = "none"` only), `grok` (xAI's
+Grok CLI, experimental), and `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
@@ -260,7 +261,7 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, `grok`, or `opencode-http` (alias
 `opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
 profile like `opencode-http` installs its skills but registers no hooks (it signals over
 HTTP/SSE).
@@ -295,6 +296,10 @@ them to whoever owns the machine:
   - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
     not a gap: agy's transcript carries no usage data at all (it counts tokens only in
     an internal SQLite/protobuf store). Runs work; the token columns stay empty.
+- **grok** — run `grok` once in the project and run `/hooks-trust`: project hooks in
+  `.grok/hooks/` never execute in an untrusted folder, and nothing reports that they were
+  skipped. Trust covers subdirectories, so worktree isolation works. Requires Grok CLI
+  ≥ 1.0.41. Token usage is not recorded yet (`usage_parser = "none"`).
 - **opencode** — install the HTTP client extra (`pip install 'bmad-loop[opencode]'`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
@@ -309,7 +314,7 @@ them to whoever owns the machine:
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
+`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, `antigravity`, and `grok`
 read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
@@ -410,6 +415,7 @@ that hook event):
 - **gemini** — `.gemini/settings.json`
 - **copilot** — `.github/copilot/settings.json`
 - **antigravity** — `.agents/hooks.json` (the `bmad-loop` hook group)
+- **grok** — `.grok/hooks/bmad-loop.json`
 
 Edit only the registered CLIs. Match the full relay command and event; leave every
 other hook in place. The installed `bmad-loop` executable is shared with other projects,

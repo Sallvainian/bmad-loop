@@ -9,6 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Ship a built-in `grok` profile (xAI Grok CLI ≥ 1.0.41, experimental). Hooks go in
+  `.grok/hooks/bmad-loop.json` in the Claude settings shape, skills in `.agents/skills/`,
+  and `--always-approve` runs it unattended. `SessionEnd` is mapped; a subagent's
+  teardown no longer ends the session (see Fixed). `init` prints the `/hooks-trust`
+  first-run step. No usage parser yet.
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage

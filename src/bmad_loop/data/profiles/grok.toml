@@ -1,0 +1,36 @@
+# xAI Grok CLI (>= 1.0.41). Grok reads project hooks from any JSON file in
+# .grok/hooks/, in the same `hooks` object shape as Claude Code's settings, and
+# its payload carries session_id and transcript_path. So the claude-settings-json
+# dialect applies unchanged, pointed at Grok's hook directory. Project hooks
+# run only in a trusted folder: until `/hooks-trust` has been run once in the
+# project, they silently never fire.
+#
+# Grok reads project skills from .grok/skills, .agents/skills and .claude/skills,
+# and .grok/skills wins a name clash (checked with `grok inspect` on 1.0.41). The
+# profile uses .agents/skills because that is where the BMad installer puts grok's
+# skills, so the run preflight and worktree seeding find bmad-build-auto beside the
+# bmad-loop-* skills `init` installs there. The prompt uses the same "${skill} ...
+# use subagents as needed" phrasing as codex. These settings were live-verified on
+# unattended dev and review runs on grok 1.0.30.
+#
+# Grok runs each subagent as its own session. SessionStart does not fire for a
+# subagent, but SessionEnd does, carrying the subagent's session id, its own
+# transcript and a `subagentType` field the main session's SessionEnd lacks
+# (checked on 1.0.41, and grok's hook docs say the field exists so a host can tell
+# a child's teardown from its own). The generic adapter ignores a SessionEnd so
+# marked, so SessionEnd is mapped and a real death is caught immediately rather
+# than by the window-death probe. 1.0.41 is the floor because it is the oldest
+# release checked for that field.
+name = "grok"
+binary = "grok"
+prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"
+bypass_args = ["--always-approve"]
+model_flag = "--model"
+usage_parser = "none"
+skill_tree = ".agents/skills"
+first_run_note = "run `grok` once in the project and run /hooks-trust to trust project hooks (untrusted hooks never execute)"
+
+[hooks]
+dialect = "claude-settings-json"
+config_path = ".grok/hooks/bmad-loop.json"
+events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact" }
