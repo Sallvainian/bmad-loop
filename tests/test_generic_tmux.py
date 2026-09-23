@@ -1275,8 +1275,9 @@ def test_wait_for_completion_ignores_subagent_session_end(tmp_path):
     running, the main session's later Stop must drive completion, and the
     subagent's id/transcript must never displace the main session's. Ablation:
     with the subagent_type filter in wait_for_completion removed this test fails
-    ('crashed' == 'completed')."""
-    adapter, impl = make_dev_adapter(tmp_path, profile_name="grok")
+    ('crashed' == 'completed'). The marker, not the profile, decides, so the
+    default profile stands in for grok here."""
+    adapter, impl = make_dev_adapter(tmp_path)
     adapter.watcher = _ScriptedWatcher(
         [
             _hook_event("SessionStart", "main-sess"),
@@ -1293,17 +1294,14 @@ def test_wait_for_completion_ignores_subagent_session_end(tmp_path):
     assert result.transcript_path == "/grok/main-sess/updates.jsonl"
 
 
-@pytest.mark.parametrize("profile_name", ["grok", "claude"])
 @pytest.mark.parametrize(
     "end_session", ["main-sess", "other-sess"], ids=["same-id", "different-id"]
 )
-def test_wait_for_completion_unmarked_session_end_still_crashes(
-    tmp_path, profile_name, end_session
-):
+def test_wait_for_completion_unmarked_session_end_still_crashes(tmp_path, end_session):
     """Only the subagent marker excuses a SessionEnd. One without it is the CLI
-    dying on every profile, whatever session id it carries — a real death is never
-    discarded on a guess."""
-    adapter, _ = make_dev_adapter(tmp_path, profile_name=profile_name)
+    dying, whatever session id it carries — a real death is never discarded on a
+    guess."""
+    adapter, _ = make_dev_adapter(tmp_path)
     adapter.watcher = _ScriptedWatcher(
         [
             _hook_event("SessionStart", "main-sess"),
