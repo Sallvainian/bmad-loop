@@ -5105,6 +5105,9 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     assert task.attempt == 1  # only the one session — no retry budget spent
     assert "environment fault: triage session timeout" in engine.state.paused_reason
     assert evidence in engine.state.paused_reason
+    # #752: the env-fault escalation carries the attempt's diagnostic too
+    # (ablation: drop `_diagnostic_suffix` from the env-fault `_escalate`).
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason
     assert len(adapter.sessions) == 1  # no feedback-retry session
     dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
     assert dec["env_fault"] is True
@@ -5523,6 +5526,7 @@ def test_migration_session_env_fault_escalates_without_consuming_attempts(projec
     assert task.attempt == 1  # only the one session — no migration retry spent
     assert "environment fault: migration session timeout" in engine.state.paused_reason
     assert evidence in engine.state.paused_reason
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason  # #752
     assert len(adapter.sessions) == 1
     dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
     assert dec["env_fault"] is True

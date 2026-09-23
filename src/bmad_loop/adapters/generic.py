@@ -29,6 +29,7 @@ import enum
 import hashlib
 import json
 import shlex
+import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -257,7 +258,15 @@ def load_result_document(tasks_dir: Path, task_id: str) -> dict | None:
     `_ResultFileMixin._read_result` folds every raise into ``None``; the sweep
     session-failure diagnostic (#752) keeps "missing" and "malformed" apart."""
     path = _result_path(tasks_dir, task_id)
-    if not path.is_file():
+    # `stat()` + `S_ISREG`, not `is_file()` (the DW-224 shape): 3.14's `is_file()`
+    # swallows a metadata fault as False, which would report a refused document
+    # as absent; 3.11-3.13 raise. Only absence and a non-directory component are
+    # ``None`` on every runtime — any other fault raises as a present refusal.
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(mode):
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):

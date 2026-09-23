@@ -3773,7 +3773,7 @@ class SweepEngine(Engine):
                 # resume also restores the ledger if the worktree is dirty.
                 self._escalate(
                     task,
-                    env_fault_pause_reason("migration", result),
+                    env_fault_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
@@ -4110,7 +4110,7 @@ class SweepEngine(Engine):
                 # ESCALATED-resume above resets task.attempt to 0 (fresh budget).
                 self._escalate(
                     task,
-                    env_fault_pause_reason("triage", result),
+                    env_fault_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
                 )
             if plan is not None:
                 advance(task, Phase.DONE)
